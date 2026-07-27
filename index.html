@@ -139,6 +139,13 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
       </select>
       <input type="date" id="lastVisitFrom" title="Last visit from" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
       <input type="date" id="lastVisitTo" title="Last visit to" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">
+        <label style="font-size:11px;color:var(--muted);white-space:nowrap;">Avg ≥ KSh</label>
+        <input type="range" id="minSpendSlider" min="0" max="500" step="10" value="80" style="width:70px;cursor:pointer;">
+        <span id="minSpendValue" style="font-size:11px;font-weight:700;min-width:22px;color:var(--text);">80</span>
+        <button id="meatOnlyBtn" class="btn" style="font-size:11px;padding:4px 10px;background:var(--card2);border:1px solid var(--border);color:var(--muted);">🍖 Meat Only</button>
+        <button id="resetSpendBtn" class="btn ghost" style="font-size:11px;padding:4px 10px;display:none;">Reset</button>
+      </div>
       <select id="custSort" title="Sort by">
         <option value="spentDesc">💰 Spent ↓</option>
         <option value="spentAsc">💰 Spent ↑</option>
@@ -154,6 +161,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
         <option value="lastAsc">🔚 Last Visit ↑</option>
       </select>
     </div>
+    <div id="custStatsBar" style="font-size:.8rem;color:var(--muted);margin-bottom:8px;min-height:20px;"></div>
     <div class="scroll-y"><table id="custTable">
       <thead><tr><th>Name</th><th>Contact</th><th>Spent</th><th>Visits</th><th>Avg</th><th>Days</th><th>First Visit</th><th>Last Visit</th><th>Status</th><th>Reach</th></tr></thead>
       <tbody></tbody></table></div>
@@ -2195,6 +2203,8 @@ const REPORT={totalCustomers:1669,totalRevenue:1250341,totalTxns:5519,masked:623
 
 /* ══════════ STATE ══════════ */
 let DB;
+let minAvgSpend = 80;
+let meatOnly = false;
 function seedDB(){
   const today = new Date(getTodayEAT());
   return{
@@ -2360,6 +2370,26 @@ function renderCustTable(){
     if(f==='masked')return c.masked;if(f==='new')return c.isNew;return true;});
   if(lvFrom)rows=rows.filter(c=>c.lastVisit&&c.lastVisit>=lvFrom);
   if(lvTo)rows=rows.filter(c=>c.lastVisit&&c.lastVisit<=lvTo);
+  // Meat-only / minimum avg-spend filter
+  if(minAvgSpend > 0 || meatOnly){
+    const threshold = meatOnly ? Math.max(minAvgSpend, 80) : minAvgSpend;
+    rows = rows.filter(c => {
+      const avg = (c.spent || 0) / ((c.visits || 0) > 0 ? c.visits : 1);
+      return avg >= threshold;
+    });
+  }
+  // Update stats bar
+  const statsBar = $('custStatsBar');
+  if(statsBar){
+    if(minAvgSpend > 0 || meatOnly){
+      const totalSpent = rows.reduce((s,c)=>s+(c.spent||0),0);
+      const totalVisits = rows.reduce((s,c)=>s+(c.visits||0),0);
+      const avg = totalVisits ? Math.round(totalSpent / totalVisits) : 0;
+      statsBar.innerHTML = `🍖 <b>${rows.length.toLocaleString()}</b> meat customer(s) · KSh <b>${totalSpent.toLocaleString()}</b> total · KSh <b>${avg.toLocaleString()}</b> avg/visit`;
+    } else {
+      statsBar.innerHTML = '';
+    }
+  }
   rows.sort((a,b)=>{
     if(s==='spentDesc')return b.spent-a.spent;
     if(s==='spentAsc')return a.spent-b.spent;
@@ -2386,6 +2416,47 @@ function renderCustTable(){
 }
 $('custSearch').oninput=renderCustTable;$('custFilter').onchange=renderCustTable;$('custSort').onchange=renderCustTable;
 $('lastVisitFrom').onchange=renderCustTable;$('lastVisitTo').onchange=renderCustTable;
+// Meat-only filter listeners
+const minSlider = $('minSpendSlider');
+const minValue = $('minSpendValue');
+const meatBtn = $('meatOnlyBtn');
+const resetBtn = $('resetSpendBtn');
+if(minSlider){
+  minSlider.oninput = (e) => {
+    minAvgSpend = parseInt(e.target.value);
+    minValue.textContent = minAvgSpend;
+    resetBtn.style.display = (minAvgSpend > 0 || meatOnly) ? 'inline-block' : 'none';
+    renderCustTable();
+  };
+}
+if(meatBtn){
+  meatBtn.onclick = () => {
+    meatOnly = !meatOnly;
+    meatBtn.style.background = meatOnly ? '#22c55e' : '';
+    meatBtn.style.color = meatOnly ? '#fff' : '';
+    meatBtn.style.borderColor = meatOnly ? '#22c55e' : '';
+    if(meatOnly && minAvgSpend < 80){
+      minAvgSpend = 80;
+      minSlider.value = 80;
+      minValue.textContent = 80;
+    }
+    resetBtn.style.display = (minAvgSpend > 0 || meatOnly) ? 'inline-block' : 'none';
+    renderCustTable();
+  };
+}
+if(resetBtn){
+  resetBtn.onclick = () => {
+    meatOnly = false;
+    minAvgSpend = 0;
+    minSlider.value = 0;
+    minValue.textContent = 0;
+    meatBtn.style.background = '';
+    meatBtn.style.color = '';
+    meatBtn.style.borderColor = '';
+    resetBtn.style.display = 'none';
+    renderCustTable();
+  };
+}
 window.quickWA=(p,n)=>window.open(`https://wa.me/${waNum(p)}?text=${encodeURIComponent('Hi '+firstName(n)+'! 👋 Greetings from SpaxButchery.')}`);
 window.quickSMS=(p,n)=>window.location.href=`sms:${normPhone(p)}?body=${encodeURIComponent('Hi '+firstName(n)+'! Greetings from SpaxButchery.')}`;
 
@@ -3633,8 +3704,7 @@ function urlBase64ToUint8Array(base64String){
   const rawData = window.atob(base64);
   return Uint8Array.from([...rawData].map((char) => char.charCodeAt(0)));
 }
-</script>
-
+<script>
 // ===== PUSH NOTIFICATIONS =====
 function checkRetentionAlerts(){
   if(!DB || !DB.customers) return;
@@ -3695,5 +3765,6 @@ if('Notification' in window && Notification.permission === 'default'){
 setInterval(checkRetentionAlerts, 3600000);
 
 
+</script>
 </body>
 </html>

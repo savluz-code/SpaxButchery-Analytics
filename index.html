@@ -86,6 +86,10 @@ textarea{width:100%;resize:vertical}
 .ai-btn .ic{font-size:1.5rem}.ai-btn .nm{font-size:.82rem;font-weight:600}.ai-btn .tg{font-size:.68rem;color:var(--muted)}
 footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border-top:1px solid var(--border)}
 </style>
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#0f1419">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 </head>
 <body>
 
@@ -3603,5 +3607,93 @@ load().then(() => {
   refreshAll();
 });
 </script>
+
+<script>
+// Register Service Worker for PWA
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('sw.js').then(function(reg){
+    console.log('SW registered');
+    // Request push notification permission
+    if('PushManager' in window){
+      reg.pushManager.getSubscription().then(function(sub){
+        if(!sub){
+          reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array('BEl62iSMfVjLmP2DVN3d2xvH4tWfL9ZJqQ0y8Q0y8Q0')
+          }).catch(function(e){ console.log('Push sub failed', e); });
+        }
+      });
+    }
+  }).catch(function(e){ console.log('SW reg failed', e); });
+}
+
+function urlBase64ToUint8Array(base64String){
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/\-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  return Uint8Array.from([...rawData].map((char) => char.charCodeAt(0)));
+}
+</script>
+
+// ===== PUSH NOTIFICATIONS =====
+function checkRetentionAlerts(){
+  if(!DB || !DB.customers) return;
+
+  // Three retention tiers
+  const slowing = DB.customers.filter(c => c.days >= 15 && c.days <= 30 && !c.masked);
+  const atRisk = DB.customers.filter(c => c.days > 30 && c.days <= 90 && !c.masked);
+  const lost = DB.customers.filter(c => c.days > 90 && !c.masked);
+
+  function formatCustomerList(list, max){
+    const shown = list.slice(0, max);
+    const names = shown.map(c => c.name + ' (' + c.contact + ')').join(', ');
+    const more = list.length > max ? ' + ' + (list.length - max) + ' more' : '';
+    return names + more;
+  }
+
+  if('Notification' in window && Notification.permission === 'granted'){
+    // Slowing down (15-30 days) — gentle nudge
+    if(slowing.length > 0 && !window._alertedSlowing){
+      window._alertedSlowing = true;
+      new Notification('SpaxButchery — Slowing Down', {
+        body: slowing.length + ' customer(s) haven\'t visited in 15+ days: ' + formatCustomerList(slowing, 3) + '. Tap to reach out.',
+        icon: 'icon-192.png',
+        tag: 'slowing'
+      });
+    }
+    // At Risk (30-90 days)
+    if(atRisk.length > 0 && !window._alertedAtRisk){
+      window._alertedAtRisk = true;
+      new Notification('SpaxButchery — At Risk', {
+        body: atRisk.length + ' customer(s) haven\'t visited in 30+ days: ' + formatCustomerList(atRisk, 3) + '. Tap to reach out.',
+        icon: 'icon-192.png',
+        tag: 'at-risk'
+      });
+    }
+    // Lost (90+ days)
+    if(lost.length > 0 && !window._alertedLost){
+      window._alertedLost = true;
+      new Notification('SpaxButchery — Win-Back Opportunity', {
+        body: lost.length + ' customer(s) haven\'t visited in 90+ days: ' + formatCustomerList(lost, 3) + '. Time to re-engage!',
+        icon: 'icon-192.png',
+        tag: 'lost'
+      });
+    }
+  }
+}
+
+// Request notification permission on first load
+if('Notification' in window && Notification.permission === 'default'){
+  setTimeout(() => {
+    Notification.requestPermission().then(perm => {
+      if(perm === 'granted') checkRetentionAlerts();
+    });
+  }, 5000);
+}
+
+// Check alerts every hour
+setInterval(checkRetentionAlerts, 3600000);
+
+
 </body>
 </html>

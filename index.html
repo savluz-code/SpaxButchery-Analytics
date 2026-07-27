@@ -139,13 +139,11 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
       </select>
       <input type="date" id="lastVisitFrom" title="Last visit from" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
       <input type="date" id="lastVisitTo" title="Last visit to" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
-      <div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">
-        <label style="font-size:11px;color:var(--muted);white-space:nowrap;">Avg ≥ KSh</label>
-        <input type="range" id="minSpendSlider" min="0" max="500" step="10" value="80" style="width:70px;cursor:pointer;">
-        <span id="minSpendValue" style="font-size:11px;font-weight:700;min-width:22px;color:var(--text);">80</span>
-        <button id="meatOnlyBtn" class="btn" style="font-size:11px;padding:4px 10px;background:var(--card2);border:1px solid var(--border);color:var(--muted);">🍖 Meat Only</button>
-        <button id="resetSpendBtn" class="btn ghost" style="font-size:11px;padding:4px 10px;display:none;">Reset</button>
-      </div>
+      <select id="productFilter" title="Product filter" style="padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
+        <option value="all">All Products</option>
+        <option value="meat">🥩 Meat Only</option>
+        <option value="soup">🍲 Soup Only</option>
+      </select>
       <select id="custSort" title="Sort by">
         <option value="spentDesc">💰 Spent ↓</option>
         <option value="spentAsc">💰 Spent ↑</option>
@@ -378,6 +376,10 @@ async function loadFromCloud() {
         DB.resolved = Number(data.settings.resolved) || 0;
       }
       if (data.transactions) {
+        DB.transactions = data.transactions.map(t => ({...t, amount: Number(t.amount) || 0}));
+      } else {
+        DB.transactions = []; }
+      if (data.transactions) {
         DB.seen = {};
         data.transactions.forEach(tx => {
           const key = tx.receipt ? 'R:' + tx.receipt : 
@@ -424,6 +426,7 @@ async function saveToCloud(force = false) {
         importedTx: DB.importedTx,
         resolved: DB.resolved
       },
+      transactions: DB.transactions || [],
       transactions: Object.entries(DB.seen).map(([key, val]) => {
         const parts = key.startsWith('R:') ? 
           { receipt: key.slice(2) } : 
@@ -2203,8 +2206,6 @@ const REPORT={totalCustomers:1669,totalRevenue:1250341,totalTxns:5519,masked:623
 
 /* ══════════ STATE ══════════ */
 let DB;
-let minAvgSpend = 80;
-let meatOnly = false;
 function seedDB(){
   const today = new Date(getTodayEAT());
   return{
@@ -2220,7 +2221,8 @@ function seedDB(){
       };
     }),
     monthly:JSON.parse(JSON.stringify(SEED_MONTHLY)),
-    importedRev:0,importedTx:0,resolved:0,seen:{}
+    importedRev:0,importedTx:0,resolved:0,seen:{},
+    transactions:[]
   };
 }
 function load(){
@@ -2230,6 +2232,7 @@ function load(){
     if(s){
       DB=JSON.parse(s);
       if(!DB.seen)DB.seen={};
+    if(!DB.transactions)DB.transactions=[];
     } else {
       DB=seedDB();
     }
@@ -2292,6 +2295,59 @@ function waNum(p){return '254'+normPhone(p).slice(1);}
 function firstName(n){return n.split(' ')[0];}
 function titleCase(s){return s.toLowerCase().replace(/\b\w/g,c=>c.toUpperCase());}
 function statusOf(d){if(d>=999)return['Unknown','b-masked'];if(d<=30)return['Active','b-active'];if(d<=60)return['Lapsing','b-risk'];if(d<=90)return['At Risk','b-risk'];return['Lost','b-lost'];}
+
+/* ══════════ PRODUCT CLASSIFICATION (Meat vs Soup) ══════════ */
+const SOUP_START_DATE = '2026-06-01';
+function classifyProduct(dateStr, amount){
+  if(!dateStr || dateStr < SOUP_START_DATE) return 'meat';
+  return amount <= 50 ? 'soup' : 'meat';
+}
+function getProductStats(){
+  const meatTx = DB.transactions.filter(t => t.product === 'meat');
+  const soupTx = DB.transactions.filter(t => t.product === 'soup');
+  const meatTxRev = meatTx.reduce((s,t)=>s+t.amount,0);
+  const soupTxRev = soupTx.reduce((s,t)=>s+t.amount,0);
+  const meatTxVisits = meatTx.length;
+  const soupTxVisits = soupTx.length;
+  const meatTxPhones = new Set(meatTx.map(t=>t.phone).filter(Boolean));
+  const soupTxPhones = new Set(soupTx.map(t=>t.phone).filter(Boolean));
+  let seedMeatRev=0, seedSoupRev=0, seedMeatVisits=0, seedSoupVisits=0;
+  let seedMeatCust=0, seedSoupCust=0;
+  DB.customers.forEach(c=>{
+    if(c.isNew) return;
+    const avg = (c.spent||0) / Math.max(c.visits||1,1);
+    if(c.lastVisit && c.lastVisit < SOUP_START_DATE){
+      seedMeatRev += c.spent||0; seedMeatVisits += c.visits||0; seedMeatCust++;
+    } else {
+      if(avg <= 50){ seedSoupRev += c.spent||0; seedSoupVisits += c.visits||0; seedSoupCust++; }
+      else { seedMeatRev += c.spent||0; seedMeatVisits += c.visits||0; seedMeatCust++; }
+    }
+  });
+  return {
+    meatRevenue: seedMeatRev + meatTxRev,
+    soupRevenue: seedSoupRev + soupTxRev,
+    totalRevenue: seedMeatRev + seedSoupRev + meatTxRev + soupTxRev,
+    meatCustomers: seedMeatCust + meatTxPhones.size,
+    soupCustomers: seedSoupCust + soupTxPhones.size,
+    totalCustomers: DB.customers.length,
+    meatVisits: seedMeatVisits + meatTxVisits,
+    soupVisits: seedSoupVisits + soupTxVisits,
+    totalVisits: DB.customers.reduce((s,c)=>s+(c.visits||0),0)
+  };
+}
+function customerProduct(c){
+  if(c.isNew && DB.transactions.length){
+    const custTx = DB.transactions.filter(t => t.phone && normPhone(t.phone) === normPhone(c.contact));
+    if(custTx.length){
+      const soupCount = custTx.filter(t => t.product === 'soup').length;
+      const meatCount = custTx.filter(t => t.product === 'meat').length;
+      return soupCount > meatCount ? 'soup' : 'meat';
+    }
+  }
+  if(c.lastVisit && c.lastVisit < SOUP_START_DATE) return 'meat';
+  const avg = (c.spent||0) / Math.max(c.visits||1,1);
+  return avg <= 50 ? 'soup' : 'meat';
+}
 function maskedMatches(masked,full){const m=(''+masked).match(/^(\d{4})\*+(\d{3})$/);if(!m)return false;
   full=normPhone(full);return full.length===10&&!full.includes('*')&&full.startsWith(m[1])&&full.endsWith(m[2]);}
 function nameSim(a,b){a=(a||'').toLowerCase().split(/\s+/);b=(b||'').toLowerCase().split(/\s+/);
@@ -2343,13 +2399,17 @@ function refreshAll(){
   $('hReach').textContent=validPct;
   $('maskedCount').textContent=`${REPORT.masked-DB.resolved} masked report-wide · ${cs.filter(c=>c.masked).length} in tracked list · ${DB.resolved} resolved`;
   const active=cs.filter(c=>c.days<=30).length,risk=cs.filter(c=>c.days>60&&c.days<=90).length,lost=cs.filter(c=>c.days>90).length;
-  $('kpiGrid').innerHTML=`
+  const ps = getProductStats();
+$('kpiGrid').innerHTML=`
   <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">incl. ${kes(DB.importedRev)} imported</div></div>
   <div class="kpi" style="--accent:var(--blue)"><div class="label">Customers</div><div class="value">${totCust.toLocaleString()}</div><div class="detail">${cs.filter(c=>c.isNew).length} added via import</div></div>
   <div class="kpi" style="--accent:var(--green)"><div class="label">Contacts Resolved</div><div class="value">${DB.resolved}</div><div class="detail">masked → reachable</div></div>
   <div class="kpi" style="--accent:var(--amber)"><div class="label">Reachable</div><div class="value">${validPct}%</div><div class="detail">target: 80%</div></div>
   <div class="kpi" style="--accent:var(--purple)"><div class="label">Tracked VIPs</div><div class="value">${cs.filter(c=>c.spent>=10000).length}</div><div class="detail">KES 10K+ lifetime</div></div>
-  <div class="kpi" style="--accent:var(--red2)"><div class="label">At Risk Now</div><div class="value">${risk}</div><div class="detail">win-back window (61–90d)</div></div>`;
+  <div class="kpi" style="--accent:var(--red2)"><div class="label">At Risk Now</div><div class="value">${risk}</div><div class="detail">win-back window (61–90d)</div></div>
+  <div class="kpi" style="--accent:#e63946"><div class="label">🥩 Meat Revenue</div><div class="value">${kes(ps.meatRevenue)}</div><div class="detail">${ps.meatCustomers.toLocaleString()} customers · ${ps.meatVisits.toLocaleString()} visits</div></div>
+  <div class="kpi" style="--accent:#f4a261"><div class="label">🍲 Soup Revenue</div><div class="value">${kes(ps.soupRevenue)}</div><div class="detail">${ps.soupCustomers.toLocaleString()} customers · ${ps.soupVisits.toLocaleString()} visits</div></div>
+  <div class="kpi" style="--accent:#2ec4b6"><div class="label">💰 Combined</div><div class="value">${kes(ps.totalRevenue)}</div><div class="detail">${ps.totalCustomers.toLocaleString()} customers · ${ps.totalVisits.toLocaleString()} visits</div></div>`;
   if(revChart)revChart.destroy();if(segChart)segChart.destroy();
   revChart=new Chart($('ovRev'),{type:'bar',data:{labels:DB.monthly.labels,datasets:[{data:DB.monthly.revenue,
     backgroundColor:'rgba(230,57,70,.65)',borderRadius:6}]},options:{maintainAspectRatio:false,
@@ -2362,7 +2422,7 @@ function refreshAll(){
 
 /* ══════════ CUSTOMER TABLE ══════════ */
 function renderCustTable(){
-  const q=($('custSearch').value||'').toLowerCase(),f=$('custFilter').value,s=$('custSort').value;
+  const q=($('custSearch').value||'').toLowerCase(),f=$('custFilter').value,s=$('custSort').value,pf=$('productFilter')?$('productFilter').value:'all';
   let rows=DB.customers.filter(c=>c.name.toLowerCase().includes(q)||c.contact.includes(q));
   const lvFrom=$('lastVisitFrom').value,lvTo=$('lastVisitTo').value;
   rows=rows.filter(c=>{if(f==='vip')return c.spent>=10000;if(f==='active')return c.days<=30;
@@ -2370,24 +2430,19 @@ function renderCustTable(){
     if(f==='masked')return c.masked;if(f==='new')return c.isNew;return true;});
   if(lvFrom)rows=rows.filter(c=>c.lastVisit&&c.lastVisit>=lvFrom);
   if(lvTo)rows=rows.filter(c=>c.lastVisit&&c.lastVisit<=lvTo);
-  // Meat-only / minimum avg-spend filter
-  if(minAvgSpend > 0 || meatOnly){
-    const threshold = meatOnly ? Math.max(minAvgSpend, 80) : minAvgSpend;
-    rows = rows.filter(c => {
-      const avg = (c.spent || 0) / ((c.visits || 0) > 0 ? c.visits : 1);
-      return avg >= threshold;
-    });
-  }
-  // Update stats bar
+  if(pf && pf !== 'all') rows = rows.filter(c => customerProduct(c) === pf);
   const statsBar = $('custStatsBar');
   if(statsBar){
-    if(minAvgSpend > 0 || meatOnly){
+    if(pf && pf !== 'all'){
       const totalSpent = rows.reduce((s,c)=>s+(c.spent||0),0);
       const totalVisits = rows.reduce((s,c)=>s+(c.visits||0),0);
       const avg = totalVisits ? Math.round(totalSpent / totalVisits) : 0;
-      statsBar.innerHTML = `🍖 <b>${rows.length.toLocaleString()}</b> meat customer(s) · KSh <b>${totalSpent.toLocaleString()}</b> total · KSh <b>${avg.toLocaleString()}</b> avg/visit`;
+      const icon = pf === 'meat' ? '🥩' : '🍲';
+      const label = pf === 'meat' ? 'Meat' : 'Soup';
+      statsBar.innerHTML = `${icon} <b>${rows.length.toLocaleString()}</b> ${label.toLowerCase()} customer(s) · KSh <b>${totalSpent.toLocaleString()}</b> total · KSh <b>${avg.toLocaleString()}</b> avg/visit · ${totalVisits.toLocaleString()} visits`;
     } else {
-      statsBar.innerHTML = '';
+      const ps = getProductStats();
+      statsBar.innerHTML = `🥩 Meat: KSh <b>${ps.meatRevenue.toLocaleString()}</b> · ${ps.meatCustomers.toLocaleString()} customers · ${ps.meatVisits.toLocaleString()} visits &nbsp;|&nbsp; 🍲 Soup: KSh <b>${ps.soupRevenue.toLocaleString()}</b> · ${ps.soupCustomers.toLocaleString()} customers · ${ps.soupVisits.toLocaleString()} visits &nbsp;|&nbsp; 💰 Total: KSh <b>${ps.totalRevenue.toLocaleString()}</b>`;
     }
   }
   rows.sort((a,b)=>{
@@ -2416,47 +2471,7 @@ function renderCustTable(){
 }
 $('custSearch').oninput=renderCustTable;$('custFilter').onchange=renderCustTable;$('custSort').onchange=renderCustTable;
 $('lastVisitFrom').onchange=renderCustTable;$('lastVisitTo').onchange=renderCustTable;
-// Meat-only filter listeners
-const minSlider = $('minSpendSlider');
-const minValue = $('minSpendValue');
-const meatBtn = $('meatOnlyBtn');
-const resetBtn = $('resetSpendBtn');
-if(minSlider){
-  minSlider.oninput = (e) => {
-    minAvgSpend = parseInt(e.target.value);
-    minValue.textContent = minAvgSpend;
-    resetBtn.style.display = (minAvgSpend > 0 || meatOnly) ? 'inline-block' : 'none';
-    renderCustTable();
-  };
-}
-if(meatBtn){
-  meatBtn.onclick = () => {
-    meatOnly = !meatOnly;
-    meatBtn.style.background = meatOnly ? '#22c55e' : '';
-    meatBtn.style.color = meatOnly ? '#fff' : '';
-    meatBtn.style.borderColor = meatOnly ? '#22c55e' : '';
-    if(meatOnly && minAvgSpend < 80){
-      minAvgSpend = 80;
-      minSlider.value = 80;
-      minValue.textContent = 80;
-    }
-    resetBtn.style.display = (minAvgSpend > 0 || meatOnly) ? 'inline-block' : 'none';
-    renderCustTable();
-  };
-}
-if(resetBtn){
-  resetBtn.onclick = () => {
-    meatOnly = false;
-    minAvgSpend = 0;
-    minSlider.value = 0;
-    minValue.textContent = 0;
-    meatBtn.style.background = '';
-    meatBtn.style.color = '';
-    meatBtn.style.borderColor = '';
-    resetBtn.style.display = 'none';
-    renderCustTable();
-  };
-}
+$('productFilter').onchange=renderCustTable;
 window.quickWA=(p,n)=>window.open(`https://wa.me/${waNum(p)}?text=${encodeURIComponent('Hi '+firstName(n)+'! 👋 Greetings from SpaxButchery.')}`);
 window.quickSMS=(p,n)=>window.location.href=`sms:${normPhone(p)}?body=${encodeURIComponent('Hi '+firstName(n)+'! Greetings from SpaxButchery.')}`;
 
@@ -2820,6 +2835,16 @@ function importTransactions(txs) {
   const monthAdd = {};
   const txDate = (tx) => tx.date || new Date().toISOString().slice(0, 10);
   txs.forEach(tx => {
+    const product = classifyProduct(tx.date, tx.amount);
+    DB.transactions.push({
+      date: tx.date || '',
+      amount: Number(tx.amount || 0),
+      name: tx.name || '',
+      phone: normalizeContact(tx.phone || ''),
+      product: product,
+      receipt: tx.receipt || '',
+      importedAt: new Date().toISOString()
+    });
     const key = transactionKey(tx);
     if (DB.seen[key]) { dupes++; return; }
     DB.seen[key] = 1;

@@ -119,6 +119,20 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
 
 <section id="overview" class="tab active">
   <div class="kpi-grid" id="kpiGrid"></div>
+  <div class="card" style="margin-bottom:18px;padding:16px 20px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+      <div>
+        <h3 style="font-size:1.05rem;">💰 COGS & Net Margin Model</h3>
+        <div class="hint" style="margin-bottom:0">Zero-cost operational margin calculator (Meat COGS, Soup COGS & Monthly Overhead)</div>
+      </div>
+      <div class="flex" style="gap:10px;align-items:center;flex-wrap:wrap;">
+        <label style="font-size:.78rem;color:var(--muted)">🥩 Meat COGS %: <input type="number" id="meatCogsInput" value="70" min="0" max="100" style="width:65px;padding:4px 6px;font-size:.8rem;border-radius:6px;" onchange="updateCogs()"></label>
+        <label style="font-size:.78rem;color:var(--muted)">🍲 Soup COGS %: <input type="number" id="soupCogsInput" value="35" min="0" max="100" style="width:65px;padding:4px 6px;font-size:.8rem;border-radius:6px;" onchange="updateCogs()"></label>
+        <label style="font-size:.78rem;color:var(--muted)">🏢 Overhead (KES): <input type="number" id="overheadInput" value="35000" step="1000" style="width:90px;padding:4px 6px;font-size:.8rem;border-radius:6px;" onchange="updateCogs()"></label>
+      </div>
+    </div>
+    <div id="cogsSummaryBar" style="margin-top:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;"></div>
+  </div>
   <div class="grid-2">
     <div class="card"><h3>Monthly Revenue</h3><div class="hint">Baseline + imported transactions</div>
       <div class="chart-box"><canvas id="ovRev"></canvas></div></div>
@@ -136,7 +150,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
       <select id="custFilter">
         <option value="all">All customers</option><option value="vip">VIP (10K+)</option>
         <option value="active">Active (≤30d)</option><option value="risk">At Risk (61–90d)</option>
-        <option value="lost">Lost (90+d)</option><option value="masked">Masked contacts</option>
+        <option value="lost">Lost (90+d)</option><option value="overdue">⚡ Overdue (Personal Cadence)</option><option value="masked">Masked contacts</option>
         <option value="new">Newly imported</option>
       </select>
       <input type="date" id="lastVisitFrom" title="Last visit from" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
@@ -169,25 +183,56 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
 </section>
 
 <section id="import" class="tab">
-  <div class="card">
-    <h3>📥 Import M-Pesa PDF Statement / CSV / Excel</h3>
-      <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:16px;">
-        <div style="font-weight:600;font-size:.9rem;margin-bottom:6px;">📚 Transaction History</div>
-        <div style="font-size:.8rem;color:var(--muted);margin-bottom:10px;">
-          Import past statements to build per-customer transaction history. 
-          Your current summary data (spent, visits, dates) is <b>never touched</b>.
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn" style="background:var(--blue);color:#fff;font-size:.85rem;" onclick="openBackfillModal()">📥 Backfill History</button>
-          <input type="file" id="backfillFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleBackfill(this)">
-
-          <button class="btn" style="background:var(--amber);color:#000;font-size:.85rem;" onclick="openRebuildModal()">🔄 Full Rebuild</button>
-          <input type="file" id="rebuildFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleRebuild(this)">
-        </div>
-        <div style="font-size:.7rem;color:var(--muted);margin-top:8px;">
-          <b>Backfill</b> = add history only, keep summary stats · <b>Rebuild</b> = reset everything and recalculate
-        </div>
+  <!-- CARD 1: DAILY STOCK LEDGER -->
+  <div class="card" style="border-left: 4px solid var(--green); margin-bottom: 20px;">
+    <h3 style="color:var(--green); font-size: 1.15rem;">📋 Daily Stock & Reconciliation Ledger</h3>
+    <div class="hint">Ingest handwritten notebook pages, WhatsApp daily stock reports & Excel sales sheets</div>
+    
+    <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:16px;margin-top:10px;">
+      <div style="font-weight:600;font-size:.95rem;margin-bottom:6px;">📓 Daily Sales & Stock Sheet Ingestion</div>
+      <div style="font-size:.82rem;color:var(--muted);margin-bottom:14px;line-height:1.5;">
+        Extract figures from physical daily sales sheets (Opening Stock, Purchases, Waste, Closing Stock, Sales kg, Cash KES, M-Pesa vs Cash reconciliation) into structured analytics.
       </div>
+      <div class="flex" style="gap:10px;margin-bottom:14px;flex-wrap:wrap;">
+        <button class="btn blue sm" onclick="downloadLedgerTemplate()">⬇️ Download CSV Ledger Template</button>
+      </div>
+      <div style="margin-bottom:12px;">
+        <label style="font-size:.8rem;color:var(--muted);display:block;margin-bottom:6px;font-weight:600;">📋 Paste Daily Ledger / WhatsApp Report Text:</label>
+        <textarea id="ledgerPasteText" rows="6" placeholder="e.g.
+02/07/2026
+Beef 6.4 0 0.34 2.76 3.3 2772
+Matumbo 1.5 0 0 1.5 0 0
+Liver 1.78 0 0 0 1.78 1495
+Minced 0.38 0 0 0.2 0.18 151
+Figo 1.64 0 0 1.50 0.14 118
+C/H 1260
+Mpesa 3210
+Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var(--card);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:8px;"></textarea>
+      </div>
+      <button class="btn green" style="padding:8px 18px;font-size:.9rem;" onclick="processLedgerParse()">⚡ Parse & Reconcile Daily Ledger</button>
+    </div>
+  </div>
+
+  <!-- CARD 2: M-PESA STATEMENTS & STATEMENTS IMPORT -->
+  <div class="card" style="margin-bottom: 20px;">
+    <h3 style="font-size: 1.15rem;">📥 Import M-Pesa PDF Statement / CSV / Excel</h3>
+    <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:16px;margin-top:10px;">
+      <div style="font-weight:600;font-size:.9rem;margin-bottom:6px;">📚 Transaction History</div>
+      <div style="font-size:.8rem;color:var(--muted);margin-bottom:10px;">
+        Import past statements to build per-customer transaction history. 
+        Your current summary data (spent, visits, dates) is <b>never touched</b>.
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn" style="background:var(--blue);color:#fff;font-size:.85rem;" onclick="openBackfillModal()">📥 Backfill History</button>
+        <input type="file" id="backfillFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleBackfill(this)">
+
+        <button class="btn" style="background:var(--amber);color:#000;font-size:.85rem;" onclick="openRebuildModal()">🔄 Full Rebuild</button>
+        <input type="file" id="rebuildFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleRebuild(this)">
+      </div>
+      <div style="font-size:.7rem;color:var(--muted);margin-top:8px;">
+        <b>Backfill</b> = add history only, keep summary stats · <b>Rebuild</b> = reset everything and recalculate
+      </div>
+    </div>
     <div class="hint">Hybrid engine: embedded-text parsing + Tesseract OCR fallback for scanned/image PDFs</div>
     <div class="note">
       <b>📄 PDF statements:</b> pages with a text layer parse instantly; image-only pages are automatically
@@ -213,6 +258,8 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
     <div id="pdfProgress" style="margin-top:12px;font-size:.85rem;color:var(--muted)"></div>
     <div class="prog-bar" id="progWrap" style="display:none"><div id="progBar"></div></div>
   </div>
+
+  <!-- PREVIEW CARD -->
   <div class="card" id="previewCard" style="display:none">
     <h3>Preview — <span id="pvCount"></span> rows <span class="badge b-valid" id="pvFormat"></span> <span class="badge b-dup" id="pvDups" style="display:none"></span></h3>
     <div class="hint">Duplicates are skipped automatically on confirm</div>
@@ -223,6 +270,8 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
       <button class="btn ghost" id="cancelImport">Cancel</button>
     </div>
   </div>
+
+  <!-- DATA MANAGEMENT CARD -->
   <div class="card">
     <h3>🗂️ Data Management</h3>
     <div class="flex">
@@ -2455,7 +2504,9 @@ function seedDB(){
     monthly:JSON.parse(JSON.stringify(SEED_MONTHLY)),
     importedRev:0,importedTx:0,resolved:0,seen:{},
     transactions:[],
-    customerTx:{}
+    customerTx:{},
+    cogs:{ meatPct: 70, soupPct: 35, overhead: 35000 },
+    dailyLedgers:[]
   };
 }
 function load(){
@@ -2467,6 +2518,8 @@ function load(){
       if(!DB.seen)DB.seen={};
     if(!DB.transactions)DB.transactions=[];
     if(!DB.customerTx)DB.customerTx={};
+    if(!DB.cogs)DB.cogs={ meatPct: 70, soupPct: 35, overhead: 35000 };
+    if(!DB.dailyLedgers)DB.dailyLedgers=[];
     } else {
       DB=seedDB();
     }
@@ -2487,8 +2540,8 @@ function load(){
         needsSave = true;
       }
       // Also guard the "same as lastVisit" case — that equality is expected for
-      // single-visit customers and must not trigger a seed overwrite.
-      if(c.firstVisit === c.lastVisit && !hasHistory && seedLookup[c.name] && c.firstVisit !== stripTime(seedLookup[c.name])){
+      // single-visit customers (c.visits === 1) and must not trigger a seed overwrite.
+      if((c.visits || 0) > 1 && c.firstVisit === c.lastVisit && !hasHistory && seedLookup[c.name] && c.firstVisit !== stripTime(seedLookup[c.name])){
         c.firstVisit = stripTime(seedLookup[c.name]);
         needsSave = true;
       }
@@ -2509,18 +2562,26 @@ function load(){
     }
 
     // Now try cloud sync (will push seed data if cloud is empty)
-    loadFromCloud().then(cloudLoaded => {
+    return loadFromCloud().then(cloudLoaded => {
       if (!cloudLoaded) {
         // Cloud failed — keep local data and refresh
         refreshAll();
       }
-      // If cloud loaded successfully, refreshAll was already called inside loadFromCloud's .then chain
+      const fixed = repairDates();
+      if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
+      return cloudLoaded;
     }).catch(() => {
       refreshAll();
+      const fixed = repairDates();
+      if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
     });
-  }catch(e){DB=seedDB(); refreshAll();}
-  const fixed = repairDates();
-  if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
+  }catch(e){
+    DB=seedDB();
+    refreshAll();
+    const fixed = repairDates();
+    if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
+    return Promise.resolve();
+  }
 }function save(){
   localStorage.setItem('spaxDB_v23',JSON.stringify(DB));
   if (SYNC_MODE === 'auto') {
@@ -2541,6 +2602,162 @@ function waNum(p){return '254'+normPhone(p).slice(1);}
 function firstName(n){return n.split(' ')[0];}
 function titleCase(s){return s.toLowerCase().replace(/\b\w/g,c=>c.toUpperCase());}
 function statusOf(d){if(d>=999)return['Unknown','b-masked'];if(d<=30)return['Active','b-active'];if(d<=60)return['Lapsing','b-risk'];if(d<=90)return['At Risk','b-risk'];return['Lost','b-lost'];}
+
+
+
+/* ══════════ DAILY STOCK & CASH LEDGER PARSER ══════════ */
+function downloadLedgerTemplate() {
+  const csvContent = "data:text/csv;charset=utf-8," + 
+    "Date,Item,OS_kg,Pur_kg,Waste_kg,CS_kg,Sales_kg,Cash_KES,Cash_In_Hand,Mpesa,Expenses\n" +
+    "02/07/2026,Beef,6.4,0,0.34,2.76,3.3,2772,1260,3210,160\n" +
+    "02/07/2026,Matumbo,1.5,0,0,1.5,0,0,1260,3210,160\n" +
+    "02/07/2026,Liver,1.78,0,0,0,1.78,1495,1260,3210,160\n" +
+    "02/07/2026,Minced,0.38,0,0,0.2,0.18,151,1260,3210,160\n" +
+    "02/07/2026,Figo,1.64,0,0,1.50,0.14,118,1260,3210,160";
+  const encodedUri = encodeURI(csvContent);
+  const link = document.createElement("a");
+  link.setAttribute("href", encodedUri);
+  link.setAttribute("download", "Spax_Daily_Stock_Ledger_Template.csv");
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+function parseDailyLedgerText(text) {
+  if (!text || !text.trim()) return null;
+  const lines = text.trim().split(/\r?\n/);
+  const dateMatch = text.match(/(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})/);
+  const dateStr = dateMatch ? parseDate(dateMatch[1]) : getTodayEAT();
+
+  let ch = 0, mpesa = 0, exp = 0, totalWrittenRevenue = 0;
+  const items = [];
+
+  lines.forEach(line => {
+    const l = line.trim();
+    if (!l) return;
+
+    if (/c\/h|cash\s*in\s*hand/i.test(l)) {
+      const m = l.match(/(\d+(?:\.\d+)?)/);
+      if (m) ch = parseFloat(m[1]);
+    } else if (/mpesa/i.test(l)) {
+      const m = l.match(/(\d+(?:\.\d+)?)/);
+      if (m) mpesa = parseFloat(m[1]);
+    } else if (/exp|expenses/i.test(l)) {
+      const m = l.match(/(\d+(?:\.\d+)?)/);
+      if (m) exp = parseFloat(m[1]);
+    } else if (/total|revenue/i.test(l) && !/item/i.test(l)) {
+      const m = l.match(/(\d+(?:\.\d+)?)/);
+      if (m) totalWrittenRevenue = parseFloat(m[1]);
+    } else {
+      const parts = l.split(/[\s,\t]+/);
+      if (parts.length >= 2) {
+        const name = parts[0].replace(/[^a-zA-Z]/g, '');
+        if (name && name.length >= 2) {
+          const nums = parts.slice(1).map(p => parseFloat(p)).filter(n => !isNaN(n));
+          if (nums.length >= 1) {
+            const cash = nums[nums.length - 1];
+            const salesKg = nums.length >= 2 ? nums[nums.length - 2] : 0;
+            items.push({ item: name, salesKg: salesKg, cash: cash, rawNums: nums });
+          }
+        }
+      }
+    }
+  });
+
+  const sumItemCash = items.reduce((s, i) => s + (i.cash || 0), 0);
+  const revenue = totalWrittenRevenue || sumItemCash;
+  const reconciled = ch + mpesa + exp;
+  const variance = reconciled - revenue;
+
+  return {
+    date: dateStr,
+    items: items,
+    ch: ch,
+    mpesa: mpesa,
+    exp: exp,
+    reconciled: reconciled,
+    totalItemCash: sumItemCash,
+    revenue: revenue,
+    variance: variance
+  };
+}
+
+function processLedgerParse() {
+  const raw = $('ledgerPasteText') ? $('ledgerPasteText').value : '';
+  if (!raw || !raw.trim()) {
+    toast('❌ Please paste ledger text or WhatsApp report');
+    return;
+  }
+  const parsed = parseDailyLedgerText(raw);
+  if (!parsed || !parsed.items.length) {
+    toast('❌ Could not parse ledger lines. Ensure items and figures are listed.');
+    return;
+  }
+
+  DB.dailyLedgers.push(parsed);
+  DB.importedRev += parsed.revenue;
+  
+  // Add to monthly revenue
+  const mk = parsed.date ? parsed.date.slice(0, 7) : getTodayEAT().slice(0, 7);
+  const idx = DB.monthly.labels.indexOf(mk);
+  if (idx >= 0) DB.monthly.revenue[idx] += parsed.revenue;
+  else { DB.monthly.labels.push(mk); DB.monthly.revenue.push(parsed.revenue); }
+
+  save();
+  toast(`✅ Daily ledger imported! KSh ${parsed.revenue.toLocaleString()} revenue recorded (Variance: ${parsed.variance >= 0 ? '+' : ''}${parsed.variance} KES)`);
+  if ($('ledgerPasteText')) $('ledgerPasteText').value = '';
+  refreshAll();
+}
+
+/* ══════════ MARGINS & PERSONALIZED IPI ALERTS ══════════ */
+function customerIPI(c) {
+  const visits = Math.max(c.visits || 1, 1);
+  if (visits <= 1) {
+    const days = c.days || 0;
+    return { ipi: 14, multiplier: Math.round((days / 14) * 10) / 10, status: days > 25 ? 'overdue' : 'ontrack' };
+  }
+  let tenureDays = 0;
+  if (c.firstVisit && c.lastVisit && c.lastVisit >= c.firstVisit) {
+    const f = new Date(c.firstVisit);
+    const l = new Date(c.lastVisit);
+    tenureDays = Math.max(0, Math.round((l - f) / 86400000));
+  }
+  if (tenureDays === 0) tenureDays = (visits - 1) * 14;
+  const ipi = Math.max(2, tenureDays / (visits - 1));
+  const mult = (c.days || 0) / ipi;
+  let status = 'ontrack';
+  if (mult >= 1.8) status = 'overdue';
+  else if (mult >= 1.2) status = 'duesoon';
+  return { ipi: Math.round(ipi * 10) / 10, multiplier: Math.round(mult * 10) / 10, status };
+}
+
+function getMarginStats() {
+  if (!DB.cogs) DB.cogs = { meatPct: 70, soupPct: 35, overhead: 35000 };
+  const ps = getProductStats();
+  const meatCost = ps.meatRevenue * (DB.cogs.meatPct / 100);
+  const soupCost = ps.soupRevenue * (DB.cogs.soupPct / 100);
+  const totalCogs = meatCost + soupCost;
+  const grossProfit = ps.totalRevenue - totalCogs;
+  const grossMarginPct = ps.totalRevenue > 0 ? (grossProfit / ps.totalRevenue) * 100 : 0;
+  const netProfit = grossProfit - (DB.cogs.overhead || 0);
+  const netMarginPct = ps.totalRevenue > 0 ? (netProfit / ps.totalRevenue) * 100 : 0;
+  return {
+    meatCost, soupCost, totalCogs, grossProfit, grossMarginPct,
+    netProfit, netMarginPct, overhead: DB.cogs.overhead || 0
+  };
+}
+
+function updateCogs(){
+  if(!DB.cogs) DB.cogs = { meatPct: 70, soupPct: 35, overhead: 35000 };
+  const m = Number($('meatCogsInput').value || 70);
+  const s = Number($('soupCogsInput').value || 35);
+  const o = Number($('overheadInput').value || 0);
+  DB.cogs.meatPct = m;
+  DB.cogs.soupPct = s;
+  DB.cogs.overhead = o;
+  save();
+  refreshAll();
+}
 
 /* ══════════ PRODUCT CLASSIFICATION (Meat vs Soup) ══════════ */
 const SOUP_START_DATE = '2026-06-01';
@@ -2588,6 +2805,8 @@ function getProductStats(){
 function repairDates(){
   let fixed = 0;
   DB.customers.forEach(c => {
+    if(c.firstVisit) c.firstVisit = stripTime(c.firstVisit);
+    if(c.lastVisit) c.lastVisit = stripTime(c.lastVisit);
     // 0. Reconcile against actual transaction history — this is the authoritative
     // source. Seed/baseline data (e.g. an older analytics CSV) can carry a stale
     // Last Visit that predates transactions a statement backfill later reveals;
@@ -2697,17 +2916,43 @@ function refreshAll(){
   $('hReach').textContent=validPct;
   $('maskedCount').textContent=`${REPORT.masked-DB.resolved} masked report-wide · ${cs.filter(c=>c.masked).length} in tracked list · ${DB.resolved} resolved`;
   const active=cs.filter(c=>c.days<=30).length,risk=cs.filter(c=>c.days>60&&c.days<=90).length,lost=cs.filter(c=>c.days>90).length;
+  const ipiOverdueCount = cs.filter(c => customerIPI(c).status === 'overdue').length;
   const ps = getProductStats();
+  const ms = getMarginStats();
+
+  if ($('meatCogsInput') && DB.cogs) {
+    $('meatCogsInput').value = DB.cogs.meatPct || 70;
+    $('soupCogsInput').value = DB.cogs.soupPct || 35;
+    $('overheadInput').value = DB.cogs.overhead || 35000;
+  }
+
+  if ($('cogsSummaryBar')) {
+    $('cogsSummaryBar').innerHTML = `
+      <div style="background:var(--card);padding:10px 12px;border-radius:8px;border:1px solid var(--border);">
+        <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;">Gross Profit</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--green);">${kes(ms.grossProfit)}</div>
+        <div style="font-size:.74rem;color:var(--muted);">${ms.grossMarginPct.toFixed(1)}% Gross Margin</div>
+      </div>
+      <div style="background:var(--card);padding:10px 12px;border-radius:8px;border:1px solid var(--border);">
+        <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;">Net Operating Profit</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${ms.netProfit >= 0 ? 'var(--green)' : 'var(--red)'};">${kes(ms.netProfit)}</div>
+        <div style="font-size:.74rem;color:var(--muted);">${ms.netMarginPct.toFixed(1)}% Net Margin</div>
+      </div>
+      <div style="background:var(--card);padding:10px 12px;border-radius:8px;border:1px solid var(--border);">
+        <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;">Total COGS Expense</div>
+        <div style="font-size:1.1rem;font-weight:700;color:var(--amber);">${kes(ms.totalCogs)}</div>
+        <div style="font-size:.74rem;color:var(--muted);">Meat ${kes(ms.meatCost)} · Soup ${kes(ms.soupCost)}</div>
+      </div>
+    `;
+  }
+
 $('kpiGrid').innerHTML=`
-  <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">incl. ${kes(DB.importedRev)} imported</div></div>
+  <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">Gross Sales</div></div>
+  <div class="kpi" style="--accent:var(--green)"><div class="label">Net Operating Margin</div><div class="value">${kes(ms.netProfit)}</div><div class="detail">${ms.netMarginPct.toFixed(1)}% net margin</div></div>
+  <div class="kpi" style="--accent:var(--amber)"><div class="label">Cadence Overdue</div><div class="value">${ipiOverdueCount}</div><div class="detail">⚡ 1.8x personal IPI delay</div></div>
   <div class="kpi" style="--accent:var(--blue)"><div class="label">Customers</div><div class="value">${totCust.toLocaleString()}</div><div class="detail">${cs.filter(c=>c.isNew).length} added via import</div></div>
-  <div class="kpi" style="--accent:var(--green)"><div class="label">Contacts Resolved</div><div class="value">${DB.resolved}</div><div class="detail">masked → reachable</div></div>
-  <div class="kpi" style="--accent:var(--amber)"><div class="label">Reachable</div><div class="value">${validPct}%</div><div class="detail">target: 80%</div></div>
   <div class="kpi" style="--accent:var(--purple)"><div class="label">Tracked VIPs</div><div class="value">${cs.filter(c=>c.spent>=10000).length}</div><div class="detail">KES 10K+ lifetime</div></div>
-  <div class="kpi" style="--accent:var(--red2)"><div class="label">At Risk Now</div><div class="value">${risk}</div><div class="detail">win-back window (61–90d)</div></div>
-  <div class="kpi" style="--accent:#e63946"><div class="label">🥩 Meat Revenue</div><div class="value">${kes(ps.meatRevenue)}</div><div class="detail">${ps.meatCustomers.toLocaleString()} customers · ${ps.meatVisits.toLocaleString()} visits</div></div>
-  <div class="kpi" style="--accent:#f4a261"><div class="label">🍲 Soup Revenue</div><div class="value">${kes(ps.soupRevenue)}</div><div class="detail">${ps.soupCustomers.toLocaleString()} customers · ${ps.soupVisits.toLocaleString()} visits</div></div>
-  <div class="kpi" style="--accent:#2ec4b6"><div class="label">💰 Combined</div><div class="value">${kes(ps.totalRevenue)}</div><div class="detail">${ps.totalCustomers.toLocaleString()} customers · ${ps.totalVisits.toLocaleString()} visits</div></div>`;
+`;
   if(revChart)revChart.destroy();if(segChart)segChart.destroy();
   revChart=new Chart($('ovRev'),{type:'bar',data:{labels:DB.monthly.labels,datasets:[{data:DB.monthly.revenue,
     backgroundColor:'rgba(230,57,70,.65)',borderRadius:6}]},options:{maintainAspectRatio:false,
@@ -2725,6 +2970,7 @@ function renderCustTable(){
   const lvFrom=$('lastVisitFrom').value,lvTo=$('lastVisitTo').value;
   rows=rows.filter(c=>{if(f==='vip')return c.spent>=10000;if(f==='active')return c.days<=30;
     if(f==='risk')return c.days>60&&c.days<=90;if(f==='lost')return c.days>90;
+    if(f==='overdue')return customerIPI(c).status==='overdue';
     if(f==='masked')return c.masked;if(f==='new')return c.isNew;return true;});
   if(lvFrom)rows=rows.filter(c=>c.lastVisit&&c.lastVisit>=lvFrom);
   if(lvTo)rows=rows.filter(c=>c.lastVisit&&c.lastVisit<=lvTo);
@@ -2766,7 +3012,7 @@ function renderCustTable(){
     <td>${c.name}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${c.isNew?' <span class="badge b-new">NEW</span>':''}</td>
     <td><span class="badge ${c.masked?'b-masked':'b-valid'}">${c.contact}</span></td>
     <td>${kes(c.spent)}</td><td>${c.visits}</td><td>KES ${Math.round(c.spent/Math.max(c.visits,1))}</td>
-    <td>${c.days}</td><td>${first}</td><td>${last}</td><td><span class="badge ${cls}">${st}</span></td>
+    <td>${c.days}</td><td>${first}</td><td>${last}</td><td><span class="badge ${cls}">${st}</span>${customerIPI(c).status==='overdue'?' <span class="badge b-risk" title="Personal purchase interval overdue">⚡ Overdue</span>':''}</td>
     <td style="white-space:nowrap"><button class="btn ghost sm" onclick="event.stopPropagation();showCustomerDetail('${c.name.replace(/'/g,"\'")}')">👁️</button>${reach}</td></tr>`;}).join('');
 }
 $('custSearch').oninput=renderCustTable;$('custFilter').onchange=renderCustTable;$('custSort').onchange=renderCustTable;
@@ -2872,6 +3118,16 @@ function parseDate(value) {
   // Try YYYY/MM/DD format too
   const iso2 = raw.match(/(\d{4}\/\d{2}\/\d{2})/);
   if (iso2) return iso2[1].replace(/\//g, '-');
+  // Try DD/MM/YYYY or DD-MM-YYYY format
+  const dmy = raw.match(/(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})/);
+  if (dmy) {
+    const day = String(dmy[1]).padStart(2, '0');
+    const month = String(dmy[2]).padStart(2, '0');
+    const year = dmy[3];
+    if (Number(month) <= 12 && Number(day) <= 31) {
+      return `${year}-${month}-${day}`;
+    }
+  }
   const d = new Date(raw);
   if (!isNaN(d)) return d.toISOString().slice(0, 10);
   return "";
@@ -3001,16 +3257,14 @@ function mergeBaselineCustomer(c) {
     existing.spent = Math.max(Number(existing.spent || 0), Number(c.totalSpent || 0));
     existing.visits = Math.max(Number(existing.visits || 0), Number(c.visits || 0));
     // Handle visit dates: firstVisit = earliest, lastVisit = latest
-    const newDate = c.lastVisit || c.firstVisit || "";
-    if (newDate) {
-      const newDateObj = new Date(newDate);
-      // Update lastVisit if new date is more recent
-      if (!existing.lastVisit || newDateObj > new Date(existing.lastVisit)) {
-        existing.lastVisit = newDate;
+    if (c.lastVisit) {
+      if (!existing.lastVisit || c.lastVisit > existing.lastVisit) {
+        existing.lastVisit = c.lastVisit;
       }
-      // Update firstVisit if new date is older (or not set)
-      if (!existing.firstVisit || newDateObj < new Date(existing.firstVisit)) {
-        existing.firstVisit = newDate;
+    }
+    if (c.firstVisit) {
+      if (!existing.firstVisit || c.firstVisit < existing.firstVisit) {
+        existing.firstVisit = c.firstVisit;
       }
     }
     // Recalculate days from lastVisit
@@ -3353,93 +3607,7 @@ function importTransactions(txs) {
 
 
 
-/* ══════════ FIRST VISIT CORRECTION ══════════ */
-function handleFixFirstVisit(input){
-  const file = input.files[0];
-  if(!file) return;
-  const reader = new FileReader();
-  reader.onload = function(e){
-    try{
-      let data = [];
-      if(file.name.endsWith('.csv')){
-        data = parseCSV(e.target.result);
-      } else {
-        // For XLSX we'd need SheetJS - use CSV for now
-        alert('Please save as CSV and re-upload. XLSX support coming soon.');
-        input.value = '';
-        return;
-      }
-      const result = fixFirstVisits(data);
-      alert(`✅ First Visit correction complete!
 
-Matched & updated: ${result.updated}
-Not found: ${result.notFound}
-Skipped (no date): ${result.skipped}`);
-      input.value = '';
-      renderAll();
-      if(SYNC_MODE === 'auto') saveToCloud();
-    }catch(err){
-      alert('Error: ' + err.message);
-      input.value = '';
-    }
-  };
-  reader.readAsText(file);
-}
-
-function fixFirstVisits(rows){
-  let updated = 0, notFound = 0, skipped = 0;
-  const nameIndex = {};
-  DB.customers.forEach(c => {
-    const key = c.name.trim().toLowerCase();
-    if(!nameIndex[key]) nameIndex[key] = [];
-    nameIndex[key].push(c);
-  });
-
-  rows.forEach(row => {
-    const name = (row.name || row.Name || row.customer || row.Customer || '').trim();
-    const phone = (row.phone || row.Phone || row.contact || row.Contact || row.mobile || row.Mobile || '').trim();
-    const firstVisit = stripTime(row.firstVisit || row.FirstVisit || row.first_visit || row['first visit'] || row.date || row.Date || '');
-
-    if(!firstVisit){
-      skipped++;
-      return;
-    }
-
-    let matches = [];
-
-    // Try phone match first (if phone is valid, not masked)
-    if(phone && !phone.match(/xx/i) && phone.length >= 9){
-      const norm = normalizeContact(phone);
-      matches = DB.customers.filter(c => c.contact === norm || c.contact.includes(phone.slice(-4)));
-    }
-
-    // Fallback: name match (case-insensitive, exact)
-    if(matches.length === 0 && name){
-      const key = name.toLowerCase();
-      matches = nameIndex[key] || [];
-    }
-
-    // Also try partial name match if exact fails
-    if(matches.length === 0 && name){
-      const key = name.toLowerCase();
-      matches = DB.customers.filter(c => c.name.toLowerCase() === key || c.name.toLowerCase().includes(key));
-    }
-
-    if(matches.length === 1){
-      matches[0].firstVisit = firstVisit;
-      updated++;
-    } else if(matches.length > 1){
-      // Multiple matches - update all (rare, but possible with common names)
-      matches.forEach(c => { c.firstVisit = firstVisit; });
-      updated += matches.length;
-    } else {
-      notFound++;
-    }
-  });
-
-  save();
-  return { updated, notFound, skipped };
-}
 
 
 
@@ -3544,6 +3712,7 @@ function fixFirstVisits(rows){
     }
   });
 
+  repairDates();
   save();
   return { updated, notFound, skipped };
 }
@@ -4525,8 +4694,8 @@ async function smartMergeCloud(){
         merged.push({
           ...localCust,
           ...(useCloud ? cloudCust : {}),
-          firstVisit: stripTime(useCloud ? (cloudCust.firstVisit || localCust.firstVisit) : (localCust.firstVisit || cloudCust.firstVisit)),
-          lastVisit: stripTime(useCloud ? (cloudCust.lastVisit || localCust.lastVisit) : (localCust.lastVisit || cloudCust.lastVisit))
+          firstVisit: (() => { const f1 = stripTime(cloudCust.firstVisit), f2 = stripTime(localCust.firstVisit); return (f1 && f2) ? (f1 < f2 ? f1 : f2) : (f1 || f2 || ""); })(),
+          lastVisit: (() => { const l1 = stripTime(cloudCust.lastVisit), l2 = stripTime(localCust.lastVisit); return (l1 && l2) ? (l1 > l2 ? l1 : l2) : (l1 || l2 || ""); })()
         });
         cloudMap.delete(name);
         mergedCount++;
@@ -4638,6 +4807,8 @@ function showCustomerDetail(name){
   $('modalVisits').textContent = c.visits;
   $('modalAvg').textContent = 'KES ' + Math.round(c.spent/Math.max(c.visits,1)).toLocaleString();
   $('modalLast').textContent = c.lastVisit || '—';
+  const ipiInfo = customerIPI(c);
+  $('modalAvg').innerHTML = 'KES ' + Math.round(c.spent/Math.max(c.visits,1)).toLocaleString() + '<br><small style="color:var(--muted);font-size:.72rem;">Cycle: ~' + ipiInfo.ipi + 'd (' + (ipiInfo.status==='overdue'?'⚠️ Overdue ' + ipiInfo.multiplier + 'x': 'On track') + ')</small>';
 
   // Build transaction history
   const txs = DB.customerTx[name] || [];
@@ -4845,14 +5016,14 @@ function recalcFromHistory(){
     c.visits = txs.length;
     const dates = txs.map(t => t.date).filter(Boolean).sort();
     if(dates.length > 0){
-      c.firstVisit = dates[0];
-      c.lastVisit = dates[dates.length - 1];
+      const minTx = dates[0];
+      const maxTx = dates[dates.length - 1];
+      if(!c.firstVisit || minTx < c.firstVisit) c.firstVisit = minTx;
+      if(!c.lastVisit || maxTx > c.lastVisit) c.lastVisit = maxTx;
     }
     if(c.lastVisit){
       const today = new Date(getTodayEAT());
-      const last = new Date(c.lastVisit);
-      const diff = Math.floor((today - last) / 86400000);
-      c.days = diff;
+      c.days = Math.max(0, Math.round((today - new Date(c.lastVisit)) / 86400000));
     }
   });
 }

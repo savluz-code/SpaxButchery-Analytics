@@ -673,6 +673,9 @@ async function loadFromCloud() {
       localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
       const cloudFixed = repairDates();
       if(cloudFixed > 0) console.log('Cloud sync repair: fixed', cloudFixed, 'customers');
+      // Merchant exclusion is non-negotiable: if the cloud sheet still carries
+      // Simon Musyoka (the Merchant), scrub him from the merged data now.
+      purgeMerchantData();
       refreshAll();
       return true;
     } else {
@@ -700,22 +703,27 @@ async function saveToCloud(force = false) {
   showSyncStatus('⏳ Saving to cloud...');
 
   try {
+    // Merchant exclusion applies to the cloud too: never push Simon Musyoka
+    // (the Merchant) to the Google Sheet — his rows, customer record, or
+    // history would come back on the next pull and pollute revenue again.
     const payload = {
       action: 'saveAll',
-      customers: DB.customers,
+      customers: (DB.customers || []).filter(c => !isMerchant(c.name)),
       monthly: DB.monthly,
       settings: {
         importedRev: DB.importedRev,
         importedTx: DB.importedTx,
         resolved: DB.resolved
       },
-      customerTx: DB.customerTx || {},
+      customerTx: Object.fromEntries(
+        Object.entries(DB.customerTx || {}).filter(([name]) => !isMerchant(name))
+      ),
       // Send the dedup map verbatim (same format as transactionKey) so every
       // device restores an identical guard. Previously the seen-map was flattened
       // into fake transaction rows, which corrupted the cloud transactions list
       // and produced keys ('R:'/'C:') that never matched the local guard format.
       seen: DB.seen || {},
-      transactions: DB.transactions || []
+      transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
 
     const response = await fetch(GAS_URL, {
@@ -2588,6 +2596,11 @@ function load(){
       localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
     }
 
+    // MERCHANT CLEANUP: scrub any Simon Musyoka (the Merchant) records that a
+    // previous version of the app may have captured — transactions, customer
+    // rows, history and revenue. Persists automatically if anything was removed.
+    purgeMerchantData();
+
     // Now try cloud sync (will push seed data if cloud is empty)
     return loadFromCloud().then(cloudLoaded => {
       if (!cloudLoaded) {
@@ -3114,32 +3127,12 @@ Chart.defaults.color='#8b9aa7';Chart.defaults.borderColor='rgba(255,255,255,.06)
 let revChart,segChart;
 function refreshAll(){
   const today = new Date(getTodayEAT());
-  
-  // MERCHANT CLEANUP: Simon Musyoka (The Merchant) exclusion logic.
-  // This ensures his internal transfers/withdrawals never pollute revenue or customer metrics.
-  const merchantTransactions = DB.transactions.filter(t => isMerchant(t.name) || isMerchant(t.details));
-  if (merchantTransactions.length > 0) {
-    const merchantRev = merchantTransactions.reduce((s, t) => s + (Number(t.amount) || 0), 0);
-    
-    // 1. Reduce global imported revenue
-    DB.importedRev = Math.max(0, DB.importedRev - merchantRev);
-    
-    // 2. Reduce monthly revenue buckets
-    merchantTransactions.forEach(t => {
-      const mk = t.date ? t.date.slice(0, 7) : '';
-      if (mk) {
-        const i = DB.monthly.labels.indexOf(mk);
-        if (i >= 0) DB.monthly.revenue[i] = Math.max(0, DB.monthly.revenue[i] - (Number(t.amount) || 0));
-      }
-    });
 
-    // 3. Remove from transactions and customer list
-    DB.transactions = DB.transactions.filter(t => !isMerchant(t.name) && !isMerchant(t.details));
-    DB.customers = DB.customers.filter(c => !isMerchant(c.name));
-    
-    save(); // Persist the cleanup
-    console.log(`Cleaned up ${merchantTransactions.length} merchant transactions worth KSh ${merchantRev}`);
-  }
+  // MERCHANT CLEANUP: Simon Musyoka (The Merchant) exclusion — see
+  // purgeMerchantData(). His internal transfers/withdrawals must never appear
+  // in the transactions list, customer list, history, or revenue aggregates.
+  // No-op (and non-destructive) once the data is clean.
+  purgeMerchantData();
 
   // Recalculate days from lastVisit for all customers
   DB.customers.forEach(c=>{
@@ -3628,11 +3621,104 @@ function extractPerson(details) {
 }
 
 // MERCHANT EXCLUSION: Global check to ensure internal merchant transactions
-// (Simon Musyoka) never pollute customer metrics or revenue.
+// (Simon Musyoka — the Merchant/owner, NOT a customer) never pollute customer
+// metrics or revenue. Matches any name containing both a "Simon" token
+// (incl. OCR/typo variants like "Simo") and "Musyoka", in any order. Real
+// customers like "Simon Mwathi Mwangi" or "John Musyoka Malonza" are safe —
+// they never match both tokens.
 function isMerchant(name) {
   if (!name) return false;
-  const n = String(name).toLowerCase();
-  return n.includes("simon") && n.includes("musyoka");
+  const n = String(name).toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!n) return false;
+  // Exact-token match: "simon" (incl. the common OCR/typo variant "simo")
+  // PLUS "musyoka", in any order. Distinct names like "Simona Musyoka" or
+  // "Simion Musyoka" are NOT matched, and neither are real customers such as
+  // "Simon Mwathi Mwangi" or "John Musyoka Malonza".
+  const hasSimon = n.split(/\s+/).some(w => w === 'simon' || w === 'simo');
+  return hasSimon && n.includes('musyoka');
+}
+
+let _purgeBusy = false;
+// CENTRAL MERCHANT PURGE — Simon Musyoka (the Merchant) is removed from every
+// corner of the DB: the transactions list, per-customer history, customer
+// records, dedup keys, and his amounts are rolled back out of the revenue
+// aggregates (importedRev, importedTx, monthly buckets). Safe to run on every
+// refresh: it is a no-op once the data is clean, so calling it repeatedly
+// costs nothing. When something IS removed it persists via save(), which also
+// pushes the scrubbed data to the cloud on the next auto-sync.
+function purgeMerchantData(quiet) {
+  if (_purgeBusy) return { removedTx: 0, removedCustomers: 0, removedRev: 0 };
+  _purgeBusy = true;
+  try {
+    const beforeTx = (DB.transactions || []).length;
+    const beforeCustomers = (DB.customers || []).length;
+    const merchantTx = (DB.transactions || []).filter(t => isMerchant(t.name) || isMerchant(t.details));
+    const removedRev = merchantTx.reduce((s, t) => s + (Number(t.amount) || 0), 0);
+
+    // 1. Roll his amounts back out of the revenue aggregates (global + monthly
+    // buckets) — once per transaction. The SAME transaction also lives in
+    // DB.customerTx[his name], so track which rows are already covered here
+    // and skip them in step 3 to avoid double-subtraction.
+    const covered = new Set();
+    if (merchantTx.length) {
+      DB.importedRev = Math.max(0, (Number(DB.importedRev) || 0) - removedRev);
+      DB.importedTx = Math.max(0, (Number(DB.importedTx) || 0) - merchantTx.length);
+      merchantTx.forEach(t => {
+        covered.add(((t.receipt || '') + '|' + (t.date || '') + '|' + (Number(t.amount) || 0)).toLowerCase());
+        const mk = t.date ? String(t.date).slice(0, 7) : '';
+        if (mk && DB.monthly && DB.monthly.labels) {
+          const i = DB.monthly.labels.indexOf(mk);
+          if (i >= 0) DB.monthly.revenue[i] = Math.max(0, (Number(DB.monthly.revenue[i]) || 0) - (Number(t.amount) || 0));
+        }
+      });
+      // 2. Drop his transactions and their dedup keys (so a future re-import
+      // of the same statement is filtered at parse time, not mis-flagged).
+      const removedKeys = new Set(merchantTx.map(t => transactionKey(t)));
+      merchantTx.forEach(t => { const k2 = txKeyNoTime(t); if (k2) removedKeys.add(k2); });
+      if (DB.seen) Object.keys(DB.seen).forEach(k => { if (removedKeys.has(k)) delete DB.seen[k]; });
+      DB.transactions = DB.transactions.filter(t => !isMerchant(t.name) && !isMerchant(t.details));
+    }
+
+    // 3. His per-customer history — also rolls back any amounts that only
+    // ever landed in customerTx WITHOUT a matching DB.transactions row
+    // (e.g. rows merged in from the cloud), which is why each entry is checked
+    // against the `covered` set first: the same transaction must never be
+    // subtracted from a monthly bucket twice.
+    if (DB.customerTx) {
+      Object.keys(DB.customerTx).forEach(name => {
+        if (!isMerchant(name)) return;
+        (DB.customerTx[name] || []).forEach(t => {
+          const ck = ((t.receipt || '') + '|' + (t.date || '') + '|' + (Number(t.amount) || 0)).toLowerCase();
+          if (covered.has(ck)) return;
+          const mk = t.date ? String(t.date).slice(0, 7) : '';
+          if (mk && DB.monthly && DB.monthly.labels) {
+            const i = DB.monthly.labels.indexOf(mk);
+            if (i >= 0) DB.monthly.revenue[i] = Math.max(0, (Number(DB.monthly.revenue[i]) || 0) - (Number(t.amount) || 0));
+          }
+        });
+        delete DB.customerTx[name];
+      });
+    }
+
+    // 4. His customer record(s) — he must never appear in the customer list
+    // or any segment/outreach/report.
+    const merchantCustNames = new Set();
+    (DB.customers || []).forEach(c => { if (isMerchant(c.name)) merchantCustNames.add(c.name); });
+    if (merchantCustNames.size) {
+      DB.customers = DB.customers.filter(c => !merchantCustNames.has(c.name));
+    }
+
+    const removedTx = beforeTx - (DB.transactions || []).length;
+    const removedCustomers = beforeCustomers - (DB.customers || []).length;
+    if ((removedTx || removedCustomers || removedRev) && !quiet) {
+      save(); // persist — save() → refreshAll() re-enters, but the next pass
+              // is a no-op (everything is already clean), so this converges.
+      console.log(`Merchant cleanup: removed ${removedTx} transaction(s), ${removedCustomers} customer record(s), KSh ${removedRev} rolled back from revenue`);
+    }
+    return { removedTx, removedCustomers, removedRev };
+  } finally {
+    _purgeBusy = false;
+  }
 }
 
 function parseMpesaText(raw, sourceLabel) {
@@ -4358,7 +4444,9 @@ function parseContactListFromText(text) {
         if (parts.length > Math.max(nameIdx, phoneIdx)) {
           const name = parts[nameIdx].replace(/\d{5,}/g, '').replace(/\s+/g, ' ').trim();
           const phone = normalizeContact(parts[phoneIdx]);
-          if (name && phone && isValidKenyanContact(phone) && !seen.has(phone)) {
+          // MERCHANT EXCLUSION: the owner's own entry must never enter the
+          // contact list / resolver.
+          if (name && phone && isValidKenyanContact(phone) && !seen.has(phone) && !isMerchant(name)) {
             seen.add(phone);
             contacts.push({ name: toTitleCase(name), phone });
           }
@@ -4392,7 +4480,7 @@ function parseContactListFromText(text) {
       name = name.replace(/[,;:|\t]/g, ' ').replace(/\d{5,}/g, '').replace(/\s+/g, ' ').trim();
       name = name.replace(/^[-–—\s]+/, '').trim();
     }
-    if (name && name.length >= 2 && !/\b(paid|in|amount|kes|completed|merchant|payment|from|to|date|time|receipt)\b/i.test(name)) {
+    if (name && name.length >= 2 && !/\b(paid|in|amount|kes|completed|merchant|payment|from|to|date|time|receipt)\b/i.test(name) && !isMerchant(name)) {
       seen.add(phone);
       contacts.push({ name: toTitleCase(name), phone });
     }
@@ -4506,20 +4594,25 @@ async function parseAnyFile(file){
     const list=rows.map(row=>({
       name:String(pick(row,['Name','Customer','Customer Name'])||'').trim(),
       phone:normalizeContact(pick(row,['Contact','Phone','Phone Number','Mobile']))
-    })).filter(x=>x.phone&&!x.phone.includes('*'));
+    })).filter(x=>x.phone&&!x.phone.includes('*')&&!isMerchant(x.name));
     if(list.length) resolveContacts(list,true);
     return [];
   }
 
   // M-Pesa statement export
   if(hasDetails&&hasPaidIn){
-    return rows.map(row=>{
+    const out=[];
+    rows.forEach(row=>{
       const det=String(pick(row,['Details','Narration','Other Party'])||'');
+      // MERCHANT EXCLUSION: Simon Musyoka's internal transfers must never be
+      // parsed as revenue — check the raw details AND the extracted name.
+      if(isMerchant(det)) return;
       const pm=det.match(/254[\d*]{6,12}|0[71][\d*]{5,11}/);
       let name=det.replace(/merchant payment( online)?( received)? from|small business pay merchant from|254[\d*]+|0[71][\d*]+|\d{5,}/gi,' ')
         .replace(/[-–—]/g,' ').replace(/\s+/g,' ').trim();
       const amt=parseAmount(pick(row,['Paid In','Credit','Amount','Paid in']));
-      return{
+      if(amt<=0||isMerchant(name)) return;
+      out.push({
         receipt:pick(row,['Receipt','Receipt No','Transaction ID','Ref']),
         name:toTitleCase(name)||'Unknown',
         phone:pm?normalizeContact(pm[0]):'',
@@ -4528,8 +4621,9 @@ async function parseAnyFile(file){
         date:parseDate(pick(row,['Date','Completion Time','Transaction Date'])),
         time:String(pick(row,['Time','Completion Time'])||'').match(/(\d{2}:\d{2}:\d{2})/)?.[1]||'',
         source:'CSV/Excel'
-      };
-    }).filter(x=>x.amount>0);
+      });
+    });
+    return out;
   }
 
   // Customer export — this carries a customer's LIFETIME Total_Spent and
@@ -4539,17 +4633,23 @@ async function parseAnyFile(file){
   // history that produced this total gets counted a second time as soon as
   // the underlying M-Pesa transactions are also imported.
   if(hasName&&hasAmount){
-    return rows.map(row=>({
-      receipt:'',
-      name:String(pick(row,['Name','Customer','Customer Name'])||'').trim(),
-      phone:'',
-      amount:parseAmount(pick(row,['Total_Spent','Total Spent','Spent','Amount','Revenue'])),
-      visits:parseAmount(pick(row,['Visits','Visit Count','Transactions']))||1,
-      date:parseDate(pick(row,['Last_Visit','Last Visit','Date'])),
-      time:'',
-      source:'Customer Export',
-      isAggregate:true
-    })).filter(x=>x.amount>0||x.name);
+    return rows.map(row=>{
+      const nm=String(pick(row,['Name','Customer','Customer Name'])||'').trim();
+      // MERCHANT EXCLUSION: never merge a Simon Musyoka row from a customer
+      // export into the database — he is the owner, not a customer.
+      if(isMerchant(nm)) return null;
+      return{
+        receipt:'',
+        name:nm,
+        phone:'',
+        amount:parseAmount(pick(row,['Total_Spent','Total Spent','Spent','Amount','Revenue'])),
+        visits:parseAmount(pick(row,['Visits','Visit Count','Transactions']))||1,
+        date:parseDate(pick(row,['Last_Visit','Last Visit','Date'])),
+        time:'',
+        source:'Customer Export',
+        isAggregate:true
+      };
+    }).filter(x=>x&&(x.amount>0||x.name));
   }
 
   return [];
@@ -4600,10 +4700,13 @@ function parseSheetRows(raw) {
     fmt = 'M-Pesa CSV';
     body.forEach(r => {
       const det = '' + (r[iDet] || '');
+      // MERCHANT EXCLUSION: Simon Musyoka's rows are never revenue.
+      if (isMerchant(det)) return;
       const pm = det.match(/254[\d*]{6,12}|0[71][\d*]{5,11}/);
       let name = det.replace(/merchant payment( online)?( received)? from|small business pay merchant from|254[\d*]+|0[71][\d*]+|\d{5,}/gi, ' ')
         .replace(/[-–—]/g, ' ').replace(/\s+/g, ' ').trim();
       const amt = parseFloat(('' + (r[iPaid] || 0)).replace(/[^\d.]/g, '')) || 0;
+      if (isMerchant(name)) return;
       if (amt > 0 && (pm || name)) rows.push({
         receipt: iRcpt >= 0 ? ('' + (r[iRcpt] || '')) : '',
         name: toTitleCase(name) || 'Unknown',
@@ -4620,9 +4723,12 @@ function parseSheetRows(raw) {
     // the matching isAggregate note in parseAnyFile's Customer export branch).
     const isAggregate = iVis >= 0;
     body.forEach(r => {
+      // MERCHANT EXCLUSION: never import the owner as a customer row.
+      const nm = '' + (r[iName] || '').trim();
+      if (isMerchant(nm)) return;
       const amt = parseFloat(('' + (r[iAmt] || 0)).replace(/[^\d.]/g, '')) || 0;
       rows.push({
-        receipt: '', name: '' + (r[iName] || '').trim(),
+        receipt: '', name: nm,
         phone: iPhone >= 0 ? normalizeContact(r[iPhone] || '') : '',
         amount: amt, visits: iVis >= 0 ? (parseInt(r[iVis]) || 1) : 1,
         date: iDate >= 0 ? ('' + (r[iDate] || '')).slice(0, 10) : '', time: '',
@@ -4630,7 +4736,7 @@ function parseSheetRows(raw) {
       });
     });
   } else if (iName >= 0 && iPhone >= 0) {
-    const list = body.map(r => ({ name: '' + (r[iName] || '').trim(), phone: normalizeContact(r[iPhone] || '') })).filter(x => x.phone && !x.phone.includes('*'));
+    const list = body.map(r => ({ name: '' + (r[iName] || '').trim(), phone: normalizeContact(r[iPhone] || '') })).filter(x => x.phone && !x.phone.includes('*') && !isMerchant(x.name));
     const n = resolveContacts(list, true);
     toast(`📇 Contact list detected — ${n} masked contact(s) auto-resolved`);
     return;
@@ -4642,6 +4748,9 @@ function parseSheetRows(raw) {
 
 /* ══════════ PREVIEW + DEDUP + CONFIRM ══════════ */
 function showPreview(rows, fmt) {
+  // MERCHANT EXCLUSION: Simon Musyoka (the Merchant) must not even appear in
+  // the import preview — his rows are dropped before the user sees them.
+  rows = rows.filter(r => !isMerchant(r.name) && !isMerchant(r.details));
   pendingRows = rows.map(r => ({ ...r, dup: isSeen(r) }));
   const dups = pendingRows.filter(r => r.dup).length;
   $('pvFormat').textContent = fmt;
@@ -4922,6 +5031,8 @@ function renderMaskTable(){
 function resolveContacts(list,silent){
   let auto=0;const review=[];const resolvedNames=[];
   list.forEach(item=>{
+    // MERCHANT EXCLUSION: never resolve or unmask anything for Simon Musyoka.
+    if(isMerchant(item.name)) return;
     const p=normPhone(item.phone);if(p.length!==10||p.includes('*'))return;
     DB.customers.filter(c=>c.masked&&maskedMatches(c.contact,p)).forEach(c=>{
       const sim=item.name?nameSim(c.name,item.name):0;
@@ -5366,6 +5477,7 @@ async function forcePullFromCloud(){
     }
 
     save();
+    purgeMerchantData();
     refreshAll();
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pulled ' + DB.customers.length + ' customers from cloud. Local data overwritten.</span>';
     showSyncStatus('✅ Force pull complete');
@@ -5440,6 +5552,9 @@ async function smartMergeCloud(){
     });
 
     save();
+    // Merchant exclusion survives merges too — drop any Simon Musyoka records
+    // pulled in from the cloud BEFORE pushing, so the sheet gets scrubbed too.
+    purgeMerchantData();
     await saveToCloud(true);
     refreshAll();
 

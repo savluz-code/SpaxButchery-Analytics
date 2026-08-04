@@ -2493,6 +2493,7 @@ function seedDB(){
       return{
         name:c[0],contact:c[1],spent:c[2],visits:c[3],days:c[4],
         firstVisit: firstVisit, lastVisit: lastVisit,
+        seedFrom: firstVisit, seedTo: lastVisit, // original seed coverage window — never mutated
         masked:c[1].includes('***'),isNew:false
       };
     }),
@@ -2521,6 +2522,17 @@ function load(){
     if(Object.keys(DB.seen).some(k => /^[RC]:/.test(k))){
       DB.seen = {};
       DB.transactions.forEach(t => { markSeen(t); });
+    }
+    // Snapshot the ORIGINAL seed coverage window (seedFrom/seedTo) for customers
+    // from older saves, so the seed guard keeps its exact window even after
+    // imports extend lastVisit. Name-matched against the seed array; harmless for
+    // import-created customers (excluded from the guard by isNew anyway).
+    if(!DB.customers.some(c => c.seedFrom || c.seedTo)){
+      const seedBy = new Map(SEED_CUSTOMERS.map(s => [normalizeName(s[0]), s]));
+      DB.customers.forEach(c => {
+        const s = seedBy.get(normalizeName(c.name));
+        if(s){ c.seedFrom = c.seedFrom || stripTime(s[5]) || ''; c.seedTo = c.seedTo || stripTime(s[6]) || ''; }
+      });
     }
     } else {
       DB=seedDB();
@@ -3705,8 +3717,12 @@ function isSeedDuplicate(tx) {
   const cust = findCustomerMatch(tx);
   if (!cust || cust.isNew) return false;                       // seed customers only (not import-created)
   if (Number(cust.visits || 0) === 0 && Number(cust.spent || 0) === 0) return false; // rebuild reset → statements are the source of truth
-  const first = cust.firstVisit || '';
-  const last = cust.lastVisit || first;
+  // Use the ORIGINAL seed window (seedFrom/seedTo, snapshotted at seed time), NOT
+  // the live firstVisit/lastVisit: imports extend lastVisit, which would silently
+  // widen the window and wrongly skip genuinely-new rows in out-of-order imports
+  // (e.g. July 2026 imported before May 2026). The snapshot is the true coverage.
+  const first = cust.seedFrom || cust.firstVisit || '';
+  const last = cust.seedTo || cust.lastVisit || first;
   if (!first) return false;
   return tx.date >= first && tx.date <= last;
 }

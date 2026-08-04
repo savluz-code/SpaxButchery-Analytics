@@ -3060,10 +3060,20 @@ function findCustomer(phone,name){
 }
 
 /* ══════════ NAV ══════════ */
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+function activateTab(id){
+  const b=document.querySelector(`nav button[data-tab="${id}"]`);
+  if(!b||!$(id))return;
   document.querySelectorAll('nav button,.tab').forEach(x=>x.classList.remove('active'));
-  b.classList.add('active');$(b.dataset.tab).classList.add('active');
-  if(b.dataset.tab==='outreach')renderSeg();});
+  b.classList.add('active');$(id).classList.add('active');
+  if(id==='outreach')renderSeg();
+}
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  activateTab(b.dataset.tab);
+  if(history.replaceState)history.replaceState(null,'','#'+b.dataset.tab);
+});
+// Deep-link: open a tab directly via #hash (e.g. index.html#import)
+if(location.hash)activateTab(location.hash.slice(1));
+window.addEventListener('hashchange',()=>activateTab(location.hash.slice(1)));
 
 /* ══════════ OVERVIEW ══════════ */
 Chart.defaults.color='#8b9aa7';Chart.defaults.borderColor='rgba(255,255,255,.06)';

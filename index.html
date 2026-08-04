@@ -2635,24 +2635,43 @@ function parseDailyLedgerText(text) {
     const l = line.trim();
     if (!l) return;
 
-    if (/c\/h|cash\s*in\s*hand/i.test(l)) {
-      const m = l.match(/(\d+(?:\.\d+)?)/);
-      if (m) ch = parseFloat(m[1]);
-    } else if (/mpesa/i.test(l)) {
-      const m = l.match(/(\d+(?:\.\d+)?)/);
-      if (m) mpesa = parseFloat(m[1]);
-    } else if (/exp|expenses/i.test(l)) {
-      const m = l.match(/(\d+(?:\.\d+)?)/);
-      if (m) exp = parseFloat(m[1]);
-    } else if (/total|revenue/i.test(l) && !/item/i.test(l)) {
+    // Skip table header rows ("OS Pur Total Waste CS Sales Cash") — otherwise a
+    // stray number on a header line would poison the written-total override.
+    const headerHits = (l.match(/\b(os|pur|total|waste|cs|sales|cash|ksh)\b/gi) || []).length;
+    if (headerHits >= 2) return;
+
+    // Keyword lines (C/H, M-Pesa, Exp) are only honoured when the line carries
+    // exactly ONE number — a multi-figure line is a data row whose margin junk
+    // happened to read as a keyword ("C/H Liver 178178 0 75 …" ≠ cash-in-hand).
+    const lineNums = l.match(/\d+(?:\.\d+)?/g) || [];
+
+    if (/c\/h|cash\s*in\s*hand/i.test(l) && lineNums.length === 1) {
+      ch = parseFloat(lineNums[0]);
+    } else if (/mpesa/i.test(l) && lineNums.length === 1) {
+      mpesa = parseFloat(lineNums[0]);
+    } else if (/\bexp\b|expenses/i.test(l) && lineNums.length === 1) {
+      exp = parseFloat(lineNums[0]);
+    } else if (/^(grand\s*)?total|^revenue/i.test(l) && !/item/i.test(l)) {
       const m = l.match(/(\d+(?:\.\d+)?)/);
       if (m) totalWrittenRevenue = parseFloat(m[1]);
     } else {
       const parts = l.split(/[\s,\t]+/);
       if (parts.length >= 2) {
-        const name = parts[0].replace(/[^a-zA-Z]/g, '');
-        if (name && name.length >= 2) {
-          const nums = parts.slice(1).map(p => parseFloat(p)).filter(n => !isNaN(n));
+        const isNum = p => /^\d+(?:\.\d+)?$/.test(p);
+        // Item name = the longest letter-token BEFORE the first numeric token
+        // (OCR junk like "JH Beef …", "4 Minced …", "i Fi qo …" is skipped).
+        const firstNumIdx = parts.findIndex(isNum);
+        const scanEnd = firstNumIdx > 0 ? firstNumIdx : 1;
+        let name = '', nameIdx = -1;
+        for (let i = 0; i < scanEnd; i++) {
+          const t = parts[i].replace(/[^a-zA-Z]/g, '');
+          if (t.length > name.length) { name = t; nameIdx = i; }
+        }
+        if (name.length >= 2) {
+          // Figures = every fully-numeric token after the name. Half-letter junk
+          // ("6k", "1g") is ignored; fused cells ("034276") land mid-row while
+          // the trailing Sales/Cash columns usually survive intact.
+          const nums = parts.slice(nameIdx + 1).filter(isNum).map(Number);
           if (nums.length >= 1) {
             const cash = nums[nums.length - 1];
             const salesKg = nums.length >= 2 ? nums[nums.length - 2] : 0;
@@ -2670,6 +2689,7 @@ function parseDailyLedgerText(text) {
 
   return {
     date: dateStr,
+    dateDetected: !!dateMatch,
     items: items,
     ch: ch,
     mpesa: mpesa,
@@ -2709,6 +2729,53 @@ function processLedgerParse() {
 }
 
 /* ══════════ LEDGER SHEET PHOTO OCR (JPG/PNG capture) ══════════ */
+// Erase long horizontal/vertical rule lines from a BINARIZED canvas. Notebook
+// ruling and table borders otherwise fuse with neighbouring digits during OCR
+// ("6.4|6.4|0.34" reads as "6464034"). A text stroke never forms a straight
+// run tens of px long, so only true rule lines get erased.
+function deslateRuledLines(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const dark = new Uint8Array(w * h);
+  let darkTotal = 0;
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+    if (d[i] < 128) { dark[j] = 1; darkTotal++; }
+  }
+  if (!darkTotal) return canvas;
+  const MIN_H_RUN = Math.max(80, Math.floor(w * 0.08)); // horiz rule: ≥8% of width
+  const MIN_V_RUN = Math.max(80, Math.floor(h * 0.06)); // vert rule: ≥6% of height
+  const kill = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {                    // horizontal runs
+    let x = 0;
+    while (x < w) {
+      if (dark[y * w + x]) {
+        let x2 = x;
+        while (x2 + 1 < w && dark[y * w + x2 + 1]) x2++;
+        if (x2 - x + 1 >= MIN_H_RUN) for (let k = x; k <= x2; k++) kill[y * w + k] = 1;
+        x = x2 + 1;
+      } else x++;
+    }
+  }
+  for (let x = 0; x < w; x++) {                    // vertical runs
+    let y = 0;
+    while (y < h) {
+      if (dark[y * w + x]) {
+        let y2 = y;
+        while (y2 + 1 < h && dark[(y2 + 1) * w + x]) y2++;
+        if (y2 - y + 1 >= MIN_V_RUN) for (let k = y; k <= y2; k++) kill[k * w + x] = 1;
+        y = y2 + 1;
+      } else y++;
+    }
+  }
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+    if (kill[j]) { d[i] = d[i + 1] = d[i + 2] = 255; d[i + 3] = 255; }
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
 // Tidy common OCR misreads on a sheet photo: keyword lines (C/H, M-Pesa, Exp)
 // get normalised, and number-ish tokens get their look-alike letters fixed
 // (O→0, I/l→1, S→5, B→8). Date tokens (with / or -) are left untouched.
@@ -2716,15 +2783,20 @@ function cleanLedgerOcrText(text) {
   return String(text || '').split(/\r?\n/).map(line => {
     let l = line.replace(/\s+/g, ' ').trim();
     if (!l) return '';
-    if (/^c[\s\/\\)|l-]*h\b/i.test(l)) l = l.replace(/^[cC][\s\/\\)|l-]*[hH]/, 'C/H');
-    if (/^m\s*[-\/]?\s*p\s*e\s*s\s*[aou]/i.test(l)) l = l.replace(/^m\s*[-\/]?\s*p\s*e\s*s\s*[aou][a-z]*/i, 'Mpesa');
-    if (/^e\s*x\s*p/i.test(l)) l = l.replace(/^e\s*x\s*p[a-z]*/i, 'Exp');
+    // Keyword tokens, wherever they sit in the line (OCR often prepends junk)
+    l = l.replace(/\bS?C[\/\\)|l-]?H\b/g, 'C/H');
+    l = l.replace(/\b[e6][xz]p[a-z]*\b/gi, 'Exp');
+    l = l.replace(/\bm[-\s\/]?pe?s[oa]?[a-z]*\b/gi, 'Mpesa');
     l = l.split(' ').map(tok => {
-      // Date-like tokens: fix digit misreads but keep the / or - separators
-      if (/^[0-9OoIl|]+[\/-][0-9OoIl|\/-]+$/.test(tok)) {
-        return tok.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1');
+      // Date-like tokens (2+ separators; 'f' is a common OCR read of '/'): fix digit misreads, keep separators
+      if (/^[0-9OoIl|]{1,2}[\/fF\\-][0-9OoIl|]{1,2}[\/fF\\-][0-9OoIl|]{2,4}$/.test(tok)) {
+        return tok.replace(/[fF]/g, '/').replace(/[Oo]/g, '0').replace(/[Il|]/g, '1');
       }
-      if (/[\/-]/.test(tok)) return tok; // other separator tokens stay as-is
+      // Single - or : between digit groups = a misread decimal point (0:38 → 0.38, 1-64 → 1.64)
+      if (/^[0-9OoIl|]+[-:][0-9OoIl|]+$/.test(tok)) {
+        return tok.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1').replace(/[-:]/, '.');
+      }
+      if (/\//.test(tok)) return tok; // other slash tokens stay as-is
       // Standalone look-alike letter = a misread digit (O→0, I/l→1, S→5, B→8)
       if (/^[OolI|SsBb]$/.test(tok)) {
         return tok.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1').replace(/[Ss]/g, '5').replace(/[Bb]/g, '8');
@@ -2764,19 +2836,26 @@ async function handleLedgerPhoto(input) {
     const thumb = $('ledgerPhotoPreview');
     if (thumb) { thumb.src = img.src; thumb.style.display = 'block'; }
 
-    // Draw to canvas (capped for memory) on a white background, then preprocess
+    // Draw to canvas on a white background. Long side is normalised to
+    // 2000–2600px: small photos are UPSCALED (thicker strokes read better),
+    // huge ones capped for memory.
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
-    const maxDim = 2400;
-    let w = img.width, h = img.height;
-    if (w > maxDim || h > maxDim) {
-      const scale = maxDim / Math.max(w, h);
-      w = Math.round(w * scale); h = Math.round(h * scale);
-    }
+    const long = Math.max(img.width, img.height);
+    let scale = 1;
+    if (long > 2600) scale = 2600 / long;
+    else if (long < 2000) scale = Math.min(2, 2600 / long);
+    let w = Math.round(img.width * scale), h = Math.round(img.height * scale);
     canvas.width = w; canvas.height = h;
     ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
     ctx.drawImage(img, 0, 0, w, h);
+    // Keep an untouched copy for the fallback pass
+    const rawCanvas = document.createElement('canvas');
+    rawCanvas.width = w; rawCanvas.height = h;
+    rawCanvas.getContext('2d').drawImage(canvas, 0, 0);
+    // Binarize, then erase notebook ruling / table borders before OCR
     preprocessForHandwriting(canvas);
+    deslateRuledLines(canvas);
 
     setStatus('<span class="spinner"></span> OCR running on sheet photo… (first run downloads the ~15 MB model once)');
     const worker = await Tesseract.createWorker('eng', 1, {
@@ -2784,14 +2863,24 @@ async function handleLedgerPhoto(input) {
         if (m.status) setStatus(`<span class="spinner"></span> OCR: ${m.status}… <b>${Math.round((m.progress || 0) * 100)}%</b>`);
       }
     });
-    let text = '';
+    let text = '', parsed = null;
     try {
       await worker.setParameters({
+        tessedit_pageseg_mode: '6', // uniform block: rows of "Item fig fig … Cash"
         tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ./,:-",
         preserve_interword_spaces: '1'
       });
       const { data } = await worker.recognize(canvas);
       text = data.text || '';
+      parsed = parseDailyLedgerText(cleanLedgerOcrText(text));
+      // Fallback pass: if nothing parseable, retry on the unprocessed photo —
+      // a clean, high-contrast page often reads better without binarization.
+      if (!parsed || !parsed.items.length) {
+        setStatus('<span class="spinner"></span> First pass found nothing — retrying on the untouched photo…');
+        const { data: data2 } = await worker.recognize(rawCanvas);
+        const parsed2 = parseDailyLedgerText(cleanLedgerOcrText(data2.text || ''));
+        if (parsed2 && parsed2.items.length) { text = data2.text || ''; parsed = parsed2; }
+      }
     } finally {
       await worker.terminate();
     }
@@ -2799,9 +2888,11 @@ async function handleLedgerPhoto(input) {
     const cleaned = cleanLedgerOcrText(text);
     if ($('ledgerPasteText')) $('ledgerPasteText').value = cleaned;
 
-    const parsed = parseDailyLedgerText(cleaned);
     if (parsed && parsed.items.length) {
-      setStatus(`✅ Captured <b>${parsed.items.length}</b> item row(s) from the photo — date <b>${parsed.date || 'n/a'}</b>, revenue est. <b>${kes(parsed.revenue)}</b>, C/H <b>${kes(parsed.ch)}</b>, M-Pesa <b>${kes(parsed.mpesa)}</b>, Exp <b>${kes(parsed.exp)}</b>.<br>👀 Handwriting OCR can slip — review the figures in the box below, then hit <b>⚡ Parse & Reconcile Daily Ledger</b>.`);
+      const dateNote = parsed.dateDetected
+        ? `date <b>${parsed.date}</b>`
+        : `date <b>not read — defaulted to today (${parsed.date})</b>; add the sheet date as the first line if different`;
+      setStatus(`✅ Captured <b>${parsed.items.length}</b> item row(s) from the photo — ${dateNote}, revenue est. <b>${kes(parsed.revenue)}</b>, C/H <b>${kes(parsed.ch)}</b>, M-Pesa <b>${kes(parsed.mpesa)}</b>, Exp <b>${kes(parsed.exp)}</b>.<br>👀 Handwriting OCR can slip — review the figures in the box below, then hit <b>⚡ Parse & Reconcile Daily Ledger</b>.`);
       toast('📸 Sheet captured — review the figures, then Parse');
     } else {
       setStatus('⚠️ OCR finished but no ledger rows were recognised. The raw text is in the box below — tidy it up (one item + figures per line, e.g. <code>Beef 6.4 0 0.34 2.76 3.3 2772</code>) then hit Parse.');

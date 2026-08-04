@@ -235,7 +235,8 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
       <b>🖼️ Images:</b> PNG/JPG screenshots/photos are OCR'd. <b>Contact lists are resolved first</b> — if the image looks like a name+phone list, masked contacts are auto-unlocked. Otherwise, M-Pesa transactions are parsed.
       wrapped receipt numbers &amp; multi-line names. OCR misreads of masked numbers (<code>***</code> read as <code>#**</code>/<code>xxx</code>) are auto-repaired.<br>
       <b>🛡️ Duplicate guard:</b> every transaction fingerprinted by <b>Receipt No</b> (or date+time+phone+amount).
-      Re-importing the same or overlapping statements skips already-loaded rows — flagged in preview.<br>
+      Re-importing the same or overlapping statements skips already-loaded rows — flagged in preview.
+      Rows dated inside a seed customer's covered period (first→last visit, e.g. the opening June&nbsp;2025 statement) are already counted in the seed and are skipped too.<br>
       <b>📊 CSV / Excel:</b> customer exports, transaction lists, or contact lists (auto-routed to the Resolver).
     </div>
     <div class="drop" id="dropZone">
@@ -2492,6 +2493,7 @@ function seedDB(){
       return{
         name:c[0],contact:c[1],spent:c[2],visits:c[3],days:c[4],
         firstVisit: firstVisit, lastVisit: lastVisit,
+        seedFrom: firstVisit, seedTo: lastVisit, // original seed coverage window — never mutated
         masked:c[1].includes('***'),isNew:false
       };
     }),
@@ -2520,6 +2522,17 @@ function load(){
     if(Object.keys(DB.seen).some(k => /^[RC]:/.test(k))){
       DB.seen = {};
       DB.transactions.forEach(t => { markSeen(t); });
+    }
+    // Snapshot the ORIGINAL seed coverage window (seedFrom/seedTo) for customers
+    // from older saves, so the seed guard keeps its exact window even after
+    // imports extend lastVisit. Name-matched against the seed array; harmless for
+    // import-created customers (excluded from the guard by isNew anyway).
+    if(!DB.customers.some(c => c.seedFrom || c.seedTo)){
+      const seedBy = new Map(SEED_CUSTOMERS.map(s => [normalizeName(s[0]), s]));
+      DB.customers.forEach(c => {
+        const s = seedBy.get(normalizeName(c.name));
+        if(s){ c.seedFrom = c.seedFrom || stripTime(s[5]) || ''; c.seedTo = c.seedTo || stripTime(s[6]) || ''; }
+      });
     }
     } else {
       DB=seedDB();
@@ -3680,10 +3693,45 @@ function txKeyNoTime(tx) {
 // Central dedup lookups — every import/backfill path must use these so the guard
 // stays consistent with the keys written into DB.seen (including time-less receipt
 // variants from cloud syncs or older rows).
-function isSeen(tx) {
+// Seed-data guard. Seed customers arrive WITHOUT transaction details (no receipts,
+// times, or per-transaction rows) — just aggregates: spent, visits, first/last visit.
+// The seed aggregates already count EVERY transaction the customer made between
+// firstVisit and lastVisit (e.g. the business's opening June 2025 statement is
+// baked into the seed). So a statement row dated inside that coverage window is
+// that history re-appearing in a fresh import — treat it as a duplicate and skip
+// it, otherwise the amount/visit gets added on top of the seed and revenue &
+// stats are corrupted. Rows dated before firstVisit or after lastVisit are NOT in
+// the seed (new activity / pre-seed gaps) and import normally.
+//
+// Scoping (verified): this guard is a fallback that only fires while a row's own
+// fingerprint has NOT been captured yet. isSeen() consults the receipt/composite
+// seen-map FIRST; the seed guard is only reached for receipts not in DB.seen.
+// Once a row is skipped (or backfilled), markSeen() records its receipt, so every
+// later re-import is caught by the receipt guard alone — the seed guard never
+// re-fires on captured receipts. A per-customer off-switch ("customer has some
+// receipts → guard off") would be wrong: captured receipts for a seed customer
+// are usually out-of-window activity (e.g. July 2026), so an uncaptured June 2025
+// row would then import as new and double-count against the seed.
+function isSeedDuplicate(tx) {
+  if (!tx || !tx.date) return false;
+  const cust = findCustomerMatch(tx);
+  if (!cust || cust.isNew) return false;                       // seed customers only (not import-created)
+  if (Number(cust.visits || 0) === 0 && Number(cust.spent || 0) === 0) return false; // rebuild reset → statements are the source of truth
+  // Use the ORIGINAL seed window (seedFrom/seedTo, snapshotted at seed time), NOT
+  // the live firstVisit/lastVisit: imports extend lastVisit, which would silently
+  // widen the window and wrongly skip genuinely-new rows in out-of-order imports
+  // (e.g. July 2026 imported before May 2026). The snapshot is the true coverage.
+  const first = cust.seedFrom || cust.firstVisit || '';
+  const last = cust.seedTo || cust.lastVisit || first;
+  if (!first) return false;
+  return tx.date >= first && tx.date <= last;
+}
+function isSeen(tx, opts) {
   if (DB.seen[transactionKey(tx)]) return true;
   const k2 = txKeyNoTime(tx);
-  return k2 ? !!DB.seen[k2] : false;
+  if (k2 && DB.seen[k2]) return true;
+  if (!opts || opts.seedGuard !== false) return isSeedDuplicate(tx);
+  return false;
 }
 function markSeen(tx) {
   DB.seen[transactionKey(tx)] = 1;
@@ -3704,7 +3752,7 @@ function importTransactions(txs) {
   // counted across transactions, customers, monthly buckets, or importedRev.
   const fresh = [];
   txs.forEach(tx => {
-    if (isSeen(tx)) { dupes++; return; }
+    if (isSeen(tx)) { dupes++; markSeen(tx); return; }
     markSeen(tx);
     fresh.push(tx);
   });
@@ -4426,7 +4474,7 @@ function parseSheetRows(raw) {
 
 /* ══════════ PREVIEW + DEDUP + CONFIRM ══════════ */
 function showPreview(rows, fmt) {
-  pendingRows = rows.map(r => ({ ...r, dup: isSeen(r) }));
+  pendingRows = rows.map(r => ({ ...r, dup: isSeen(r), seedDup: isSeedDuplicate(r) }));
   const dups = pendingRows.filter(r => r.dup).length;
   $('pvFormat').textContent = fmt;
   $('pvCount').textContent = rows.length;
@@ -4434,7 +4482,8 @@ function showPreview(rows, fmt) {
   $('pvDups').textContent = dups + ' duplicate(s) will be skipped';
   $('pvTable').querySelector('tbody').innerHTML = pendingRows.slice(0, 300).map(r => {
     let tag;
-    if (r.dup) tag = '<span class="badge b-dup">DUPLICATE — will skip</span>';
+    if (r.seedDup) tag = '<span class="badge b-dup">SEED — already counted</span>';
+    else if (r.dup) tag = '<span class="badge b-dup">DUPLICATE — will skip</span>';
     else {
       const m = findCustomerMatch(r);
       tag = m ? `<span class="badge b-active">Existing — ${m.masked ? 'masked' : 'matched'}</span>`
@@ -5315,7 +5364,10 @@ function backfillTransactions(txs){
   let imported = 0, dupes = 0;
 
   txs.forEach(tx => {
-    if (isSeen(tx)){ dupes++; return; }
+    // seedGuard off: backfill is history-only (never touches revenue/stats), so it
+    // must still capture seed-period transactions into customer history — the seed
+    // guard only applies to main imports, where skipping prevents double-counting.
+    if (isSeen(tx, { seedGuard: false })){ dupes++; markSeen(tx); return; }
     markSeen(tx);
 
     const product = classifyProduct(tx.date, tx.amount);

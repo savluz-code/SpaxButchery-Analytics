@@ -3690,6 +3690,16 @@ function txKeyNoTime(tx) {
 // it, otherwise the amount/visit gets added on top of the seed and revenue &
 // stats are corrupted. Rows dated before firstVisit or after lastVisit are NOT in
 // the seed (new activity / pre-seed gaps) and import normally.
+//
+// Scoping (verified): this guard is a fallback that only fires while a row's own
+// fingerprint has NOT been captured yet. isSeen() consults the receipt/composite
+// seen-map FIRST; the seed guard is only reached for receipts not in DB.seen.
+// Once a row is skipped (or backfilled), markSeen() records its receipt, so every
+// later re-import is caught by the receipt guard alone — the seed guard never
+// re-fires on captured receipts. A per-customer off-switch ("customer has some
+// receipts → guard off") would be wrong: captured receipts for a seed customer
+// are usually out-of-window activity (e.g. July 2026), so an uncaptured June 2025
+// row would then import as new and double-count against the seed.
 function isSeedDuplicate(tx) {
   if (!tx || !tx.date) return false;
   const cust = findCustomerMatch(tx);

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpaxButchery | Analytics v2.3</title>
+<title>SpaxButchery | Analytics v2.4</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
@@ -95,8 +95,8 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
 
 <header>
   <div class="logo"><div class="logo-badge">🥩</div>
-    <div><h1>SpaxButchery Analytics <span style="color:var(--amber);font-size:.85rem">v2.3</span></h1>
-    <div class="sub">PDF + OCR Statements · Dedup Guard · AI Accounts · Bulk SMS</div></div></div>
+    <div><h1>SpaxButchery Analytics <span style="color:var(--amber);font-size:.85rem">v2.4</span></h1>
+    <div class="sub">Ledger Photo Capture · PDF + OCR Statements · Dedup Guard · AI Accounts · Bulk SMS</div></div></div>
   <div class="hdr-stats">
     <div class="hdr-stat">👥 <span id="hCust">—</span> customers</div>
     <div class="hdr-stat">💰 KES <span id="hRev">—</span></div>
@@ -119,20 +119,6 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
 
 <section id="overview" class="tab active">
   <div class="kpi-grid" id="kpiGrid"></div>
-  <div class="card" style="margin-bottom:18px;padding:16px 20px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
-      <div>
-        <h3 style="font-size:1.05rem;">💰 COGS & Net Margin Model</h3>
-        <div class="hint" style="margin-bottom:0">Zero-cost operational margin calculator (Meat COGS, Soup COGS & Monthly Overhead)</div>
-      </div>
-      <div class="flex" style="gap:10px;align-items:center;flex-wrap:wrap;">
-        <label style="font-size:.78rem;color:var(--muted)">🥩 Meat COGS %: <input type="number" id="meatCogsInput" value="70" min="0" max="100" style="width:65px;padding:4px 6px;font-size:.8rem;border-radius:6px;" onchange="updateCogs()"></label>
-        <label style="font-size:.78rem;color:var(--muted)">🍲 Soup COGS %: <input type="number" id="soupCogsInput" value="35" min="0" max="100" style="width:65px;padding:4px 6px;font-size:.8rem;border-radius:6px;" onchange="updateCogs()"></label>
-        <label style="font-size:.78rem;color:var(--muted)">🏢 Overhead (KES): <input type="number" id="overheadInput" value="35000" step="1000" style="width:90px;padding:4px 6px;font-size:.8rem;border-radius:6px;" onchange="updateCogs()"></label>
-      </div>
-    </div>
-    <div id="cogsSummaryBar" style="margin-top:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;"></div>
-  </div>
   <div class="grid-2">
     <div class="card"><h3>Monthly Revenue</h3><div class="hint">Baseline + imported transactions</div>
       <div class="chart-box"><canvas id="ovRev"></canvas></div></div>
@@ -195,12 +181,17 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
       <div style="font-weight:600;font-size:.95rem;margin-bottom:6px;">📓 Daily Sales & Stock Sheet Ingestion</div>
       <div style="font-size:.82rem;color:var(--muted);margin-bottom:14px;line-height:1.5;">
         Extract figures from physical daily sales sheets (Opening Stock, Purchases, Waste, Closing Stock, Sales kg, Cash KES, M-Pesa vs Cash reconciliation) into structured analytics.
+        <b>Snap a photo</b> of the handwritten page (JPG/PNG) and the figures are captured automatically — or paste the WhatsApp report text below.
       </div>
       <div class="flex" style="gap:10px;margin-bottom:14px;flex-wrap:wrap;">
         <button class="btn blue sm" onclick="downloadLedgerTemplate()">⬇️ Download CSV Ledger Template</button>
+        <button class="btn sm" style="background:var(--amber);color:#000;" onclick="document.getElementById('ledgerImageInput').click()">📸 Upload Sheet Photo (JPG/PNG)</button>
+        <input type="file" id="ledgerImageInput" accept="image/jpeg,image/png,.jpg,.jpeg,.png" style="display:none" onchange="handleLedgerPhoto(this)">
       </div>
+      <img id="ledgerPhotoPreview" alt="Uploaded sheet" style="display:none;max-height:180px;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-bottom:10px;">
+      <div id="ledgerOcrStatus" style="font-size:.82rem;color:var(--muted);margin-bottom:12px;line-height:1.6;"></div>
       <div style="margin-bottom:12px;">
-        <label style="font-size:.8rem;color:var(--muted);display:block;margin-bottom:6px;font-weight:600;">📋 Paste Daily Ledger / WhatsApp Report Text:</label>
+        <label style="font-size:.8rem;color:var(--muted);display:block;margin-bottom:6px;font-weight:600;">📋 Ledger Text (pasted, or auto-captured from a sheet photo — review before parsing):</label>
         <textarea id="ledgerPasteText" rows="6" placeholder="e.g.
 02/07/2026
 Beef 6.4 0 0.34 2.76 3.3 2772
@@ -591,7 +582,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.3 · Local data · PDF text + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.4 · Local data · PDF text + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -2514,7 +2505,6 @@ function seedDB(){
     importedRev:0,importedTx:0,resolved:0,seen:{},
     transactions:[],
     customerTx:{},
-    cogs:{ meatPct: 70, soupPct: 35, overhead: 35000 },
     dailyLedgers:[]
   };
 }
@@ -2527,7 +2517,7 @@ function load(){
       if(!DB.seen)DB.seen={};
     if(!DB.transactions)DB.transactions=[];
     if(!DB.customerTx)DB.customerTx={};
-    if(!DB.cogs)DB.cogs={ meatPct: 70, soupPct: 35, overhead: 35000 };
+    if(DB.cogs)delete DB.cogs; // COGS & net margin model removed
     if(!DB.dailyLedgers)DB.dailyLedgers=[];
     } else {
       DB=seedDB();
@@ -2718,7 +2708,114 @@ function processLedgerParse() {
   refreshAll();
 }
 
-/* ══════════ MARGINS & PERSONALIZED IPI ALERTS ══════════ */
+/* ══════════ LEDGER SHEET PHOTO OCR (JPG/PNG capture) ══════════ */
+// Tidy common OCR misreads on a sheet photo: keyword lines (C/H, M-Pesa, Exp)
+// get normalised, and number-ish tokens get their look-alike letters fixed
+// (O→0, I/l→1, S→5, B→8). Date tokens (with / or -) are left untouched.
+function cleanLedgerOcrText(text) {
+  return String(text || '').split(/\r?\n/).map(line => {
+    let l = line.replace(/\s+/g, ' ').trim();
+    if (!l) return '';
+    if (/^c[\s\/\\)|l-]*h\b/i.test(l)) l = l.replace(/^[cC][\s\/\\)|l-]*[hH]/, 'C/H');
+    if (/^m\s*[-\/]?\s*p\s*e\s*s\s*[aou]/i.test(l)) l = l.replace(/^m\s*[-\/]?\s*p\s*e\s*s\s*[aou][a-z]*/i, 'Mpesa');
+    if (/^e\s*x\s*p/i.test(l)) l = l.replace(/^e\s*x\s*p[a-z]*/i, 'Exp');
+    l = l.split(' ').map(tok => {
+      // Date-like tokens: fix digit misreads but keep the / or - separators
+      if (/^[0-9OoIl|]+[\/-][0-9OoIl|\/-]+$/.test(tok)) {
+        return tok.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1');
+      }
+      if (/[\/-]/.test(tok)) return tok; // other separator tokens stay as-is
+      // Standalone look-alike letter = a misread digit (O→0, I/l→1, S→5, B→8)
+      if (/^[OolI|SsBb]$/.test(tok)) {
+        return tok.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1').replace(/[Ss]/g, '5').replace(/[Bb]/g, '8');
+      }
+      if (/\d/.test(tok) && /^[0-9OoIl|SsBb.,]+$/.test(tok)) {
+        return tok.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1').replace(/[Ss]/g, '5').replace(/[Bb]/g, '8');
+      }
+      return tok;
+    }).join(' ');
+    return l;
+  }).filter(Boolean).join('\n');
+}
+
+async function handleLedgerPhoto(input) {
+  const file = input.files && input.files[0];
+  input.value = ''; // allow re-uploading the same photo
+  if (!file) return;
+  if (!/^image\/(jpeg|png)$/i.test(file.type) && !/\.(jpe?g|png)$/i.test(file.name)) {
+    toast('❌ Please upload a JPG or PNG photo of the sheet');
+    return;
+  }
+  const status = $('ledgerOcrStatus');
+  const setStatus = html => { if (status) status.innerHTML = html; };
+  setStatus('<span class="spinner"></span> Loading photo…');
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = e => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = reject;
+        image.src = e.target.result;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    const thumb = $('ledgerPhotoPreview');
+    if (thumb) { thumb.src = img.src; thumb.style.display = 'block'; }
+
+    // Draw to canvas (capped for memory) on a white background, then preprocess
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const maxDim = 2400;
+    let w = img.width, h = img.height;
+    if (w > maxDim || h > maxDim) {
+      const scale = maxDim / Math.max(w, h);
+      w = Math.round(w * scale); h = Math.round(h * scale);
+    }
+    canvas.width = w; canvas.height = h;
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    preprocessForHandwriting(canvas);
+
+    setStatus('<span class="spinner"></span> OCR running on sheet photo… (first run downloads the ~15 MB model once)');
+    const worker = await Tesseract.createWorker('eng', 1, {
+      logger: m => {
+        if (m.status) setStatus(`<span class="spinner"></span> OCR: ${m.status}… <b>${Math.round((m.progress || 0) * 100)}%</b>`);
+      }
+    });
+    let text = '';
+    try {
+      await worker.setParameters({
+        tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ./,:-",
+        preserve_interword_spaces: '1'
+      });
+      const { data } = await worker.recognize(canvas);
+      text = data.text || '';
+    } finally {
+      await worker.terminate();
+    }
+
+    const cleaned = cleanLedgerOcrText(text);
+    if ($('ledgerPasteText')) $('ledgerPasteText').value = cleaned;
+
+    const parsed = parseDailyLedgerText(cleaned);
+    if (parsed && parsed.items.length) {
+      setStatus(`✅ Captured <b>${parsed.items.length}</b> item row(s) from the photo — date <b>${parsed.date || 'n/a'}</b>, revenue est. <b>${kes(parsed.revenue)}</b>, C/H <b>${kes(parsed.ch)}</b>, M-Pesa <b>${kes(parsed.mpesa)}</b>, Exp <b>${kes(parsed.exp)}</b>.<br>👀 Handwriting OCR can slip — review the figures in the box below, then hit <b>⚡ Parse & Reconcile Daily Ledger</b>.`);
+      toast('📸 Sheet captured — review the figures, then Parse');
+    } else {
+      setStatus('⚠️ OCR finished but no ledger rows were recognised. The raw text is in the box below — tidy it up (one item + figures per line, e.g. <code>Beef 6.4 0 0.34 2.76 3.3 2772</code>) then hit Parse.');
+      toast('⚠️ No ledger rows detected — please review the text');
+    }
+  } catch (err) {
+    console.error(err);
+    setStatus('');
+    toast('❌ Photo OCR failed: ' + (err.message || 'unknown error'));
+  }
+}
+window.handleLedgerPhoto = handleLedgerPhoto;
+
+/* ══════════ PERSONALIZED IPI ALERTS ══════════ */
 function customerIPI(c) {
   const visits = Math.max(c.visits || 1, 1);
   if (visits <= 1) {
@@ -2738,34 +2835,6 @@ function customerIPI(c) {
   if (mult >= 1.8) status = 'overdue';
   else if (mult >= 1.2) status = 'duesoon';
   return { ipi: Math.round(ipi * 10) / 10, multiplier: Math.round(mult * 10) / 10, status };
-}
-
-function getMarginStats() {
-  if (!DB.cogs) DB.cogs = { meatPct: 70, soupPct: 35, overhead: 35000 };
-  const ps = getProductStats();
-  const meatCost = ps.meatRevenue * (DB.cogs.meatPct / 100);
-  const soupCost = ps.soupRevenue * (DB.cogs.soupPct / 100);
-  const totalCogs = meatCost + soupCost;
-  const grossProfit = ps.totalRevenue - totalCogs;
-  const grossMarginPct = ps.totalRevenue > 0 ? (grossProfit / ps.totalRevenue) * 100 : 0;
-  const netProfit = grossProfit - (DB.cogs.overhead || 0);
-  const netMarginPct = ps.totalRevenue > 0 ? (netProfit / ps.totalRevenue) * 100 : 0;
-  return {
-    meatCost, soupCost, totalCogs, grossProfit, grossMarginPct,
-    netProfit, netMarginPct, overhead: DB.cogs.overhead || 0
-  };
-}
-
-function updateCogs(){
-  if(!DB.cogs) DB.cogs = { meatPct: 70, soupPct: 35, overhead: 35000 };
-  const m = Number($('meatCogsInput').value || 70);
-  const s = Number($('soupCogsInput').value || 35);
-  const o = Number($('overheadInput').value || 0);
-  DB.cogs.meatPct = m;
-  DB.cogs.soupPct = s;
-  DB.cogs.overhead = o;
-  save();
-  refreshAll();
 }
 
 /* ══════════ PRODUCT CLASSIFICATION (Meat vs Soup) ══════════ */
@@ -2926,38 +2995,9 @@ function refreshAll(){
   $('maskedCount').textContent=`${REPORT.masked-DB.resolved} masked report-wide · ${cs.filter(c=>c.masked).length} in tracked list · ${DB.resolved} resolved`;
   const active=cs.filter(c=>c.days<=30).length,risk=cs.filter(c=>c.days>60&&c.days<=90).length,lost=cs.filter(c=>c.days>90).length;
   const ipiOverdueCount = cs.filter(c => customerIPI(c).status === 'overdue').length;
-  const ps = getProductStats();
-  const ms = getMarginStats();
-
-  if ($('meatCogsInput') && DB.cogs) {
-    $('meatCogsInput').value = DB.cogs.meatPct || 70;
-    $('soupCogsInput').value = DB.cogs.soupPct || 35;
-    $('overheadInput').value = DB.cogs.overhead || 35000;
-  }
-
-  if ($('cogsSummaryBar')) {
-    $('cogsSummaryBar').innerHTML = `
-      <div style="background:var(--card);padding:10px 12px;border-radius:8px;border:1px solid var(--border);">
-        <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;">Gross Profit</div>
-        <div style="font-size:1.1rem;font-weight:700;color:var(--green);">${kes(ms.grossProfit)}</div>
-        <div style="font-size:.74rem;color:var(--muted);">${ms.grossMarginPct.toFixed(1)}% Gross Margin</div>
-      </div>
-      <div style="background:var(--card);padding:10px 12px;border-radius:8px;border:1px solid var(--border);">
-        <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;">Net Operating Profit</div>
-        <div style="font-size:1.1rem;font-weight:700;color:${ms.netProfit >= 0 ? 'var(--green)' : 'var(--red)'};">${kes(ms.netProfit)}</div>
-        <div style="font-size:.74rem;color:var(--muted);">${ms.netMarginPct.toFixed(1)}% Net Margin</div>
-      </div>
-      <div style="background:var(--card);padding:10px 12px;border-radius:8px;border:1px solid var(--border);">
-        <div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;">Total COGS Expense</div>
-        <div style="font-size:1.1rem;font-weight:700;color:var(--amber);">${kes(ms.totalCogs)}</div>
-        <div style="font-size:.74rem;color:var(--muted);">Meat ${kes(ms.meatCost)} · Soup ${kes(ms.soupCost)}</div>
-      </div>
-    `;
-  }
 
 $('kpiGrid').innerHTML=`
   <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">Gross Sales</div></div>
-  <div class="kpi" style="--accent:var(--green)"><div class="label">Net Operating Margin</div><div class="value">${kes(ms.netProfit)}</div><div class="detail">${ms.netMarginPct.toFixed(1)}% net margin</div></div>
   <div class="kpi" style="--accent:var(--amber)"><div class="label">Cadence Overdue</div><div class="value">${ipiOverdueCount}</div><div class="detail">⚡ 1.8x personal IPI delay</div></div>
   <div class="kpi" style="--accent:var(--blue)"><div class="label">Customers</div><div class="value">${totCust.toLocaleString()}</div><div class="detail">${cs.filter(c=>c.isNew).length} added via import</div></div>
   <div class="kpi" style="--accent:var(--purple)"><div class="label">Tracked VIPs</div><div class="value">${cs.filter(c=>c.spent>=10000).length}</div><div class="detail">KES 10K+ lifetime</div></div>
@@ -4337,7 +4377,7 @@ function restoreLocalBaseline(){
 }
 window.restoreLocalBaseline = restoreLocalBaseline;
 // Serialize the live DB into a paste-ready JS seed snapshot (customers + monthly
-// + transactions + customer history + COGS settings).
+// + transactions + customer history).
 function buildSeedCode(){
   const stamp = new Date().toISOString();
   const customers = DB.customers.map(c => ({ name: c.name, contact: c.contact, spent: c.spent, visits: c.visits, days: c.days, firstVisit: c.firstVisit, lastVisit: c.lastVisit, masked: !!c.masked, isNew: !!c.isNew }));
@@ -4353,8 +4393,6 @@ const SEED_SNAPSHOT_MONTHLY = ${JSON.stringify(DB.monthly, null, 2)};
 const SEED_SNAPSHOT_TRANSACTIONS = ${JSON.stringify(DB.transactions, null, 2)};
 
 const SEED_SNAPSHOT_CUSTOMER_TX = ${JSON.stringify(DB.customerTx, null, 2)};
-
-const SEED_SNAPSHOT_COGS = ${JSON.stringify(DB.cogs || { meatPct: 70, soupPct: 35, overhead: 35000 }, null, 2)};
 `;
   return code;
 }

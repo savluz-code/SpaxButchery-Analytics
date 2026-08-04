@@ -2492,6 +2492,10 @@ function seedDB(){
       return{
         name:c[0],contact:c[1],spent:c[2],visits:c[3],days:c[4],
         firstVisit: firstVisit, lastVisit: lastVisit,
+        // Frozen seed snapshot window for the seed-data duplicate guard. The live
+        // lastVisit is extended by imports, but the guard must compare against the
+        // ORIGINAL seed window so the covered range doesn't grow with each import.
+        seedFrom: firstVisit, seedTo: lastVisit,
         masked:c[1].includes('***'),isNew:false
       };
     }),
@@ -2555,6 +2559,20 @@ function load(){
       } else if (c.days === 999) {
         // No lastVisit known — keep days as 999 (unknown)
         c.days = 999;
+      }
+    });
+    // Migrate older saves that predate the seed-snapshot window (seedFrom/seedTo).
+    // Match each tracked customer to SEED_CUSTOMERS by name and stamp the frozen
+    // seed window; the seed duplicate guard needs it to stay stable as imports
+    // extend the live lastVisit. Customers with no seed match get an empty window
+    // (the guard then falls back to their firstVisit/lastVisit).
+    DB.customers.forEach(c=>{
+      if(c.seedFrom === undefined || c.seedTo === undefined){
+        const sf = seedLookup[c.name] ? stripTime(seedLookup[c.name]) : "";
+        const st = seedLastVisit[c.name] ? stripTime(seedLastVisit[c.name]) : "";
+        if(c.seedFrom === undefined) c.seedFrom = sf;
+        if(c.seedTo === undefined) c.seedTo = st;
+        needsSave = true;
       }
     });
     // Persist migration fixes to localStorage
@@ -3677,13 +3695,41 @@ function txKeyNoTime(tx) {
   if (!receipt) return null;
   return ["receipt", receipt, tx.date || "", "", Number(tx.amount || 0).toFixed(2)].join("|");
 }
+// Seed-data duplicate guard. The seed report ships per-customer summary stats
+// (spent/visits/firstVisit/lastVisit) that already cover that customer's known
+// statement window. Re-importing a statement that overlaps the window would
+// double-count those rows on top of the seed summary, so a statement row that
+// matches a NON-new (seed/baseline) customer AND falls inside that customer's
+// snapshot window is treated as already counted. The window is the FROZEN seed
+// snapshot (seedFrom/seedTo) — NOT the live lastVisit, which imports keep
+// extending — so the covered range stays stable as new statements are imported.
+function isSeedDuplicate(tx){
+  if(!tx.date) return false;
+  const cust = findCustomerMatch(tx);
+  if(!cust || cust.isNew) return false;
+  // Rebuild mode: a customer whose summary was zeroed out (e.g. Full Rebuild
+  // resetting spent/visits to 0) has nothing pre-counted, so nothing to guard.
+  const visits = Number(cust.visits) || 0;
+  const spent = Number(cust.spent) || 0;
+  if(visits === 0 && spent === 0) return false;
+  const first = cust.seedFrom || cust.firstVisit;
+  const last = cust.seedTo || cust.lastVisit || first;
+  return tx.date >= first && tx.date <= last;
+}
 // Central dedup lookups — every import/backfill path must use these so the guard
 // stays consistent with the keys written into DB.seen (including time-less receipt
-// variants from cloud syncs or older rows).
-function isSeen(tx) {
+// variants from cloud syncs or older rows). The receipt guard is checked FIRST;
+// only rows whose receipt is NOT yet in DB.seen fall through to the seed guard,
+// which records the receipt via markSeen on skip so a re-import is caught by the
+// receipt guard next time. Pass {seedGuard:false} to disable the seed fallback —
+// used by history-only backfill, whose rows must never be suppressed by the seed
+// summary (they belong in the per-customer transaction history).
+function isSeen(tx, opts) {
   if (DB.seen[transactionKey(tx)]) return true;
   const k2 = txKeyNoTime(tx);
-  return k2 ? !!DB.seen[k2] : false;
+  if (k2 ? !!DB.seen[k2] : false) return true;
+  if (opts && opts.seedGuard === false) return false;
+  return isSeedDuplicate(tx);
 }
 function markSeen(tx) {
   DB.seen[transactionKey(tx)] = 1;
@@ -3704,7 +3750,10 @@ function importTransactions(txs) {
   // counted across transactions, customers, monthly buckets, or importedRev.
   const fresh = [];
   txs.forEach(tx => {
-    if (isSeen(tx)) { dupes++; return; }
+    // isSeen checks the receipt guard first, then (for rows whose receipt isn't
+    // yet recorded) the seed guard. Either way, when a row is skipped we record
+    // its receipt so a future re-import is caught by the receipt guard directly.
+    if (isSeen(tx)) { dupes++; markSeen(tx); return; }
     markSeen(tx);
     fresh.push(tx);
   });
@@ -4426,8 +4475,12 @@ function parseSheetRows(raw) {
 
 /* ══════════ PREVIEW + DEDUP + CONFIRM ══════════ */
 function showPreview(rows, fmt) {
-  pendingRows = rows.map(r => ({ ...r, dup: isSeen(r) }));
-  const dups = pendingRows.filter(r => r.dup).length;
+  // `dup` here is the RECEIPT duplicate only (isSeen with the seed guard
+  // disabled) so the SEED badge below can still surface for seed-covered rows,
+  // and so those rows flow through to importTransactions (which records their
+  // receipts via markSeen on skip) instead of being filtered out up front.
+  pendingRows = rows.map(r => ({ ...r, dup: isSeen(r, {seedGuard:false}), seedDup: isSeedDuplicate(r) }));
+  const dups = pendingRows.filter(r => r.dup || r.seedDup).length;
   $('pvFormat').textContent = fmt;
   $('pvCount').textContent = rows.length;
   $('pvDups').style.display = dups ? 'inline-block' : 'none';
@@ -4435,12 +4488,13 @@ function showPreview(rows, fmt) {
   $('pvTable').querySelector('tbody').innerHTML = pendingRows.slice(0, 300).map(r => {
     let tag;
     if (r.dup) tag = '<span class="badge b-dup">DUPLICATE — will skip</span>';
+    else if (r.seedDup) tag = '<span class="badge b-dup">SEED — already counted</span>';
     else {
       const m = findCustomerMatch(r);
       tag = m ? `<span class="badge b-active">Existing — ${m.masked ? 'masked' : 'matched'}</span>`
         : '<span class="badge b-new">New customer</span>';
     }
-    return `<tr style="${r.dup ? 'opacity:.45' : ''}"><td>${r.receipt || '—'}</td><td>${r.name}</td><td>${r.phone || '—'}</td>
+    return `<tr style="${r.dup || r.seedDup ? 'opacity:.45' : ''}"><td>${r.receipt || '—'}</td><td>${r.name}</td><td>${r.phone || '—'}</td>
     <td>${kes(r.amount)}</td><td>${r.date || '—'}${r.time ? ' ' + r.time : ''}</td><td>${tag}</td></tr>`;
   }).join('');
   $('previewCard').style.display = 'block';
@@ -4451,10 +4505,14 @@ function showPreview(rows, fmt) {
 
 $('cancelImport').onclick = () => { $('previewCard').style.display = 'none'; pendingRows = []; };
 $('confirmImport').onclick = () => {
+  // Receipt-duplicate rows are filtered out up front; seed-covered rows are
+  // passed through so importTransactions can record their receipts (markSeen on
+  // skip) — they are not counted toward any aggregate. Reported revenue excludes
+  // those seed-covered rows so the log never shows double-counted amounts.
   const toImport = pendingRows.filter(r => !r.dup);
   const result = importTransactions(toImport);
   $('previewCard').style.display = 'none';
-  const rev = toImport.reduce((s, r) => s + Number(r.amount || 0), 0);
+  const rev = toImport.filter(r => !r.seedDup).reduce((s, r) => s + Number(r.amount || 0), 0);
   $('importLog').textContent = `Last import: ${result.updated} updated · ${result.added} new · ${result.unmasked} unmasked · ${result.dupes} duplicates skipped · ${kes(rev)}`;
   save();
   toast(`✅ ${result.updated} updated, ${result.added} new, ${result.unmasked} unmasked, ${result.dupes} dup(s) skipped`);
@@ -5315,7 +5373,10 @@ function backfillTransactions(txs){
   let imported = 0, dupes = 0;
 
   txs.forEach(tx => {
-    if (isSeen(tx)){ dupes++; return; }
+    // History-only: never let the seed guard suppress a row the seed summary
+    // already counted — those rows belong in the per-customer transaction
+    // history. Only the receipt guard (already-imported statement rows) skips.
+    if (isSeen(tx, {seedGuard:false})){ dupes++; markSeen(tx); return; }
     markSeen(tx);
 
     const product = classifyProduct(tx.date, tx.amount);

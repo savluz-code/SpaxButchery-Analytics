@@ -658,13 +658,15 @@ async function loadFromCloud() {
         DB.customerTx = data.customerTx;
       } else {
         DB.transactions = []; }
-      if (data.transactions) {
+      // Restore the dedup map in the SAME key format the import guard uses
+      // (transactionKey / markSeen). The old 'R:'/'C:' scheme never matched those
+      // keys, so after any sync re-importing an already-loaded statement slipped
+      // past the guard and double-counted revenue & stats.
+      if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
+        DB.seen = data.seen;
+      } else if (data.transactions) {
         DB.seen = {};
-        data.transactions.forEach(tx => {
-          const key = tx.receipt ? 'R:' + tx.receipt : 
-            'C:' + tx.date + '|' + tx.time + '|' + tx.phone + '|' + tx.amount;
-          DB.seen[key] = 1;
-        });
+        data.transactions.forEach(tx => { markSeen(tx); });
       }
       lastSyncTime = new Date();
       showSyncStatus('✅ Synced ' + lastSyncTime.toLocaleTimeString());
@@ -708,20 +710,12 @@ async function saveToCloud(force = false) {
         resolved: DB.resolved
       },
       customerTx: DB.customerTx || {},
-      transactions: (DB.transactions || []).concat(Object.entries(DB.seen).map(([key, val]) => {
-        const parts = key.startsWith('R:') ? 
-          { receipt: key.slice(2) } : 
-          (() => { const p = key.slice(2).split('|'); return { date: p[0], time: p[1], phone: p[2], amount: p[3] }; })();
-        return {
-          receipt: parts.receipt || '',
-          date: parts.date || '',
-          time: parts.time || '',
-          name: '',
-          phone: parts.phone || '',
-          amount: Number(parts.amount) || 0,
-          importedAt: new Date().toISOString()
-        };
-      }))
+      // Send the dedup map verbatim (same format as transactionKey) so every
+      // device restores an identical guard. Previously the seen-map was flattened
+      // into fake transaction rows, which corrupted the cloud transactions list
+      // and produced keys ('R:'/'C:') that never matched the local guard format.
+      seen: DB.seen || {},
+      transactions: DB.transactions || []
     };
 
     const response = await fetch(GAS_URL, {
@@ -2519,6 +2513,14 @@ function load(){
     if(!DB.customerTx)DB.customerTx={};
     if(DB.cogs)delete DB.cogs; // COGS & net margin model removed
     if(!DB.dailyLedgers)DB.dailyLedgers=[];
+    // Heal dedup maps written in the old cloud-sync key format ('R:...'/'C:...'),
+    // which never matched the local transactionKey scheme and silently disabled
+    // the duplicate guard for re-imported statements. Rebuild from the stored
+    // transactions using the same keys the import guard reads.
+    if(Object.keys(DB.seen).some(k => /^[RC]:/.test(k))){
+      DB.seen = {};
+      DB.transactions.forEach(t => { markSeen(t); });
+    }
     } else {
       DB=seedDB();
     }
@@ -3664,6 +3666,30 @@ function transactionKey(tx) {
   if (receipt) return ["receipt", receipt, tx.date || "", tx.time || "", Number(tx.amount || 0).toFixed(2)].join("|");
   return ["composite", tx.date || "", tx.time || "", Number(tx.amount || 0).toFixed(2), normalizeName(tx.name), normalizeContact(tx.contact || tx.phone)].join("|");
 }
+// Time-less variant of the receipt key. DB.seen may legitimately hold keys from
+// older rows whose `time` was never stored (cloud-synced rows, pre-fix imports),
+// so a re-import must still be recognized as a duplicate even when the stored key
+// lacks the time component. Safe for receipt rows: M-Pesa receipt codes are unique
+// per transaction. Composite (no-receipt) rows stay strictly time-sensitive so two
+// genuinely different same-day/same-amount payments by one customer are never merged.
+function txKeyNoTime(tx) {
+  const receipt = cleanReceipt(tx.receipt);
+  if (!receipt) return null;
+  return ["receipt", receipt, tx.date || "", "", Number(tx.amount || 0).toFixed(2)].join("|");
+}
+// Central dedup lookups — every import/backfill path must use these so the guard
+// stays consistent with the keys written into DB.seen (including time-less receipt
+// variants from cloud syncs or older rows).
+function isSeen(tx) {
+  if (DB.seen[transactionKey(tx)]) return true;
+  const k2 = txKeyNoTime(tx);
+  return k2 ? !!DB.seen[k2] : false;
+}
+function markSeen(tx) {
+  DB.seen[transactionKey(tx)] = 1;
+  const k2 = txKeyNoTime(tx);
+  if (k2) DB.seen[k2] = 1;
+}
 
 function importTransactions(txs) {
   let imported = 0, dupes = 0, added = 0, updated = 0, unmasked = 0;
@@ -3678,15 +3704,15 @@ function importTransactions(txs) {
   // counted across transactions, customers, monthly buckets, or importedRev.
   const fresh = [];
   txs.forEach(tx => {
-    const key = transactionKey(tx);
-    if (DB.seen[key]) { dupes++; return; }
-    DB.seen[key] = 1;
+    if (isSeen(tx)) { dupes++; return; }
+    markSeen(tx);
     fresh.push(tx);
   });
   fresh.forEach(tx => {
     const product = classifyProduct(tx.date, tx.amount);
     DB.transactions.push({
       date: tx.date || '',
+      time: tx.time || '',
       amount: Number(tx.amount || 0),
       name: tx.name || '',
       phone: normalizeContact(tx.phone || tx.contact || ''),
@@ -3823,9 +3849,10 @@ function reconcileImportedRevenue(){
     }
   });
   DB.transactions = survivors;
-  // Rebuild the dedup seen-map from surviving transactions
+  // Rebuild the dedup seen-map from surviving transactions (same key scheme the
+  // import guard uses, including the time-less receipt variant for older rows).
   DB.seen = {};
-  DB.transactions.forEach(t => { DB.seen[transactionKey(t)] = 1; });
+  DB.transactions.forEach(t => { markSeen(t); });
   DB.importedRev = Math.max(0, (Number(DB.importedRev || 0) - amount));
   DB.importedTx = Math.max(0, (Number(DB.importedTx || 0) - removedCount));
   repairDates();
@@ -4399,7 +4426,7 @@ function parseSheetRows(raw) {
 
 /* ══════════ PREVIEW + DEDUP + CONFIRM ══════════ */
 function showPreview(rows, fmt) {
-  pendingRows = rows.map(r => ({ ...r, dup: !!DB.seen[transactionKey(r)] }));
+  pendingRows = rows.map(r => ({ ...r, dup: isSeen(r) }));
   const dups = pendingRows.filter(r => r.dup).length;
   $('pvFormat').textContent = fmt;
   $('pvCount').textContent = rows.length;
@@ -5074,6 +5101,13 @@ async function forcePullFromCloud(){
     if(data.customerTx){
       DB.customerTx = data.customerTx;
     }
+    // Restore the dedup map in the local key format so re-imports stay guarded
+    if(data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length){
+      DB.seen = data.seen;
+    } else if(data.transactions){
+      DB.seen = {};
+      data.transactions.forEach(tx => { markSeen(tx); });
+    }
 
     save();
     refreshAll();
@@ -5281,13 +5315,13 @@ function backfillTransactions(txs){
   let imported = 0, dupes = 0;
 
   txs.forEach(tx => {
-    const key = transactionKey(tx);
-    if(DB.seen[key]){ dupes++; return; }
-    DB.seen[key] = 1;
+    if (isSeen(tx)){ dupes++; return; }
+    markSeen(tx);
 
     const product = classifyProduct(tx.date, tx.amount);
     const ntx = {
       date: tx.date || '',
+      time: tx.time || '',
       amount: Number(tx.amount || 0),
       name: tx.name || '',
       phone: normalizeContact(tx.phone || tx.contact || ''),

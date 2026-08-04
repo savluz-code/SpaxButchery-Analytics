@@ -3680,10 +3680,27 @@ function txKeyNoTime(tx) {
 // Central dedup lookups — every import/backfill path must use these so the guard
 // stays consistent with the keys written into DB.seen (including time-less receipt
 // variants from cloud syncs or older rows).
+// Seed-data guard. Seed customers arrive WITHOUT transaction details (no receipts,
+// times, or per-transaction rows) — just aggregates: spent, visits, first/last visit.
+// For single-visit seed rows that aggregate IS one transaction, so a statement row
+// with the same customer, date and exact amount is that same sale re-appearing in a
+// fresh import — treat it as a duplicate and skip it instead of double-counting
+// revenue/stats. Applies only to untouched seed rows: once the customer has real
+// imported history, the receipt/composite guard fully owns dedup.
+function isSeedDuplicate(tx) {
+  if (!tx || !tx.date) return false;
+  const cust = findCustomerMatch(tx);
+  if (!cust || cust.isNew) return false;                       // seed customers only (not import-created)
+  if (Number(cust.visits || 0) !== 1) return false;            // aggregate must be a single sale
+  if ((DB.customerTx[cust.name] || []).length) return false;   // real history? normal guard handles it
+  const amount = Number(tx.amount || 0);
+  return amount > 0 && amount === Number(cust.spent || 0) && tx.date === (cust.lastVisit || '');
+}
 function isSeen(tx) {
   if (DB.seen[transactionKey(tx)]) return true;
   const k2 = txKeyNoTime(tx);
-  return k2 ? !!DB.seen[k2] : false;
+  if (k2 && DB.seen[k2]) return true;
+  return isSeedDuplicate(tx);
 }
 function markSeen(tx) {
   DB.seen[transactionKey(tx)] = 1;
@@ -3704,7 +3721,7 @@ function importTransactions(txs) {
   // counted across transactions, customers, monthly buckets, or importedRev.
   const fresh = [];
   txs.forEach(tx => {
-    if (isSeen(tx)) { dupes++; return; }
+    if (isSeen(tx)) { dupes++; markSeen(tx); return; }
     markSeen(tx);
     fresh.push(tx);
   });
@@ -5315,7 +5332,7 @@ function backfillTransactions(txs){
   let imported = 0, dupes = 0;
 
   txs.forEach(tx => {
-    if (isSeen(tx)){ dupes++; return; }
+    if (isSeen(tx)){ dupes++; markSeen(tx); return; }
     markSeen(tx);
 
     const product = classifyProduct(tx.date, tx.amount);

@@ -240,8 +240,8 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     </div>
     <div class="drop" id="dropZone">
       <div class="big">📂</div>
-      <div><b>Drop file here</b> or click to browse</div>
-      <div style="color:var(--muted);font-size:.8rem;margin-top:6px">.pdf (text or scanned) · .csv · .xlsx · .xls · .png · .jpg (contact lists & receipts)</div>
+      <div><b>Drop one or more files here</b> or click to browse</div>
+      <div style="color:var(--muted);font-size:.8rem;margin-top:6px">Select multiple .pdf (text or scanned) · .csv · .xlsx · .xls · .png · .jpg (contact lists & receipts)</div>
       <input type="file" id="fileInput" accept=".pdf,.csv,.xlsx,.xls,.png,.jpg,.jpeg,.webp,.bmp,.gif" multiple style="display:none">
     </div>
     <div style="margin-top:12px;text-align:center;">
@@ -374,9 +374,9 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
       <b>📎 Attach file:</b> Drop a <b>PDF</b>, CSV, Excel, screenshot, or <b>handwritten photo</b> of a contact list. It auto-extracts names + phones and resolves masked contacts. PDFs use embedded text or OCR fallback; handwriting gets fast adaptive thresholding + a review step.</div>
     <div class="drop" id="resolverDrop" style="padding:24px;margin-bottom:14px">
       <div class="big">📎</div>
-      <div><b>Drop contact list here</b> or click to browse</div>
-      <div style="color:var(--muted);font-size:.8rem;margin-top:6px">.pdf · .csv · .xlsx · .xls · .png · .jpg · .jpeg</div>
-      <input type="file" id="resolverFile" accept=".pdf,.csv,.xlsx,.xls,.png,.jpg,.jpeg,.webp,.bmp,.gif" style="display:none">
+      <div><b>Drop one or more contact lists here</b> or click to browse</div>
+      <div style="color:var(--muted);font-size:.8rem;margin-top:6px">Select multiple .pdf · .csv · .xlsx · .xls · .png · .jpg · .jpeg files</div>
+      <input type="file" id="resolverFile" accept=".pdf,.csv,.xlsx,.xls,.png,.jpg,.jpeg,.webp,.bmp,.gif" multiple style="display:none">
     </div>
     <div id="resolverProgress" style="margin-bottom:12px;font-size:.85rem;color:var(--muted)"></div>
     <div class="grid-2">
@@ -4222,9 +4222,47 @@ const dz = $('dropZone');
 dz.onclick = () => $('fileInput').click();
 dz.ondragover = e => { e.preventDefault(); dz.classList.add('over'); };
 dz.ondragleave = () => dz.classList.remove('over');
-dz.ondrop = e => { e.preventDefault(); dz.classList.remove('over'); handleFile(e.dataTransfer.files[0]); };
-$('fileInput').onchange = e => { handleFile(e.target.files[0]); e.target.value = ''; };
+dz.ondrop = e => { e.preventDefault(); dz.classList.remove('over'); handleFiles(e.dataTransfer.files); };
+$('fileInput').onchange = e => { handleFiles(e.target.files); e.target.value = ''; };
 let pendingRows = [];
+
+// File inputs can return several files at once. Keep the original order while
+// parsing them, then show one combined preview so the user can confirm the whole
+// selection in a single import.
+async function handleFiles(fileList) {
+  const files = Array.from(fileList || []).filter(Boolean);
+  if (!files.length) return;
+
+  const rows = [];
+  let possibleMissed = 0;
+  const errors = [];
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    $('pdfProgress').innerHTML = `<span class="spinner"></span> Parsing ${file.name}… <small>File ${i + 1} of ${files.length}</small>`;
+    try {
+      const parsed = await parseAnyFile(file);
+      if (parsed && parsed.length) rows.push(...parsed);
+      possibleMissed += Number(parsed && parsed.possibleMissed || 0);
+    } catch (err) {
+      console.error(err);
+      errors.push(`${file.name}: ${err.message || 'unknown error'}`);
+    }
+  }
+  $('pdfProgress').textContent = '';
+
+  if (!rows.length) {
+    toast(errors.length ? `❌ Could not read the selected file(s): ${errors.join('; ')}` : '❌ No transactions found in the selected file(s)');
+    return;
+  }
+  rows.possibleMissed = possibleMissed;
+  showPreview(rows, files.length === 1 ? files[0].name : `${files.length} selected files`);
+  if (errors.length) toast(`⚠️ ${errors.length} file(s) could not be read. The readable files are shown in the preview.`);
+}
+
+// Keep this single-file alias for any callers outside the multi-file picker.
+async function handleFile(file) {
+  return handleFiles(file ? [file] : []);
+}
 
 function setProg(pct){$('progWrap').style.display=pct==null?'none':'block';if(pct!=null)$('progBar').style.width=Math.round(pct*100)+'%';}
 
@@ -4326,24 +4364,6 @@ async function parseAnyFile(file){
 
   return [];
 }
-async function handleFile(file) {
-  if (!file) return;
-  try {
-    $('pdfProgress').innerHTML = '<span class="spinner"></span> Parsing ' + file.name + '…';
-    const rows = await parseAnyFile(file);
-    $('pdfProgress').textContent = '';
-    if (!rows || rows.length === 0) {
-      toast('❌ No transactions found in ' + file.name);
-      return;
-    }
-    showPreview(rows, file.name);
-  } catch (err) {
-    $('pdfProgress').textContent = '';
-    console.error(err);
-    toast('❌ File read error: ' + (err.message || 'unknown'));
-  }
-}
-
 /* ══════════ PDF HYBRID: TEXT LAYER → OCR FALLBACK ══════════ */
 async function handlePdf(file) {
   $('pdfProgress').innerHTML = '<span class="spinner"></span> Reading PDF…';
@@ -4839,7 +4859,7 @@ function preprocessForHandwriting(canvas) {
   return canvas;
 }
 
-function showOcrReview(text, onConfirm, confidence) {
+function showOcrReview(text, onConfirm, confidence, onCancel) {
   const box = document.createElement('div');
   box.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;display:flex;align-items:center;justify-content:center;padding:20px;';
   const confText = confidence ? `<span style="color:${confidence < 45 ? 'var(--red2)' : confidence < 70 ? 'var(--amber)' : 'var(--green)'};font-weight:700">${Math.round(confidence)}% confidence</span>` : '';
@@ -4857,11 +4877,43 @@ function showOcrReview(text, onConfirm, confidence) {
       </div>
     </div>`;
   document.body.appendChild(box);
-  $('ocrReviewCancel').onclick = () => box.remove();
+  $('ocrReviewCancel').onclick = () => {
+    box.remove();
+    if (onCancel) onCancel();
+  };
   $('ocrReviewResolve').onclick = () => { const t = $('ocrReviewText').value; box.remove(); onConfirm(t); };
 }
 
 /* ══════════ RESOLVER FILE ATTACHMENT ══════════ */
+// Wait for an OCR review to finish before moving on to the next selected file.
+// Without this promise, selecting several low-confidence images would stack
+// multiple review dialogs on top of one another.
+function reviewResolverContacts(text, confidence) {
+  return new Promise(resolve => {
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
+    showOcrReview(text, editedText => {
+      const reviewed = parseContactListFromText(editedText);
+      if (!reviewed.length) {
+        $('resolverProgress').textContent = '❌ No valid contacts after review.';
+        done();
+        return;
+      }
+      const n = resolveContacts(reviewed, true);
+      $('resolverProgress').innerHTML = `✅ ${n} contact(s) resolved after review · ${reviewed.length} extracted`;
+      toast(`📇 ${n} masked contacts resolved`);
+      done();
+    }, confidence, () => {
+      $('resolverProgress').textContent = '⚠️ Review cancelled.';
+      done();
+    });
+  });
+}
+
 async function handleResolverFile(file) {
   if (!file) return;
   $('resolverProgress').innerHTML = '<span class="spinner"></span> Processing…';
@@ -4884,15 +4936,10 @@ async function handleResolverFile(file) {
         toast(`📇 ${n} masked contacts resolved from PDF`);
         return;
       }
-      // Show review for low-confidence PDF results
-      showOcrReview(text, (editedText) => {
-        const reviewed = parseContactListFromText(editedText);
-        if (!reviewed.length) { $('resolverProgress').textContent = '❌ No valid contacts after review.'; return; }
-        const n = resolveContacts(reviewed, true);
-        $('resolverProgress').innerHTML = `✅ ${n} contact(s) resolved after review · ${reviewed.length} extracted`;
-        toast(`📇 ${n} masked contacts resolved`);
-      });
+      // Show review for low-confidence PDF results and wait before processing
+      // the next file in a multi-file selection.
       $('resolverProgress').textContent = '⏳ Waiting for review…';
+      await reviewResolverContacts(text);
       return;
     }
     if (/\.(png|jpe?g|webp|bmp|gif)$/i.test(file.name)) {
@@ -4929,14 +4976,8 @@ async function handleResolverFile(file) {
 
         // If OCR confidence is terrible or no phone digits found, go straight to review
         if (wordConf < 45 || !rawText.match(/\d{5,}/)) {
-          showOcrReview(rawText, (editedText) => {
-            const reviewed = parseContactListFromText(editedText);
-            if (!reviewed.length) { $('resolverProgress').textContent = '❌ No valid contacts after review.'; return; }
-            const n = resolveContacts(reviewed, true);
-            $('resolverProgress').innerHTML = `✅ ${n} contact(s) resolved after review · ${reviewed.length} extracted`;
-            toast(`📇 ${n} masked contacts resolved`);
-          }, wordConf);
           $('resolverProgress').textContent = `⚠️ OCR confidence low (${Math.round(wordConf)}%). Please review and edit.`;
+          await reviewResolverContacts(rawText, wordConf);
           return;
         }
 
@@ -4948,15 +4989,9 @@ async function handleResolverFile(file) {
           toast(`📇 ${n} masked contacts resolved from image`);
           return;
         }
-        // Few matches → show review dialog
-        showOcrReview(rawText, (editedText) => {
-          const reviewed = parseContactListFromText(editedText);
-          if (!reviewed.length) { $('resolverProgress').textContent = '❌ No valid contacts after review.'; return; }
-          const n = resolveContacts(reviewed, true);
-          $('resolverProgress').innerHTML = `✅ ${n} contact(s) resolved after review · ${reviewed.length} extracted`;
-          toast(`📇 ${n} masked contacts resolved`);
-        }, wordConf);
+        // Few matches → show review dialog, then continue with the next file.
         $('resolverProgress').textContent = '⏳ Waiting for review…';
+        await reviewResolverContacts(rawText, wordConf);
       } finally { await worker.terminate(); }
     } else {
       // CSV / Excel → parse → contact list
@@ -4983,13 +5018,38 @@ async function handleResolverFile(file) {
   }
 }
 
+// Process every selected or dropped contact-list file in order.
+async function handleResolverFiles(fileList) {
+  const files = Array.from(fileList || []).filter(Boolean);
+  if (!files.length) return;
+
+  let completed = 0;
+  const errors = [];
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    $('resolverProgress').innerHTML = `<span class="spinner"></span> Processing ${file.name}… <small>File ${i + 1} of ${files.length}</small>`;
+    try {
+      await handleResolverFile(file);
+      completed++;
+    } catch (err) {
+      console.error(err);
+      errors.push(`${file.name}: ${err.message || 'unknown error'}`);
+    }
+  }
+
+  if (files.length > 1) {
+    $('resolverProgress').innerHTML = `✅ Finished processing <b>${completed}</b> of <b>${files.length}</b> selected file(s).` +
+      (errors.length ? `<br><span style="color:var(--red2)">${errors.join('<br>')}</span>` : '');
+  }
+}
+
 // Wire up resolver drop zone
 const rDrop = $('resolverDrop');
 rDrop.onclick = () => $('resolverFile').click();
 rDrop.ondragover = e => { e.preventDefault(); rDrop.classList.add('over'); };
 rDrop.ondragleave = () => rDrop.classList.remove('over');
-rDrop.ondrop = e => { e.preventDefault(); rDrop.classList.remove('over'); handleResolverFile(e.dataTransfer.files[0]); };
-$('resolverFile').onchange = e => { handleResolverFile(e.target.files[0]); e.target.value = ''; };
+rDrop.ondrop = e => { e.preventDefault(); rDrop.classList.remove('over'); handleResolverFiles(e.dataTransfer.files); };
+$('resolverFile').onchange = e => { handleResolverFiles(e.target.files); e.target.value = ''; };
 
 $('rcAdd').onclick=()=>{
   const n=$('rcName').value.trim(),p=$('rcPhone').value.trim();

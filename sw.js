@@ -1,4 +1,4 @@
-const CACHE_NAME = 'spax-v2.5';
+const CACHE_NAME = 'spax-v2.6';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'
@@ -32,6 +32,23 @@ self.addEventListener('activate', function(event) {
 
 // Fetch: serve from cache when offline
 self.addEventListener('fetch', function(event) {
+  const url = new URL(event.request.url);
+  // OCR engine assets (tesseract, PP-OCR runtime/models) — stale-while-revalidate
+  // so the engines keep working offline after the first download.
+  if (url.hostname === 'cdn.jsdelivr.net') {
+    event.respondWith(
+      caches.open(CACHE_NAME).then(function(cache) {
+        return cache.match(event.request).then(function(hit) {
+          const fetching = fetch(event.request).then(function(res) {
+            if (res && res.ok) cache.put(event.request, res.clone());
+            return res;
+          }).catch(function() { return hit; });
+          return hit || fetching;
+        });
+      })
+    );
+    return;
+  }
   event.respondWith(
     caches.match(event.request).then(function(response) {
       if (response) {

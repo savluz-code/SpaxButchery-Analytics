@@ -583,7 +583,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.5 · Local data · PDF text + Tesseract OCR (photo-page enhance) · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.6 · Local data · PDF text + Tesseract OCR + deep handwriting OCR (beta) · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -3643,8 +3643,15 @@ async function ocrPdf(file, opts) {
         ctx.fillStyle = "#fff";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         await page.render({ canvasContext: ctx, viewport }).promise;
+        let rawCopy = null;
+        if (opts.contacts && opts.pageStash) {
+          rawCopy = document.createElement('canvas');
+          rawCopy.width = canvas.width; rawCopy.height = canvas.height;
+          rawCopy.getContext('2d').drawImage(canvas, 0, 0);
+        }
         preprocessForHandwriting(canvas);
         deslateRuledLines(canvas);
+        if (opts.contacts && opts.pageStash) opts.pageStash.push({ clean: canvas, raw: rawCopy || canvas });
       }
       const { data } = await worker.recognize(canvas);
       let pageText = data.text || '';
@@ -4578,6 +4585,276 @@ function segmentContactRows(canvas) {
   return merged
     .filter(b => b.y1 - b.y0 >= 16)
     .map(b => ({ y0: Math.max(0, b.y0 - 6), y1: Math.min(h - 1, b.y1 + 6) }));
+}
+
+/* ══════════ DEEP OCR (PP-OCR deep-learning pass for handwriting) ══════════
+ * Photographed handwritten contact lists defeat classical Tesseract reads on
+ * digits (joined loopy glyph pairs, φ-shaped 4s, crossed 8s). This module adds
+ * an OPTIONAL deep-learning pass (PP-OCRv4 via onnxruntime-web, lazy-loaded
+ * from CDN on first use, ~15 MB once). Per row it builds a "composite strip"
+ * (ink runs re-placed with uniform gaps — kills ruling/dots/wide spaces) plus
+ * a raw photo strip, reads both, and votes on 10-digit phone windows.
+ * Everything degrades gracefully: offline/CDN-blocked → standard OCR only.
+ */
+function subSplitContactRows(canvas, bands) {
+  // A tall band often holds two rows fused by descender/underline ink.
+  // Re-profile inside the band and split at interior ink minima.
+  const hs = bands.map(b => b.y1 - b.y0).sort((a, b) => a - b);
+  const medH = hs[Math.floor(hs.length / 2)] || 100;
+  const w = canvas.width, xFrom = Math.floor(w * 0.12), xTo = Math.floor(w * 0.985);
+  const d = canvas.getContext('2d').getImageData(0, 0, w, canvas.height).data;
+  const dark2 = (x, y) => d[(y * w + x) * 4] < 128 && d[(y * w + x) * 4 + 4] < 128 && d[((y + 1) * w + x) * 4] < 128 && d[((y + 1) * w + x + 1) * 4] < 128;
+  const out = [];
+  for (const band of bands) {
+    if (band.y1 - band.y0 < medH * 1.7) { out.push(band); continue; }
+    const ink = new Float32Array(band.y1 - band.y0);
+    for (let y = band.y0; y < band.y1 - 1; y++) {
+      let c = 0;
+      for (let x = xFrom; x < xTo; x++) if (dark2(x, y)) c++;
+      ink[y - band.y0] = c;
+    }
+    const sm = new Float32Array(ink.length);
+    for (let y = 0; y < ink.length; y++) { let s = 0, n = 0; for (let k = -3; k <= 3; k++) { const yy = y + k; if (yy >= 0 && yy < ink.length) { s += ink[yy]; n++; } } sm[y] = s / n; }
+    const thresh = Math.max(8, w * 0.0018);
+    let y = 0; const parts = [];
+    while (y < sm.length) {
+      if (sm[y] > thresh) { let y1 = y; while (y1 + 1 < sm.length && sm[y1 + 1] > thresh) y1++; if (y1 - y >= 14) parts.push({ y0: band.y0 + y, y1: band.y0 + y1 }); y = y1 + 1; }
+      else y++;
+    }
+    out.push(...(parts.length ? parts : [band]));
+  }
+  return out;
+}
+
+function rowDigitCells(canvas, y0, y1, xFromFrac) {
+  // Column ink profile → runs (1-2 joined digits per run) with wide-run splits.
+  const w = canvas.width, x0 = Math.floor(w * (xFromFrac != null ? xFromFrac : 0.45)), x1 = Math.floor(w * 0.985);
+  const d = canvas.getContext('2d').getImageData(0, 0, w, canvas.height).data;
+  const dark = (x, y) => d[(y * w + x) * 4] < 128;
+  const col = new Float32Array(x1 - x0);
+  for (let x = x0; x < x1; x++) { let c = 0; for (let y = y0; y < y1; y++) if (dark(x, y)) c++; col[x - x0] = c; }
+  const runs = []; let x = 0;
+  while (x < col.length) {
+    if (col[x] >= 2) { let x2 = x; while (x2 + 1 < col.length && col[x2 + 1] >= 2) x2++; runs.push({ sx: x0 + x, ex: x0 + x2 }); x = x2 + 1; }
+    else x++;
+  }
+  const merged = [];
+  for (const r of runs) { const l = merged[merged.length - 1]; if (l && r.sx - l.ex <= 3) l.ex = r.ex; else merged.push({ ...r }); }
+  const fill = (cells) => {
+    for (const r of cells) {
+      let ty = Infinity, by = -1;
+      for (let xx = r.sx; xx <= r.ex; xx++) for (let y = y0; y < y1; y++) if (dark(xx, y)) { if (y < ty) ty = y; if (y > by) by = y; }
+      r.ty = ty === Infinity ? y0 : ty; r.by = by === -1 ? ty : by; r.w = r.ex - r.sx + 1; r.h = r.by - r.ty + 1;
+    }
+    return cells;
+  };
+  let cells = fill(merged).filter(c => c.h >= 8 && c.w >= 2);
+  if (cells.length < 2) return { cells: [], Wm: 0, Hm: 0 };
+  const med = a => { const s = [...a].sort((p, q) => p - q); return s[Math.floor(s.length / 2)] || 0; };
+  const Hm = med(cells.map(c => c.h)) || 20;
+  const Wm = Math.max(8, med(cells.filter(c => c.h >= Hm * 0.3).map(c => c.w)) || 10);
+  // split wide runs (merged digit pairs) at their weakest interior column
+  const split = [];
+  for (const c of cells) {
+    if (c.w <= Math.max(Wm * 1.75, 36)) { split.push(c); continue; }
+    let start = { ...c }; const parts = []; let guard = 6;
+    while (start.w > Math.max(Wm * 2.35, 60) && guard-- > 0) {
+      let bestX = -1, bestV = Infinity;
+      const lo = start.sx + Math.round(start.w * 0.3), hi = start.sx + Math.round(start.w * 0.7);
+      for (let xx = lo; xx <= hi; xx++) { let n = 0; for (let y = start.ty; y <= start.by; y++) if (dark(xx, y)) n++; if (n < bestV) { bestV = n; bestX = xx; } }
+      if (bestX < 0 || bestV > start.h * 0.8) break;
+      parts.push(fill([{ sx: start.sx, ex: bestX - 1 }])[0]);
+      start = fill([{ sx: bestX, ex: start.ex }])[0];
+    }
+    parts.push(start);
+    split.push(...parts);
+  }
+  cells = split.filter(c => {
+    if (c.w < Math.max(3, Wm * 0.3) && c.h < Math.max(6, Hm * 0.35)) return false; // dots
+    if (c.w > Wm * 2.2 && c.h < Hm * 0.42) return false;                            // dashes/underline
+    if (c.h < Math.max(7, Hm * 0.3)) return false;                                  // speckle
+    return true;
+  });
+  return { cells, Wm, Hm };
+}
+
+function composeDigitRow(canvas, cells, H) {
+  // Re-place ink runs with uniform gaps/height — removes ruling, dot noise and
+  // irregular handwritten spacing so the recognizer sees clean "words".
+  const items = cells.map(c => ({ c, w: Math.max(4, Math.round(c.w * (H / c.h))) }));
+  const gapS = Math.round(H * 0.12), gapL = Math.round(H * 0.55);
+  let W = gapS;
+  for (let i = 0; i < items.length; i++) {
+    const gap = i ? items[i].c.sx - items[i - 1].c.ex : 0;
+    items[i]._big = i > 0 && gap > Math.round(H * 0.66);
+    W += items[i].w + (items[i]._big ? gapL : gapS);
+  }
+  const comp = document.createElement('canvas');
+  comp.width = W + gapS * 2; comp.height = H + Math.round(H * 0.66);
+  const ctx = comp.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, comp.width, comp.height);
+  let x = gapS; const yPad = Math.round(H * 0.33);
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (i) x += (it._big ? gapL : gapS);
+    ctx.drawImage(canvas, it.c.sx, it.c.ty, it.c.w, it.c.h, x, yPad, it.w, H);
+    x += it.w;
+  }
+  return comp;
+}
+
+function upscaleCanvasCanvas(c, k) {
+  const out = document.createElement('canvas');
+  out.width = Math.round(c.width * k); out.height = Math.round(c.height * k);
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(c, 0, 0, c.width, c.height, 0, 0, out.width, out.height);
+  return out;
+}
+
+function dilateCanvasCanvas(c) {
+  // 3x3 dilation — reconnects faint handwriting strokes for the deep engine
+  const ctx = c.getContext('2d');
+  const id = ctx.getImageData(0, 0, c.width, c.height), d = id.data, s2 = d.slice();
+  const w = c.width, h = c.height;
+  const dark = (x, y) => x >= 0 && x < w && y >= 0 && y < h && s2[(y * w + x) * 4] < 128;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = (y * w + x) * 4;
+    if (s2[i] >= 128 && (dark(x - 1, y) || dark(x + 1, y) || dark(x, y - 1) || dark(x, y + 1))) { d[i] = d[i + 1] = d[i + 2] = 0; }
+    d[i + 3] = 255;
+  }
+  ctx.putImageData(id, 0, 0);
+  return c;
+}
+
+const DEEP_LETTER_DIGIT = { O: '0', o: '0', Q: '0', D: '0', C: '0', U: '0', I: '1', l: '1', '|': '1', '!': '1', j: '1', i: '1', L: '1', Z: '2', z: '2', E: '3', A: '4', S: '5', s: '5', G: '6', F: '7', T: '7', B: '8', g: '9', q: '9' };
+function deepDigitRepair(rawText) {
+  // Letters read inside digit-runs are misread digits (digit-context only).
+  const chars = String(rawText || '').split('');
+  const isD = c => /\d/.test(c);
+  return chars.map((c, i) => {
+    if (isD(c) || /\s/.test(c)) return c;
+    if (!DEEP_LETTER_DIGIT[c]) return ' ';
+    const near = chars.slice(Math.max(0, i - 2), i + 3).filter(isD).length;
+    return near >= 2 ? DEEP_LETTER_DIGIT[c] : ' ';
+  }).join('');
+}
+
+function firstPhoneAnchor(digits) {
+  // First 10-digit window anchored at '0' + [17]. No padding guesses — a
+  // shifted/wrong window is worse than none (review UI handles the rest).
+  for (let k = 0; k + 10 <= digits.length; k++) {
+    if (digits[k] === '0' && '17'.includes(digits[k + 1])) return digits.slice(k, k + 10);
+  }
+  return '';
+}
+
+function rankPhoneWindows(occ) {
+  // occ: { window: {C: n, R: n, tot: n} } — reward reads that appear in BOTH
+  // variant families (composite AND raw photo strip), then sheer frequency.
+  return Object.entries(occ)
+    .map(([wStr, o]) => ({ wStr, score: (o.C > 0 ? 2 : 0) + (o.R > 0 ? 2 : 0) + o.tot * 0.5 }))
+    .sort((a, b) => b.score - a.score);
+}
+
+let _deepOcrPromise = null;
+function deepOcrEnabled() {
+  try { return localStorage.getItem('spaxDeepOcr') !== '0'; } catch (e) { return true; }
+}
+function ensureDeepOcr(onStatus) {
+  // Lazy-load PP-OCR via ESM CDN (+esm rewrites onnxruntime-web & friends).
+  if (_deepOcrPromise) return _deepOcrPromise;
+  const say = t => { if (onStatus) onStatus(t); };
+  _deepOcrPromise = (async () => {
+    say('Loading deep OCR engine (first time ~15 MB)…');
+    const mod = await import(/* webpackIgnore: true */ 'https://cdn.jsdelivr.net/npm/@gutenye/ocr-browser@1.4.8/+esm');
+    const Ocr = mod.default || mod;
+    const M = 'https://cdn.jsdelivr.net/npm/@gutenye/ocr-models@1.4.2/assets/';
+    const ocr = await Ocr.create({
+      models: {
+        detectionPath: M + 'ch_PP-OCRv4_det_infer.onnx',
+        recognitionPath: M + 'ch_PP-OCRv4_rec_infer.onnx',
+        dictionaryPath: M + 'ppocr_keys_v1.txt',
+      },
+    });
+    say('Deep OCR engine ready');
+    return ocr;
+  })();
+  _deepOcrPromise.catch(() => { _deepOcrPromise = null; }); // allow retry on next use
+  return _deepOcrPromise;
+}
+
+// Per-row deep read. `ocr` is an engine with detect(dataUrl) → [{text, box}].
+async function readPhoneRowsDeep(ocr, cleanCanvas, rawCanvas, onProgress) {
+  const bands = subSplitContactRows(cleanCanvas, segmentContactRows(cleanCanvas));
+  const rows = [];
+  for (let i = 0; i < bands.length; i++) {
+    const b = bands[i];
+    const { cells } = rowDigitCells(cleanCanvas, b.y0, b.y1, 0.45);
+    if (cells.length < 5) { rows.push({ y0: b.y0, y1: b.y1, phone: '', mask: '', strength: 0, strip: '', nameGuess: '' }); continue; }
+    const comp = composeDigitRow(cleanCanvas, cells, 84);
+    const strip = (() => {
+      const sx0 = Math.floor(cleanCanvas.width * 0.40), x1 = Math.floor(cleanCanvas.width * 0.985);
+      const c2 = document.createElement('canvas');
+      c2.width = x1 - sx0; c2.height = b.y1 - b.y0 + 16;
+      const sctx = c2.getContext('2d');
+      sctx.fillStyle = '#fff'; sctx.fillRect(0, 0, c2.width, c2.height);
+      sctx.drawImage(rawCanvas, sx0, Math.max(0, b.y0 - 8), c2.width, Math.min(c2.height, rawCanvas.height - Math.max(0, b.y0 - 8)), 0, 0, c2.width, c2.height);
+      return c2;
+    })();
+    const variants = [
+      () => ({ cv: comp, fam: 'C' }),
+      () => ({ cv: strip, fam: 'R' }),
+      () => ({ cv: upscaleCanvasCanvas(comp, 1.6), fam: 'C' }),
+      () => ({ cv: upscaleCanvasCanvas(strip, 1.6), fam: 'R' }),
+      () => ({ cv: dilateCanvasCanvas(comp), fam: 'C' }),
+    ];
+    const occ = {};
+    let rawText = '';
+    let best = null;
+    for (const mk of variants) {
+      const v = mk();
+      let res = [];
+      try { res = await ocr.detect(v.cv.toDataURL('image/png')); } catch (e) { console.warn('deep detect failed', e); }
+      const txt = (res || []).map(t => t.text).join(' ');
+      if (v.fam === 'R' && !rawText) rawText = txt;
+      const digits = deepDigitRepair(txt).replace(/\D/g, '');
+      const wStr = firstPhoneAnchor(digits);
+      if (wStr) {
+        (occ[wStr] = occ[wStr] || { C: 0, R: 0, tot: 0 });
+        occ[wStr][v.fam]++;
+        occ[wStr].tot++;
+      }
+      // early break: exact same window first-anchored in BOTH families is a
+      // strong answer — skip the remaining variants for this row
+      best = rankPhoneWindows(occ)[0] || null;
+      if (best && best.score >= 4) break;
+    }
+    const ranked = rankPhoneWindows(occ);
+    best = ranked.length ? ranked[0] : null;
+    // positional confidence mask over unique windows (weighted by engine hits)
+    let mask = '';
+    if (best) {
+      mask = best.wStr.split('').map((ch, p) => {
+        let sup = 0, tot = 0;
+        for (const [wStr, o] of Object.entries(occ)) { const wgt = 1 + o.tot; tot += wgt; if (wStr[p] === ch) sup += wgt; }
+        return (tot >= 2 && sup / tot >= 0.6) ? ch : '?';
+      }).join('');
+    }
+    const nameMatch2 = (rawText.match(/[A-Za-z]{4,}/g) || []).sort((a, b2) => b2.length - a.length);
+    const thumb = composeDigitRow(cleanCanvas, cells, 56).toDataURL('image/png');
+    rows.push({
+      y0: b.y0, y1: b.y1,
+      phone: best ? best.wStr : '',
+      mask,
+      strength: best ? best.score : 0,
+      strip: thumb,
+      nameGuess: nameMatch2[0] || '',
+      rawText,
+    });
+    if (onProgress) onProgress(i + 1, bands.length);
+  }
+  return rows;
 }
 
 // Read the digit region (right ~55%) of every band on the page with a
@@ -5525,22 +5802,30 @@ function showOcrReview(text, onConfirm, confidence, onCancel) {
 // textarea we present the page as an editable table — one Name/Phone/Amount
 // row per detected line, with live phone validation. The user fixes what the
 // OCR mangled and hits Resolve; only rows with a valid Kenyan mobile go on.
-function showContactsReview(rows, onConfirm, confidence, onCancel) {
+function showContactsReview(rows, onConfirm, confidence, onCancel, deepRows) {
+  deepRows = deepRows || [];
   const box = document.createElement('div');
   box.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;display:flex;align-items:center;justify-content:center;padding:14px;';
   const confText = confidence != null ? `<span style="color:${confidence < 45 ? 'var(--red2)' : confidence < 70 ? 'var(--amber)' : 'var(--green)'};font-weight:700">${Math.round(confidence)}% OCR confidence</span> · ` : '';
+  const deepText = deepRows.some(d => d.phone)
+    ? `<span style="color:var(--green);font-weight:700">deep OCR: ${deepRows.filter(d => d.phone).length} phone reads</span> · strips show the <b>actual ink</b> of each row — tap one to enlarge. `
+    : (deepOcrEnabled() ? '' : 'deep OCR <b>off</b> — strips/digit reads unavailable. ');
   box.innerHTML = `
     <div style="background:#1a2129;border:1px solid #2c3945;border-radius:12px;max-width:720px;width:100%;max-height:94vh;overflow:auto;padding:18px;">
       <h3 style="margin-bottom:4px">📇 Review contact rows</h3>
-      <p style="color:var(--muted);font-size:.8rem;margin-bottom:12px;line-height:1.55">
-        ${confText}one row per line read from the page. <b>Fix the phone numbers</b> (07XX XXX XXX);
+      <p style="color:var(--muted);font-size:.8rem;margin-bottom:10px;line-height:1.55">
+        ${confText}${deepText}One row per line read from the page. <b>Fix the phone numbers</b> (07XX XXX XXX);
         ✖ drops a junk row, <b>+ Add row</b> inserts a missing one. As you type, matching <b>masked customers</b>
         appear under the row — the ✓ chip means the number unlocks that contact. Only rows with a <b style="color:var(--green)">green</b> phone are used.
       </p>
+      <label style="display:flex;align-items:center;gap:6px;font-size:.72rem;color:var(--muted);margin-bottom:10px;cursor:pointer">
+        <input type="checkbox" id="crDeepTgl" ${deepOcrEnabled() ? 'checked' : ''}> Deep handwriting OCR (beta · downloads engine ~15 MB once)
+      </label>
       <div style="display:grid;grid-template-columns:1.5fr 1.2fr .6fr 24px;gap:6px 8px;font-size:.7rem;color:var(--muted);padding:0 2px 6px">
         <div>Name</div><div>Phone</div><div>Amount</div><div></div>
       </div>
       <div id="crRows" style="display:flex;flex-direction:column;gap:6px;max-height:52vh;overflow:auto;padding-right:4px;"></div>
+      <div id="crExtra"></div>
       <div style="display:flex;gap:10px;margin-top:12px;align-items:center;flex-wrap:wrap">
         <button id="crAdd" class="btn ghost sm">＋ Add row</button>
         <span id="crCount" style="margin-left:auto;font-size:.8rem;color:var(--muted)"></span>
@@ -5565,6 +5850,33 @@ function showContactsReview(rows, onConfirm, confidence, onCancel) {
     return c;
   }
   const chip = (html, color) => `<span style="display:inline-block;font-size:.68rem;padding:2px 7px;border-radius:8px;background:${color}18;color:${color};border:1px solid ${color}44;margin:3px 6px 0 0">${html}</span>`;
+  const deepPool = deepRows.slice(); // rows consumed forward-only as table rows are added
+
+  function matchDeep(row) {
+    // Match a table row to its deep-read row via name similarity (the raw
+    // strip carries a name fragment), without re-using the same deep row twice.
+    const nv = String(row.name || '').trim();
+    let best = null, bs = 0;
+    for (const d of deepPool) {
+      if (d._used) continue;
+      const s = nv.length >= 3 && d.nameGuess ? nameSim(d.nameGuess, nv) : 0;
+      if (s > bs) { bs = s; best = d; }
+    }
+    if (best && bs >= 0.42) { best._used = true; return best; }
+    return null;
+  }
+
+  // Positional agreement of a 10-char '?'-mask against a full phone.
+  function maskPosMatch(mask, full) {
+    if (!mask || !full || full.length !== 10 || mask.length !== 10) return 0;
+    let known = 0, agree = 0;
+    for (let i = 0; i < 10; i++) {
+      if (mask[i] === '?') continue;
+      known++;
+      if (mask[i] === full[i]) agree++;
+    }
+    return known >= 7 && agree === known ? known : 0;
+  }
 
   function refresh() {
     const wraps = rowsEl.querySelectorAll(':scope > div');
@@ -5607,7 +5919,7 @@ function showContactsReview(rows, onConfirm, confidence, onCancel) {
     resolveBtn.disabled = valid === 0;
     resolveBtn.textContent = `✅ Resolve ${valid} row${valid === 1 ? '' : 's'}`;
   }
-  function addRow(row) {
+  function addRow(row, deep) {
     const wrap = document.createElement('div');
     wrap.style.cssText = 'display:grid;grid-template-columns:1.5fr 1.2fr .6fr 24px;gap:2px 8px;align-items:center;';
     wrap.innerHTML = `
@@ -5615,12 +5927,88 @@ function showContactsReview(rows, onConfirm, confidence, onCancel) {
       <input class="cr-phone" style="${inputCss}" placeholder="07XX XXX XXX" value="${esc(row.phone || row.phoneRaw || '')}">
       <input class="cr-amt" style="${inputCss}" placeholder="—" value="${esc(row.amount || '')}">
       <button class="cr-del" title="drop row" style="background:none;border:none;color:var(--red2);cursor:pointer;font-size:1rem;padding:0">✕</button>
-      <div class="cr-hints" style="grid-column:1/-1;display:none;line-height:1.3"></div>`;
+      <div class="cr-hints" style="grid-column:1/-1;display:none;line-height:1.3"></div>
+      <div class="cr-deep" style="grid-column:1/-1"></div>`;
+    const phoneInp = wrap.querySelector('.cr-phone');
+    const d = deep !== undefined ? deep : matchDeep(row);
+    if (d && (d.strip || d.phone)) {
+      const deepEl = wrap.querySelector('.cr-deep');
+      if (d.strip) {
+        const img = document.createElement('img');
+        img.src = d.strip;
+        img.title = 'actual ink of this row — tap to enlarge';
+        img.style.cssText = 'width:100%;max-height:46px;object-fit:contain;background:#fff;border-radius:5px;margin-top:3px;cursor:zoom-in;image-rendering:auto;';
+        img.onclick = ev => {
+          ev.stopPropagation();
+          const z = document.createElement('div');
+          z.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.86);z-index:110;display:flex;align-items:center;justify-content:center;cursor:zoom-out;';
+          z.innerHTML = `<img src="${d.strip}" style="max-width:96vw;max-height:82vh;background:#fff;border-radius:8px;image-rendering:auto;">`;
+          z.onclick = () => z.remove();
+          document.body.appendChild(z);
+        };
+        deepEl.appendChild(img);
+      }
+      // trusted deep read → prefill when the standard pass produced no valid phone
+      const curOk = /^0[17]\d{8}$/.test(normalizedPhone(phoneInp.value));
+      if (d.phone && d.strength >= 3 && !curOk) phoneInp.value = d.phone;
+      if (d.phone && normalizedPhone(phoneInp.value) !== d.phone) {
+        const use = document.createElement('span');
+        use.innerHTML = chip(`deep read: <b>${esc(d.phone)}</b> · use`, '#7ab3ef');
+        use.style.cursor = 'pointer';
+        use.onclick = () => { phoneInp.value = d.phone; refresh(); };
+        deepEl.appendChild(use);
+      }
+      // mask candidates: known positions uniquely agree with a saved contact
+      if (d.mask && normalizedPhone(phoneInp.value) !== d.phone) {
+        const cand = (((typeof DB !== 'undefined' && DB.customers) || []))
+          .map(c => ({ c, k: maskPosMatch(d.mask, c.contact) }))
+          .filter(x => x.k > 0)
+          .sort((a, b) => b.k - a.k)
+          .slice(0, 2);
+        for (const x of cand) {
+          const use = document.createElement('span');
+          use.innerHTML = chip(`≈ ${esc(d.mask)} → <b>${esc(x.c.name)}</b> ${esc(x.c.contact)} · use`, 'var(--green)');
+          use.style.cursor = 'pointer';
+          use.onclick = () => { phoneInp.value = x.c.contact; refresh(); };
+          deepEl.appendChild(use);
+        }
+      }
+    }
     wrap.querySelector('.cr-del').onclick = () => { wrap.remove(); refresh(); };
     wrap.querySelectorAll('input').forEach(inp => inp.addEventListener('input', refresh));
     rowsEl.appendChild(wrap);
   }
   (rows && rows.length ? rows : [{ name: '', phone: '', phoneRaw: '', amount: '' }]).forEach(addRow);
+  box.querySelector('#crDeepTgl').onchange = ev => {
+    try { localStorage.setItem('spaxDeepOcr', ev.target.checked ? '1' : '0'); } catch (e) {}
+  };
+  // Deep rows that matched no table row → offer them (rows the text pass missed)
+  const extra = deepPool.filter(d => !d._used && d.phone && d.strength >= 2);
+  if (extra.length) {
+    const ex = box.querySelector('#crExtra');
+    const title = document.createElement('div');
+    title.style.cssText = 'margin-top:12px;font-size:.74rem;color:var(--muted);font-weight:600';
+    title.textContent = '⚡ Also read from the page (deep OCR) — no text-row match:';
+    ex.appendChild(title);
+    for (const d of extra.slice(0, 6)) {
+      const line = document.createElement('div');
+      line.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:5px;background:#141a22;border:1px solid #2c3945;border-radius:8px;padding:6px 8px;';
+      line.innerHTML = `${d.strip ? `<img src="${d.strip}" style="height:30px;width:150px;object-fit:contain;background:#fff;border-radius:4px;">` : ''}
+        <span style="font-size:.75rem;color:var(--text);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.nameGuess || '—')} · <b>${esc(d.phone)}</b></span>`;
+      const add = document.createElement('button');
+      add.className = 'btn ghost sm';
+      add.textContent = '＋ add';
+      add.onclick = () => {
+        d._used = true;
+        addRow({ name: d.nameGuess || '', phone: d.phone, amount: '' }, d);
+        line.remove();
+        refresh();
+        rowsEl.scrollTop = rowsEl.scrollHeight;
+      };
+      line.appendChild(add);
+      ex.appendChild(line);
+    }
+  }
   box.querySelector('#crAdd').onclick = () => { addRow({ name: '', phone: '', phoneRaw: '', amount: '' }); refresh(); };
   box.querySelector('#crCancel').onclick = () => { box.remove(); if (onCancel) onCancel(); };
   resolveBtn.onclick = () => {
@@ -5641,7 +6029,32 @@ function showContactsReview(rows, onConfirm, confidence, onCancel) {
 // Wait for an OCR review to finish before moving on to the next selected file.
 // Without this promise, selecting several low-confidence images would stack
 // multiple review dialogs on top of one another.
-function reviewResolverContacts(text, confidence) {
+// Run the optional deep OCR pass over stashed page canvases ({clean, raw}).
+// Returns [] when disabled or unavailable (offline/CDN blocked) — callers
+// simply proceed with the standard OCR result.
+async function runDeepOcrOnStash(stash) {
+  if (!deepOcrEnabled() || !stash || !stash.length) return [];
+  try {
+    $('resolverProgress').innerHTML = '<span class="spinner"></span> Deep OCR: loading engine (first time ~15 MB)…';
+    const ocr = await ensureDeepOcr(t => { $('resolverProgress').innerHTML = `<span class="spinner"></span> ${t}`; });
+    const out = [];
+    for (const pg of stash) {
+      const rows = await readPhoneRowsDeep(ocr, pg.clean, pg.raw, (done, total) => {
+        $('resolverProgress').innerHTML = `<span class="spinner"></span> Deep OCR reading rows ${done}/${total}…`;
+      });
+      out.push(...rows);
+    }
+    const usable = out.filter(r => r.phone || r.strip);
+    console.log(`deep OCR: ${usable.filter(r => r.phone).length} phone rows of ${usable.length}`);
+    return usable;
+  } catch (e) {
+    console.warn('deep OCR unavailable', e);
+    $('resolverProgress').innerHTML = '⚠️ Deep OCR unavailable (offline or CDN blocked) — using standard OCR.';
+    return [];
+  }
+}
+
+function reviewResolverContacts(text, confidence, deepRows) {
   return new Promise(resolve => {
     let finished = false;
     const done = () => {
@@ -5668,7 +6081,7 @@ function reviewResolverContacts(text, confidence) {
     }, confidence, () => {
       $('resolverProgress').textContent = '⚠️ Review cancelled.';
       done();
-    });
+    }, deepRows);
   });
 }
 
@@ -5680,12 +6093,15 @@ async function handleResolverFile(file) {
       // PDF → text extraction → OCR fallback → contact list
       $('resolverProgress').innerHTML = '<span class="spinner"></span> Reading PDF…';
       let text = '';
+      let deepRows = [];
       try {
         text = await extractPdfText(file);
       } catch (e) {}
       if (!text.trim()) {
         $('resolverProgress').innerHTML = '<span class="spinner"></span> No embedded text. Running OCR…';
-        text = await ocrPdf(file, { contacts: true });
+        const stash = [];
+        text = await ocrPdf(file, { contacts: true, pageStash: stash });
+        deepRows = await runDeepOcrOnStash(stash);
       }
       // Repair handwriting misreads before matching (digit letters, split numbers)
       text = repairContactsOcrText(text);
@@ -5694,13 +6110,13 @@ async function handleResolverFile(file) {
         const n = resolveContacts(contacts, true);
         $('resolverProgress').innerHTML = `✅ ${n} contact(s) auto-resolved from PDF · ${contacts.length} extracted`;
         toast(`📇 ${n} masked contacts resolved from PDF`);
-        if (n > 0 && n < contacts.length) await reviewResolverContacts(text);
+        if (n > 0 && n < contacts.length) await reviewResolverContacts(text, undefined, deepRows);
         return;
       }
       // Show review for low-confidence PDF results and wait before processing
       // the next file in a multi-file selection.
       $('resolverProgress').textContent = '⏳ Waiting for review…';
-      await reviewResolverContacts(text);
+      await reviewResolverContacts(text, undefined, deepRows);
       return;
     }
     if (/\.(png|jpe?g|webp|bmp|gif)$/i.test(file.name)) {
@@ -5718,6 +6134,10 @@ async function handleResolverFile(file) {
       canvas.width = w; canvas.height = h;
       ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
       ctx.drawImage(img, 0, 0, w, h);
+      // Keep a raw copy for the deep OCR raw-strip variant (before binarization)
+      const rawCopy = document.createElement('canvas');
+      rawCopy.width = w; rawCopy.height = h;
+      rawCopy.getContext('2d').drawImage(canvas, 0, 0);
       // Preprocess for handwriting + strip notebook/table ruling
       preprocessForHandwriting(canvas);
       deslateRuledLines(canvas);
@@ -5749,11 +6169,12 @@ async function handleResolverFile(file) {
           preserve_interword_spaces: '1'
         });
         const rawText = repairContactsOcrText(pageText);
+        const deepRows = await runDeepOcrOnStash([{ clean: canvas, raw: rawCopy }]);
 
         // If OCR confidence is terrible or no phone digits found, go straight to review
         if (wordConf < 45 || !rawText.match(/\d{5,}/)) {
           $('resolverProgress').textContent = `⚠️ OCR confidence low (${Math.round(wordConf)}%). Please review and edit.`;
-          await reviewResolverContacts(rawText, wordConf);
+          await reviewResolverContacts(rawText, wordConf, deepRows);
           return;
         }
 
@@ -5763,12 +6184,12 @@ async function handleResolverFile(file) {
           const n = resolveContacts(contacts, true);
           $('resolverProgress').innerHTML = `✅ ${n} contact(s) auto-resolved · ${contacts.length} extracted · confidence ${Math.round(wordConf)}%`;
           toast(`📇 ${n} masked contacts resolved from image`);
-          if (n > 0 && n < contacts.length) await reviewResolverContacts(rawText, wordConf);
+          if (n > 0 && n < contacts.length) await reviewResolverContacts(rawText, wordConf, deepRows);
           return;
         }
         // Few matches → show review dialog, then continue with the next file.
         $('resolverProgress').textContent = '⏳ Waiting for review…';
-        await reviewResolverContacts(rawText, wordConf);
+        await reviewResolverContacts(rawText, wordConf, deepRows);
       } finally { await worker.terminate(); }
     } else {
       // CSV / Excel → parse → contact list

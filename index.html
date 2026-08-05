@@ -4810,6 +4810,7 @@ async function readPhoneRowsDeep(ocr, cleanCanvas, rawCanvas, onProgress) {
       () => ({ cv: dilateCanvasCanvas(comp), fam: 'C' }),
     ];
     const occ = {};
+    const streams = []; // { digits, raw, window } for amount extraction
     let rawText = '';
     let best = null;
     for (const mk of variants) {
@@ -4820,6 +4821,7 @@ async function readPhoneRowsDeep(ocr, cleanCanvas, rawCanvas, onProgress) {
       if (v.fam === 'R' && !rawText) rawText = txt;
       const digits = deepDigitRepair(txt).replace(/\D/g, '');
       const wStr = firstPhoneAnchor(digits);
+      streams.push({ digits, raw: txt, window: wStr || '' });
       if (wStr) {
         (occ[wStr] = occ[wStr] || { C: 0, R: 0, tot: 0 });
         occ[wStr][v.fam]++;
@@ -4829,6 +4831,22 @@ async function readPhoneRowsDeep(ocr, cleanCanvas, rawCanvas, onProgress) {
       // strong answer — skip the remaining variants for this row
       best = rankPhoneWindows(occ)[0] || null;
       if (best && best.score >= 4) break;
+    }
+    // rescue: no anchored window at all → a bare 9-digit 1X/7X run almost
+    // certainly lost its leading 0 (chip-only suggestion, never auto-prefill)
+    let rescue = false;
+    if (!Object.keys(occ).length) {
+      const rescued = {};
+      for (const s of streams) {
+        const m = s.digits.match(/[17]\d{8}/);
+        if (m) {
+          const wStr = '0' + m[0];
+          (rescued[wStr] = rescued[wStr] || { C: 0, R: 0, tot: 0, rescue: true });
+          rescued[wStr].tot++;
+        }
+      }
+      const top = Object.entries(rescued).sort((a, b) => b[1].tot - a[1].tot)[0];
+      if (top) { occ[top[0]] = top[1]; rescue = true; }
     }
     const ranked = rankPhoneWindows(occ);
     best = ranked.length ? ranked[0] : null;
@@ -4841,6 +4859,25 @@ async function readPhoneRowsDeep(ocr, cleanCanvas, rawCanvas, onProgress) {
         return (tot >= 2 && sup / tot >= 0.6) ? ch : '?';
       }).join('');
     }
+    // amount: digits trailing the winning phone window (sign from raw text)
+    let amount = '';
+    if (best) {
+      const votes = {};
+      for (const s of streams) {
+        if (!s.window || s.window !== best.wStr) continue;
+        const idx = s.digits.indexOf(best.wStr);
+        const tail = s.digits.slice(idx + 10).match(/^\d{1,4}(?!\d)/);
+        if (!tail) continue;
+        let val = tail[0].replace(/^0+(?=\d)/, '');
+        if (!val || !/^\d{1,5}$/.test(val)) continue;
+        const ri = s.raw.lastIndexOf(tail[0]);
+        const before = ri >= 0 ? s.raw.slice(Math.max(0, ri - 4), ri) : '';
+        if (/[-–—]\s*$/.test(before)) val = '-' + val;
+        votes[val] = (votes[val] || 0) + 1;
+      }
+      const topA = Object.entries(votes).sort((a, b) => b[1] - a[1])[0];
+      if (topA) amount = topA[0];
+    }
     const nameMatch2 = (rawText.match(/[A-Za-z]{4,}/g) || []).sort((a, b2) => b2.length - a.length);
     const thumb = composeDigitRow(cleanCanvas, cells, 56).toDataURL('image/png');
     rows.push({
@@ -4848,6 +4885,8 @@ async function readPhoneRowsDeep(ocr, cleanCanvas, rawCanvas, onProgress) {
       phone: best ? best.wStr : '',
       mask,
       strength: best ? best.score : 0,
+      rescue,
+      amount,
       strip: thumb,
       nameGuess: nameMatch2[0] || '',
       rawText,
@@ -5853,13 +5892,21 @@ function showContactsReview(rows, onConfirm, confidence, onCancel, deepRows) {
   const deepPool = deepRows.slice(); // rows consumed forward-only as table rows are added
 
   function matchDeep(row) {
-    // Match a table row to its deep-read row via name similarity (the raw
-    // strip carries a name fragment), without re-using the same deep row twice.
+    // Match a table row to its deep-read row via name similarity AND positional
+    // phone overlap with whatever digits the text pass got (either can carry a
+    // match alone), without re-using the same deep row twice.
     const nv = String(row.name || '').trim();
+    const rd0 = String(row.phone || row.phoneRaw || '').replace(/\D/g, '');
     let best = null, bs = 0;
     for (const d of deepPool) {
       if (d._used) continue;
-      const s = nv.length >= 3 && d.nameGuess ? nameSim(d.nameGuess, nv) : 0;
+      let s = nv.length >= 3 && d.nameGuess ? nameSim(d.nameGuess, nv) : 0;
+      if (rd0.length >= 4 && d.phone) {
+        const rd = rd0.slice(-10);
+        let ov = 0;
+        for (let i = 0; i < rd.length; i++) if (rd[i] === d.phone[i + (10 - rd.length)]) ov++;
+        s = Math.max(s, ov >= 7 ? 0.8 : ov >= 5 ? 0.45 : 0);
+      }
       if (s > bs) { bs = s; best = d; }
     }
     if (best && bs >= 0.42) { best._used = true; return best; }
@@ -5948,15 +5995,22 @@ function showContactsReview(rows, onConfirm, confidence, onCancel, deepRows) {
         };
         deepEl.appendChild(img);
       }
-      // trusted deep read → prefill when the standard pass produced no valid phone
+      // trusted deep read → prefill when the standard pass produced no valid
+      // phone (never for rescue-grade reads — those stay tap-to-confirm chips)
       const curOk = /^0[17]\d{8}$/.test(normalizedPhone(phoneInp.value));
-      if (d.phone && d.strength >= 3 && !curOk) phoneInp.value = d.phone;
+      if (d.phone && d.strength >= 3 && !d.rescue && !curOk) phoneInp.value = d.phone;
       if (d.phone && normalizedPhone(phoneInp.value) !== d.phone) {
         const use = document.createElement('span');
-        use.innerHTML = chip(`deep read: <b>${esc(d.phone)}</b> · use`, '#7ab3ef');
+        use.innerHTML = chip(d.rescue
+          ? `deep read (weak — check strip): <b>${esc(d.phone)}</b> · use`
+          : `deep read: <b>${esc(d.phone)}</b> · use`, d.rescue ? 'var(--amber)' : '#7ab3ef');
         use.style.cursor = 'pointer';
         use.onclick = () => { phoneInp.value = d.phone; refresh(); };
         deepEl.appendChild(use);
+      }
+      // deep amount: fill only an empty amount cell
+      if (d.amount != null && d.amount !== '' && !wrap.querySelector('.cr-amt').value.trim()) {
+        wrap.querySelector('.cr-amt').value = d.amount;
       }
       // mask candidates: known positions uniquely agree with a saved contact
       if (d.mask && normalizedPhone(phoneInp.value) !== d.phone) {

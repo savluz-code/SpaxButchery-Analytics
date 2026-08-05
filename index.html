@@ -3604,7 +3604,8 @@ function setOcrProgress(percent, status) {
   $('pdfProgress').innerHTML = (status || "Working…") + (p > 0 ? ` <b>${p}%</b>` : '');
 }
 
-async function ocrPdf(file) {
+async function ocrPdf(file, opts) {
+  opts = opts || {};
   const SCALE_DIGITAL = 2.5;   // clean statement/receipt renders
   const SCALE_PHOTO = 4.2;     // photographed pages: thin strokes need pixels
   const pdf = await loadPdfDocument(file);
@@ -3616,6 +3617,8 @@ async function ocrPdf(file) {
       const pageBase = ((p - 1) / pdf.numPages) * 100;
       const pageShare = 100 / pdf.numPages;
       const page = await pdf.getPage(p);
+      // Make sure a previous page's band-digit pass didn't leave restrictive params
+      await worker.setParameters({ tessedit_pageseg_mode: '3', tessedit_char_whitelist: '', preserve_interword_spaces: '0' });
 
       // Probe render at the digital scale to tell digital vs photographed page
       setOcrProgress(pageBase, `Rendering page ${p}/${pdf.numPages}`);
@@ -3644,7 +3647,17 @@ async function ocrPdf(file) {
         deslateRuledLines(canvas);
       }
       const { data } = await worker.recognize(canvas);
-      fullText += "\n" + data.text;
+      let pageText = data.text || '';
+      // Contact-list mode on photographed pages: second digit-focused pass per row
+      if (opts.contacts && photoLike) {
+        try {
+          const bands = await readBandDigits(worker, canvas, (done, total) =>
+            setOcrProgress(pageBase + pageShare * (done / Math.max(total, 1)) * 0.9, `Row digits ${done}/${total} (page ${p}/${pdf.numPages})`));
+          pageText = mergeBandDigits(pageText, bands);
+        } catch (e) { console.warn('band digit pass failed', e); }
+        await worker.setParameters({ tessedit_pageseg_mode: '3', tessedit_char_whitelist: '', preserve_interword_spaces: '0' });
+      }
+      fullText += "\n" + pageText;
       setOcrProgress(pageBase + pageShare, `OCR page ${p}/${pdf.numPages}${photoLike ? ' (photo mode)' : ''}`);
     }
   } finally {
@@ -4517,6 +4530,112 @@ async function handleImage(file) {
   }
 }
 
+/* ══════════ CONTACT ROW SEGMENTATION + BAND DIGITS ══════════ */
+// Handwritten contact pages: the full-page OCR read gets row ORDER right but
+// mangles digit groups (cursive loops). A second, per-row read of just the
+// digit region with a digits-only whitelist recovers many of them. Rows are
+// segmented from the binarized page with a 2x2-eroded ink profile (speckles
+// and ruling stubs suppressed), margin zone excluded.
+function segmentContactRows(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const d = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+  const ink = new Float32Array(h);
+  const xFrom = Math.floor(w * 0.12), xTo = Math.floor(w * 0.985);
+  const dark = (x, y) => d[(y * w + x) * 4] < 128;
+  // 2x2-eroded ink: a pixel counts only with right/down/down-right neighbours
+  for (let y = 0; y < h - 1; y++) {
+    let c = 0;
+    for (let x = xFrom; x < xTo; x++) {
+      if (dark(x, y) && dark(x + 1, y) && dark(x, y + 1) && dark(x + 1, y + 1)) c++;
+    }
+    ink[y] = c;
+  }
+  // smooth ±3 so intra-line gaps (between letters) fuse
+  const sm = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    let s = 0, n = 0;
+    for (let k = -3; k <= 3; k++) { const yy = y + k; if (yy >= 0 && yy < h) { s += ink[yy]; n++; } }
+    sm[y] = s / n;
+  }
+  const thresh = Math.max(10, (xTo - xFrom) * 0.005);
+  const bands = [];
+  let y = 0;
+  while (y < h) {
+    if (sm[y] > thresh) {
+      let y1 = y;
+      while (y1 + 1 < h && sm[y1 + 1] > thresh) y1++;
+      bands.push({ y0: y, y1 });
+      y = y1 + 1;
+    } else y++;
+  }
+  // merge nearly-touching bands (ascender/descender splits), then pad
+  const merged = [];
+  for (const b of bands) {
+    const last = merged[merged.length - 1];
+    if (last && b.y0 - last.y1 < 18) last.y1 = b.y1;
+    else merged.push({ ...b });
+  }
+  return merged
+    .filter(b => b.y1 - b.y0 >= 16)
+    .map(b => ({ y0: Math.max(0, b.y0 - 6), y1: Math.min(h - 1, b.y1 + 6) }));
+}
+
+// Read the digit region (right ~55%) of every band on the page with a
+// digits-only whitelist. Mutates worker params — caller resets afterwards.
+async function readBandDigits(worker, canvas, onProgress) {
+  const bands = segmentContactRows(canvas);
+  const w = canvas.width, x0 = Math.floor(w * 0.45);
+  await worker.setParameters({
+    tessedit_pageseg_mode: '7',
+    tessedit_char_whitelist: '0123456789 ',
+    preserve_interword_spaces: '1'
+  });
+  const out = [];
+  for (let i = 0; i < bands.length; i++) {
+    const b = bands[i];
+    if (b.y1 - b.y0 < 12) { out.push({ y: b.y0, digits: '' }); continue; }
+    const crop = document.createElement('canvas');
+    crop.width = w - x0; crop.height = b.y1 - b.y0;
+    const cctx = crop.getContext('2d');
+    cctx.fillStyle = '#fff';
+    cctx.fillRect(0, 0, crop.width, crop.height);
+    cctx.drawImage(canvas, x0, b.y0, crop.width, crop.height, 0, 0, crop.width, crop.height);
+    try {
+      const { data } = await worker.recognize(crop);
+      out.push({ y: b.y0, digits: (data.text || '').replace(/[^\d ]/g, ' ').replace(/\s+/g, ' ').trim() });
+    } catch (e) { out.push({ y: b.y0, digits: '' }); }
+    if (onProgress) onProgress(i + 1, bands.length);
+  }
+  return out;
+}
+
+// Fold band digits back into the full-page text lines. Conservative by design:
+// only a band read that itself forms a COMPLETE valid Kenyan mobile (after
+// joining) is appended, and only to lines lacking one. Partial/garbled band
+// reads are dropped — wrong digits mislead more than they help.
+function mergeBandDigits(pageText, bandDigits) {
+  const usable = (bandDigits || []).filter(b => (b.digits || '').replace(/\s/g, '').length >= 7);
+  if (!usable.length) return pageText;
+  const lines = String(pageText || '').split(/\r?\n/);
+  const filled = lines.map((l, i) => l.replace(/\s+/g, ' ').trim().length > 2 ? i : -1).filter(i => i >= 0);
+  if (Math.abs(usable.length - filled.length) > Math.max(4, filled.length * 0.4)) return pageText; // segmentation drift suspect — skip merge
+  const phoneOk = s => /^0[17]\d{8}$/.test(s);
+  const joined = s => String(s || '').replace(/\D/g, '');
+  for (let k = 0; k < Math.min(usable.length, filled.length); k++) {
+    const li = filled[k];
+    const line = lines[li];
+    if (/0[17]\d{8}/.test(joined(line).replace(/254(?=[17]\d{8})/, '0'))) continue; // already has a phone
+    const g = usable[k].digits.split(' ').filter(Boolean);
+    let bandPhone = '';
+    outer: for (let a = 0; a < g.length; a++) for (let b = a; b < Math.min(g.length, a + 4); b++) {
+      const j = g.slice(a, b + 1).join('');
+      if (phoneOk(j)) { bandPhone = j; break outer; }
+    }
+    if (bandPhone) lines[li] = line.replace(/\s+$/, '') + ' ' + bandPhone;
+  }
+  return lines.join('\n');
+}
+
 /* ══════════ CONTACT OCR TEXT REPAIR (handwritten lists) ══════════ */
 // Handwriting OCR mangles digits into look-alike letters (0→O/o/Q/D, 1→I/l/|,
 // 5→S, 8→B, 6→G, 4→h) and splits phones into spaced groups ("0729 919 743").
@@ -4595,7 +4714,11 @@ function buildContactRows(text) {
         if (/^0[17]\d{8}$/.test(j)) { phone = j; phoneEnd = b + 1; break outer; }
       }
     }
-    if (!phone && groups.length) phoneRaw = groups.join(' ');
+    if (!phone && groups.length) {
+      // cap runaway OCR digit bars (margin scribbles) so the phone cell stays editable
+      const capped = groups.filter(g => g.length <= 11 && g.replace(/\D/g, '').length <= 10);
+      phoneRaw = capped.join(' ');
+    }
     else if (phone && phoneEnd >= 0) {
       // amount = first plausible figure after the phone's groups
       const rest = groups.slice(phoneEnd);
@@ -5411,7 +5534,8 @@ function showContactsReview(rows, onConfirm, confidence, onCancel) {
       <h3 style="margin-bottom:4px">📇 Review contact rows</h3>
       <p style="color:var(--muted);font-size:.8rem;margin-bottom:12px;line-height:1.55">
         ${confText}one row per line read from the page. <b>Fix the phone numbers</b> (07XX XXX XXX);
-        ✖ drops a junk row, <b>+ Add row</b> inserts a missing one. Only rows with a <b style="color:var(--green)">green</b> phone are used.
+        ✖ drops a junk row, <b>+ Add row</b> inserts a missing one. As you type, matching <b>masked customers</b>
+        appear under the row — the ✓ chip means the number unlocks that contact. Only rows with a <b style="color:var(--green)">green</b> phone are used.
       </p>
       <div style="display:grid;grid-template-columns:1.5fr 1.2fr .6fr 24px;gap:6px 8px;font-size:.7rem;color:var(--muted);padding:0 2px 6px">
         <div>Name</div><div>Phone</div><div>Amount</div><div></div>
@@ -5431,6 +5555,8 @@ function showContactsReview(rows, onConfirm, confidence, onCancel) {
   const countEl = box.querySelector('#crCount');
   const resolveBtn = box.querySelector('#crResolve');
   const inputCss = 'width:100%;background:var(--card2);border:1px solid var(--border);color:var(--text);padding:7px 8px;border-radius:7px;font-size:.85rem;font-family:inherit;outline:none;';
+  const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  const MASKED = ((typeof DB !== 'undefined' && DB.customers) || []).filter(c => c.masked);
 
   function normalizedPhone(v) {
     let c = String(v || '').replace(/[^\d+]/g, '');
@@ -5438,27 +5564,58 @@ function showContactsReview(rows, onConfirm, confidence, onCancel) {
     else if (c.startsWith('254')) c = '0' + c.slice(3);
     return c;
   }
+  const chip = (html, color) => `<span style="display:inline-block;font-size:.68rem;padding:2px 7px;border-radius:8px;background:${color}18;color:${color};border:1px solid ${color}44;margin:3px 6px 0 0">${html}</span>`;
+
   function refresh() {
-    const inputs = rowsEl.querySelectorAll('.cr-phone');
-    let valid = 0;
-    inputs.forEach(inp => {
-      const p = normalizedPhone(inp.value);
+    const wraps = rowsEl.querySelectorAll(':scope > div');
+    let valid = 0, matching = 0;
+    wraps.forEach(wrap => {
+      const nameInp = wrap.querySelector('.cr-name'), phoneInp = wrap.querySelector('.cr-phone');
+      const hint = wrap.querySelector('.cr-hints');
+      const p = normalizedPhone(phoneInp.value);
       const ok = /^0[17]\d{8}$/.test(p);
-      inp.style.borderColor = ok ? 'var(--green)' : (p.length >= 7 ? 'var(--amber)' : 'var(--border)');
+      const matches = ok ? MASKED.filter(c => maskedMatches(c.contact, p)) : [];
+      let chips = '';
+      if (ok && matches.length) {
+        chips += chip(`✓ unlocks <b>${esc(matches[0].name)}</b> · ${esc(matches[0].contact)}`, 'var(--green)');
+        if (matches.length > 1) chips += chip(`+${matches.length - 1} more`, 'var(--green)');
+        matching++;
+      } else if (ok) {
+        chips += chip('valid number · no masked contact matches', 'var(--amber)');
+      } else if (p.replace(/\D/g, '').length >= 4) {
+        // partial: masked contacts whose visible prefix fits what is typed so far
+        const pre = p.replace(/\D/g, '').slice(0, 4);
+        const cands = MASKED.filter(c => c.contact.startsWith(pre)).slice(0, 3);
+        if (cands.length) chips += chip(cands.map(c => `${esc(c.contact)} · <b>${esc(c.name)}</b>`).join(' &nbsp;·&nbsp; '), '#8fa3b8');
+      }
+      // name-side hint: similar masked customer → show its mask for cross-check
+      const nv = nameInp.value.trim();
+      if (nv.length >= 3 && !(ok && matches.length)) {
+        const byName = MASKED
+          .map(c => ({ c, s: nameSim(c.name, nv) }))
+          .filter(x => x.s >= 0.5)
+          .sort((a, b) => b.s - a.s)
+          .slice(0, 2);
+        if (byName.length) chips += chip('name ≈ ' + byName.map(x => `<b>${esc(x.c.name)}</b> ${esc(x.c.contact)}`).join(' · '), 'var(--amber)');
+      }
+      hint.innerHTML = chips;
+      hint.style.display = chips ? 'block' : 'none';
+      phoneInp.style.borderColor = ok ? (matches.length ? 'var(--green)' : '#5aa35f') : (p.length >= 7 ? 'var(--amber)' : 'var(--border)');
       if (ok) valid++;
     });
-    countEl.textContent = `${valid} of ${inputs.length} row(s) have a valid phone`;
+    countEl.textContent = `${valid} valid phone(s)` + (matching ? ` · ${matching} unlock masked contacts` : '');
     resolveBtn.disabled = valid === 0;
     resolveBtn.textContent = `✅ Resolve ${valid} row${valid === 1 ? '' : 's'}`;
   }
   function addRow(row) {
     const wrap = document.createElement('div');
-    wrap.style.cssText = 'display:grid;grid-template-columns:1.5fr 1.2fr .6fr 24px;gap:6px 8px;align-items:center;';
+    wrap.style.cssText = 'display:grid;grid-template-columns:1.5fr 1.2fr .6fr 24px;gap:2px 8px;align-items:center;';
     wrap.innerHTML = `
-      <input class="cr-name" style="${inputCss}" placeholder="Name" value="${(row.name || '').replace(/"/g, '&quot;')}">
-      <input class="cr-phone" style="${inputCss}" placeholder="07XX XXX XXX" value="${(row.phone || row.phoneRaw || '').replace(/"/g, '&quot;')}">
-      <input class="cr-amt" style="${inputCss}" placeholder="—" value="${(row.amount || '').replace(/"/g, '&quot;')}">
-      <button class="cr-del" title="drop row" style="background:none;border:none;color:var(--red2);cursor:pointer;font-size:1rem;padding:0">✕</button>`;
+      <input class="cr-name" style="${inputCss}" placeholder="Name" value="${esc(row.name || '')}">
+      <input class="cr-phone" style="${inputCss}" placeholder="07XX XXX XXX" value="${esc(row.phone || row.phoneRaw || '')}">
+      <input class="cr-amt" style="${inputCss}" placeholder="—" value="${esc(row.amount || '')}">
+      <button class="cr-del" title="drop row" style="background:none;border:none;color:var(--red2);cursor:pointer;font-size:1rem;padding:0">✕</button>
+      <div class="cr-hints" style="grid-column:1/-1;display:none;line-height:1.3"></div>`;
     wrap.querySelector('.cr-del').onclick = () => { wrap.remove(); refresh(); };
     wrap.querySelectorAll('input').forEach(inp => inp.addEventListener('input', refresh));
     rowsEl.appendChild(wrap);
@@ -5528,7 +5685,7 @@ async function handleResolverFile(file) {
       } catch (e) {}
       if (!text.trim()) {
         $('resolverProgress').innerHTML = '<span class="spinner"></span> No embedded text. Running OCR…';
-        text = await ocrPdf(file);
+        text = await ocrPdf(file, { contacts: true });
       }
       // Repair handwriting misreads before matching (digit letters, split numbers)
       text = repairContactsOcrText(text);
@@ -5577,7 +5734,21 @@ async function handleResolverFile(file) {
         const { data } = await worker.recognize(canvas);
         const words = data.words || [];
         const wordConf = words.length ? words.reduce((s, w) => s + (w.confidence || 0), 0) / words.length : (data.confidence || 0);
-        const rawText = repairContactsOcrText(data.text);
+        // Second pass: per-row digit region read with a digits-only whitelist —
+        // recovers phone groups the full-page read mangled.
+        let pageText = data.text || '';
+        try {
+          $('resolverProgress').innerHTML = '<span class="spinner"></span> Reading row digits…';
+          const bands = await readBandDigits(worker, canvas, (done, total) =>
+            { $('resolverProgress').innerHTML = `<span class="spinner"></span> Row digits ${done}/${total}…`; });
+          pageText = mergeBandDigits(pageText, bands);
+        } catch (e) { console.warn('band digit pass failed', e); }
+        await worker.setParameters({
+          tessedit_pageseg_mode: '6',
+          tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .'-0123456789",
+          preserve_interword_spaces: '1'
+        });
+        const rawText = repairContactsOcrText(pageText);
 
         // If OCR confidence is terrible or no phone digits found, go straight to review
         if (wordConf < 45 || !rawText.match(/\d{5,}/)) {

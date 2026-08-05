@@ -227,10 +227,11 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         <b>Backfill</b> = add history only, keep summary stats · <b>Rebuild</b> = reset everything and recalculate
       </div>
     </div>
-    <div class="hint">Hybrid engine: embedded-text parsing + Tesseract OCR fallback for scanned/image PDFs</div>
+    <div class="hint">Hybrid engine: embedded-text parsing + Tesseract OCR fallback for scanned/image PDFs · photographed pages auto-enhanced (binarize + ruling removal, 4.2× render)</div>
     <div class="note">
       <b>📄 PDF statements:</b> pages with a text layer parse instantly; image-only pages are automatically
-      <b>OCR'd with Tesseract.js</b> (rendered at 2.5× for accuracy — first OCR run downloads the ~15&nbsp;MB language model once, then it's cached).
+      <b>OCR'd with Tesseract.js</b> (rendered at 2.5× for accuracy — first OCR run downloads the ~15&nbsp;MB language model once, then it's cached). Pages detected as <b>camera photos</b> get auto-enhancement:
+      adaptive binarization, wavy notebook-ruling removal and a larger 4.2× render.
       Handles <i>Merchant Payment from / Online from / Small Business Pay Merchant from / received from</i> rows.<br>
       <b>🖼️ Images:</b> PNG/JPG screenshots/photos are OCR'd. <b>Contact lists are resolved first</b> — if the image looks like a name+phone list, masked contacts are auto-unlocked. Otherwise, M-Pesa transactions are parsed.
       wrapped receipt numbers &amp; multi-line names. OCR misreads of masked numbers (<code>***</code> read as <code>#**</code>/<code>xxx</code>) are auto-repaired.<br>
@@ -371,7 +372,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     <h3>🔗 Masked Contact Resolver</h3>
     <div class="hint" id="maskedCount">—</div>
     <div class="note">🔍 Masked <code>0723***321</code> matches any full number starting <code>0723</code> &amp; ending <code>321</code>. Name-match too → auto-applied. Pattern-only → review list.<br>
-      <b>📎 Attach file:</b> Drop a <b>PDF</b>, CSV, Excel, screenshot, or <b>handwritten photo</b> of a contact list. It auto-extracts names + phones and resolves masked contacts. PDFs use embedded text or OCR fallback; handwriting gets fast adaptive thresholding + a review step.</div>
+      <b>📎 Attach file:</b> Drop a <b>PDF</b>, CSV, Excel, screenshot, or <b>handwritten photo</b> of a contact list. It auto-extracts names + phones and resolves masked contacts. PDFs use embedded text or OCR fallback; handwriting gets fast adaptive thresholding + a review step. <b>Handwriting OCR can misread digits</b> — OCR'd numbers are auto-repaired where possible, then shown one-per-row (Name / Phone / Amount) so you can correct the rest before anything is applied.</div>
     <div class="drop" id="resolverDrop" style="padding:24px;margin-bottom:14px">
       <div class="big">📎</div>
       <div><b>Drop one or more contact lists here</b> or click to browse</div>
@@ -582,7 +583,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.4 · Local data · PDF text + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.5 · Local data · PDF text + Tesseract OCR (photo-page enhance) · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -2785,29 +2786,74 @@ function deslateRuledLines(canvas) {
     if (d[i] < 128) { dark[j] = 1; darkTotal++; }
   }
   if (!darkTotal) return canvas;
-  const MIN_H_RUN = Math.max(80, Math.floor(w * 0.08)); // horiz rule: ≥8% of width
-  const MIN_V_RUN = Math.max(80, Math.floor(h * 0.06)); // vert rule: ≥6% of height
+  const MIN_H_RUN = Math.max(80, Math.floor(w * 0.07)); // horiz rule: ≥7% of width
+  const MIN_V_RUN = Math.max(80, Math.floor(h * 0.05)); // vert rule: ≥5% of height
+  // Ruling in phone photos WAVES (page curvature) and BREAKS under pen strokes,
+  // so run detection OR-dilates each row/column with its ±3 neighbours and
+  // bridges small gaps in the run. A run only counts when the long straight
+  // extent is far beyond any glyph — text survives, ruling dies.
+  const R = 3, BRIDGE = 6;
   const kill = new Uint8Array(w * h);
-  for (let y = 0; y < h; y++) {                    // horizontal runs
+  const rowDark = (r, x) => {
+    for (let k = -R; k <= R; k++) {
+      const rr = r + k;
+      if (rr >= 0 && rr < h && dark[rr * w + x]) return true;
+    }
+    return false;
+  };
+  const colDark = (c, y) => {
+    for (let k = -R; k <= R; k++) {
+      const cc = c + k;
+      if (cc >= 0 && cc < w && dark[y * w + cc]) return true;
+    }
+    return false;
+  };
+  for (let y = 0; y < h; y++) {                    // horizontal ruling
     let x = 0;
     while (x < w) {
-      if (dark[y * w + x]) {
-        let x2 = x;
-        while (x2 + 1 < w && dark[y * w + x2 + 1]) x2++;
-        if (x2 - x + 1 >= MIN_H_RUN) for (let k = x; k <= x2; k++) kill[y * w + k] = 1;
-        x = x2 + 1;
-      } else x++;
+      if (!rowDark(y, x)) { x++; continue; }
+      let end = x;
+      while (true) {
+        let nxt = end + 1;
+        while (nxt < w && rowDark(y, nxt)) nxt++;
+        end = nxt - 1;
+        let peek = nxt, g = 0;
+        while (peek < w && !rowDark(y, peek) && g <= BRIDGE) { peek++; g++; }
+        if (peek < w && rowDark(y, peek)) { end = peek - 1; continue; }
+        break;
+      }
+      if (end - x + 1 >= MIN_H_RUN) {
+        for (let k = -R; k <= R; k++) {
+          const rr = y + k;
+          if (rr < 0 || rr >= h) continue;
+          for (let xx = x; xx <= end; xx++) kill[rr * w + xx] = 1;
+        }
+      }
+      x = end + 1;
     }
   }
-  for (let x = 0; x < w; x++) {                    // vertical runs
+  for (let x = 0; x < w; x++) {                    // vertical ruling / margins
     let y = 0;
     while (y < h) {
-      if (dark[y * w + x]) {
-        let y2 = y;
-        while (y2 + 1 < h && dark[(y2 + 1) * w + x]) y2++;
-        if (y2 - y + 1 >= MIN_V_RUN) for (let k = y; k <= y2; k++) kill[k * w + x] = 1;
-        y = y2 + 1;
-      } else y++;
+      if (!colDark(x, y)) { y++; continue; }
+      let end = y;
+      while (true) {
+        let nxt = end + 1;
+        while (nxt < h && colDark(x, nxt)) nxt++;
+        end = nxt - 1;
+        let peek = nxt, g = 0;
+        while (peek < h && !colDark(x, peek) && g <= BRIDGE) { peek++; g++; }
+        if (peek < h && colDark(x, peek)) { end = peek - 1; continue; }
+        break;
+      }
+      if (end - y + 1 >= MIN_V_RUN) {
+        for (let k = -R; k <= R; k++) {
+          const cc = x + k;
+          if (cc < 0 || cc >= w) continue;
+          for (let yy = y; yy <= end; yy++) kill[yy * w + cc] = 1;
+        }
+      }
+      y = end + 1;
     }
   }
   for (let i = 0, j = 0; i < d.length; i += 4, j++) {
@@ -2815,6 +2861,32 @@ function deslateRuledLines(canvas) {
   }
   ctx.putImageData(img, 0, 0);
   return canvas;
+}
+
+// Camera photos of paper carry texture: brightness noise in the white area and
+// colour cast. Digital statement/receipt renders are flat 255-white with zero
+// saturation. This discriminator decides whether page-level photo cleanup
+// (binarize + ruling removal) should run before OCR.
+function isPhotoLikeForOcr(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d');
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const step = Math.max(1, Math.floor(Math.min(w, h) / 500));
+  let n = 0, sum = 0, sum2 = 0, sat = 0;
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
+      const i = (y * w + x) * 4;
+      const g = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
+      if (g > 215) {
+        n++; sum += g; sum2 += g * g;
+        sat += Math.abs(d[i] - d[i + 1]) + Math.abs(d[i + 1] - d[i + 2]);
+      }
+    }
+  }
+  if (!n) return false;
+  const mean = sum / n;
+  const std = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+  return std > 3.5 || (sat / n) > 2;
 }
 
 // Tidy common OCR misreads on a sheet photo: keyword lines (C/H, M-Pesa, Exp)
@@ -3533,31 +3605,50 @@ function setOcrProgress(percent, status) {
 }
 
 async function ocrPdf(file) {
-  const scale = 2.5;
+  const SCALE_DIGITAL = 2.5;   // clean statement/receipt renders
+  const SCALE_PHOTO = 4.2;     // photographed pages: thin strokes need pixels
   const pdf = await loadPdfDocument(file);
   let fullText = "";
-  for (let p = 1; p <= pdf.numPages; p++) {
-    const pageBase = ((p - 1) / pdf.numPages) * 100;
-    const pageShare = 100 / pdf.numPages;
-    setOcrProgress(pageBase, `Rendering page ${p}/${pdf.numPages}`);
-    const page = await pdf.getPage(p);
-    const viewport = page.getViewport({ scale });
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d", { willReadFrequently: true });
-    canvas.width = Math.floor(viewport.width);
-    canvas.height = Math.floor(viewport.height);
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    const result = await Tesseract.recognize(canvas, "eng", {
-      logger: m => {
-        if (m.status) {
-          const local = m.progress ? m.progress * pageShare : 0;
-          setOcrProgress(pageBase + local, `OCR page ${p}/${pdf.numPages}: ${m.status}`);
-        }
+  // One worker for the whole document (was: implicit worker per page).
+  const worker = await Tesseract.createWorker('eng', 1);
+  try {
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const pageBase = ((p - 1) / pdf.numPages) * 100;
+      const pageShare = 100 / pdf.numPages;
+      const page = await pdf.getPage(p);
+
+      // Probe render at the digital scale to tell digital vs photographed page
+      setOcrProgress(pageBase, `Rendering page ${p}/${pdf.numPages}`);
+      let viewport = page.getViewport({ scale: SCALE_DIGITAL });
+      let canvas = document.createElement("canvas");
+      let ctx = canvas.getContext("2d", { willReadFrequently: true });
+      canvas.width = Math.floor(viewport.width);
+      canvas.height = Math.floor(viewport.height);
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      const photoLike = isPhotoLikeForOcr(canvas);
+      if (photoLike) {
+        // Re-render bigger, then binarize + strip notebook/table ruling before OCR
+        setOcrProgress(pageBase, `Photo page ${p}/${pdf.numPages} — enhancing…`);
+        viewport = page.getViewport({ scale: SCALE_PHOTO });
+        canvas = document.createElement("canvas");
+        ctx = canvas.getContext("2d", { willReadFrequently: true });
+        canvas.width = Math.floor(viewport.width);
+        canvas.height = Math.floor(viewport.height);
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        preprocessForHandwriting(canvas);
+        deslateRuledLines(canvas);
       }
-    });
-    fullText += "\n" + result.data.text;
+      const { data } = await worker.recognize(canvas);
+      fullText += "\n" + data.text;
+      setOcrProgress(pageBase + pageShare, `OCR page ${p}/${pdf.numPages}${photoLike ? ' (photo mode)' : ''}`);
+    }
+  } finally {
+    await worker.terminate();
   }
   setOcrProgress(100, "OCR complete.");
   return fullText;
@@ -4382,6 +4473,7 @@ async function handleImage(file) {
     ctx.drawImage(img, 0, 0, w, h);
     // Preprocess for handwriting / low-quality images
     preprocessForHandwriting(canvas);
+    deslateRuledLines(canvas);
     $('pdfProgress').innerHTML = '<span class="spinner"></span> OCR running on image… (first run downloads ~15 MB model)';
     setProg(0);
     const worker = await Tesseract.createWorker('eng', 1, {
@@ -4400,8 +4492,8 @@ async function handleImage(file) {
       setProg(100);
       $('pdfProgress').textContent = '';
 
-      // FOREMOST: try contact list resolution
-      const contacts = parseContactListFromText(text);
+      // FOREMOST: try contact list resolution (handwriting misreads repaired first)
+      const contacts = parseContactListFromText(repairContactsOcrText(text));
       if (contacts.length) {
         const n = resolveContacts(contacts, true);
         toast(`📇 Contact list detected — ${n} masked contact(s) auto-resolved from image`);
@@ -4423,6 +4515,109 @@ async function handleImage(file) {
     $('pdfProgress').textContent = '';
     toast('❌ Image OCR failed: ' + (err.message || 'unknown error'));
   }
+}
+
+/* ══════════ CONTACT OCR TEXT REPAIR (handwritten lists) ══════════ */
+// Handwriting OCR mangles digits into look-alike letters (0→O/o/Q/D, 1→I/l/|,
+// 5→S, 8→B, 6→G, 4→h) and splits phones into spaced groups ("0729 919 743").
+// This pass fixes digit-ish tokens and re-joins groups that form a valid
+// Kenyan number. Lines that are pure noise are dropped; names stay untouched.
+function repairContactsOcrText(text) {
+  return String(text || '').split(/\r?\n/).map(line => {
+    let l = line.replace(/[|¦«»]+/g, ' ').replace(/\s+/g, ' ').trim();
+    // drop leading margin bullets/dashes (—, >, _) unless followed by a number sign
+    l = l.replace(/^[—–\-~>·:,;.]+\s*/, '');
+    if (!l) return '';
+    l = l.split(' ').map(tok => {
+      if (!/\d/.test(tok)) return tok;
+      const digish = (tok.match(/[0-9OoQDIl|!ijSsZBbGh]/g) || []).length;
+      if (digish >= Math.max(2, tok.length * 0.5)) {
+        return tok
+          .replace(/[OoQD]/g, '0').replace(/[Il|!ij]/g, '1').replace(/[SsZ]/g, '5')
+          .replace(/[Bb]/g, '8').replace(/G/g, '6').replace(/h/g, '4')
+          .replace(/[^\d+./-]/g, '');
+      }
+      return tok;
+    }).join(' ');
+    // "0729 919 743" / "0729.919.743" → joined when it forms a valid mobile
+    l = l.replace(/\b(0[17]\d{1,2})[\s.\-]+(\d{2,4})[\s.\-]+(\d{2,4})\b/g, (m, a, b, c) => {
+      const j = a + b + c;
+      return /^0[17]\d{8}$/.test(j) ? j : m;
+    });
+    l = l.replace(/\b(\d{4})[\s.\-]+(\d{3})[\s.\-]+(\d{3})\b/g, (m, a, b, c) => {
+      const j = a + b + c;
+      return /^0[17]\d{8}$/.test(j) ? j : m;
+    });
+    // +254 / 254 prefixed run → local 0X format
+    l = l.replace(/\b(?:\+?\d{0,3})?(\d{3})(\d{3})(\d{3})\b/g, (m, a, b, c) => {
+      const j = a + b + c;
+      if (j.length === 9 && /^[17]\d{8}$/.test(j)) return '0' + j;
+      return m;
+    });
+    l = l.replace(/\b254([17]\d{8})\b/g, '0$1');
+    return l;
+  }).filter(Boolean).join('\n');
+}
+
+// Split repaired OCR text into editable rows { name, phone, amount } for the
+// structured review table. Names come from letter tokens, phones from digit
+// groups (joined when they add up to 10), amounts from the trailing group.
+function buildContactRows(text) {
+  const rows = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const l = line.replace(/\s+/g, ' ').trim();
+    if (l.length < 3) continue;
+    // skip date-only / heading lines ("13/07/2026", "Dates?")
+    if (/^(dates?|date\b)/i.test(l)) continue;
+    if (/^\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}$/.test(l)) continue;
+
+    const toks = l.split(' ');
+    // name = consecutive letter tokens until the first number-ish token
+    const nameParts = [];
+    let i = 0;
+    for (; i < toks.length; i++) {
+      const t = toks[i];
+      if (/^[A-Za-z][A-Za-z'’.-]*[A-Za-z]$/.test(t) && t.length >= 2) nameParts.push(t.replace(/['.’]+$/, ''));
+      else if (/\d/.test(t)) break;
+      else if (nameParts.length) break; // junk after name started → stop
+    }
+    let name = nameParts.join(' ').trim();
+
+    // digits after the name → phone (joined 10) + trailing amount
+    const digitGroups = toks.slice(i).join(' ').match(/\+?\d[\d ./+-]*\d|\d/g) || [];
+    let phoneRaw = '', amount = '';
+    const groups = digitGroups.map(g => g.replace(/[^\d+]/g, '')).filter(g => g.replace(/\D/g, '').length);
+    // find the first window of groups that joins into a 10-digit 0X number
+    let phone = '', phoneEnd = -1;
+    outer: for (let a = 0; a < groups.length; a++) {
+      for (let b = a; b < Math.min(groups.length, a + 4); b++) {
+        const j = groups.slice(a, b + 1).join('').replace(/\D/g, '');
+        if (/^0[17]\d{8}$/.test(j)) { phone = j; phoneEnd = b + 1; break outer; }
+      }
+    }
+    if (!phone && groups.length) phoneRaw = groups.join(' ');
+    else if (phone && phoneEnd >= 0) {
+      // amount = first plausible figure after the phone's groups
+      const rest = groups.slice(phoneEnd);
+      const amt = rest.find(g => /^\d{1,5}$/.test(g));
+      if (amt) amount = amt;
+    }
+    // amount fallback: the trailing short group ("…0715 126 433 250" → 250)
+    if (!amount && groups.length) {
+      const last = groups[groups.length - 1];
+      const prevDigits = groups.slice(0, -1).join('');
+      if (/^\d{1,4}$/.test(last) && prevDigits.length >= (phone ? 9 : 3)) amount = last;
+    }
+    if (!name && nameParts.length === 0 && toks.length && /^[A-Za-z]+$/.test(toks[0]) === false) {
+      // junk-led line: try the longest letter-run anywhere as the name
+      const m = l.match(/[A-Za-z]{2,}(?:['’ ]?[A-Za-z]{2,})?/g);
+      if (m && m.length) name = m.sort((a, b) => b.length - a.length)[0];
+    }
+    if (name.length >= 3 || phone || groups.join('').length >= 5) {
+      rows.push({ name, phone: phone || '', phoneRaw: phone ? '' : phoneRaw.trim(), amount, raw: l });
+    }
+  }
+  return rows;
 }
 
 /* ══════════ CONTACT LIST PARSER (for images & text) ══════════ */
@@ -4546,7 +4741,17 @@ async function parseAnyFile(file){
     let text='';
     try{text=await extractPdfText(file);}catch(e){}
     if(!text.trim()){text=await ocrPdf(file);}
-    return parseMpesaText(text);
+    const txs=parseMpesaText(text);
+    // Not an M-Pesa statement? It may be a contact list saved as PDF — resolve
+    // any name+phone rows it holds instead of returning nothing.
+    if(!txs.length&&text.trim()){
+      const contacts=parseContactListFromText(repairContactsOcrText(text));
+      if(contacts.length){
+        const n=resolveContacts(contacts,true);
+        toast(`📇 No transactions found — resolved ${n} masked contact(s) from ${file.name} instead (${contacts.length} rows)`);
+      }
+    }
+    return txs;
   }
 
   // ── Images: OCR → M-Pesa parse ──
@@ -4565,6 +4770,7 @@ async function parseAnyFile(file){
     ctx.fillStyle='#fff';ctx.fillRect(0,0,w,h);
     ctx.drawImage(img,0,0,w,h);
     preprocessForHandwriting(canvas);
+    deslateRuledLines(canvas);
     const worker=await Tesseract.createWorker('eng',1);
     try{
       await worker.setParameters({
@@ -4573,7 +4779,7 @@ async function parseAnyFile(file){
       });
       const {data}=await worker.recognize(canvas);
       // Try contact-list first as side-effect, then return M-Pesa txs
-      const contacts=parseContactListFromText(data.text);
+      const contacts=parseContactListFromText(repairContactsOcrText(data.text));
       if(contacts.length) resolveContacts(contacts,true);
       return parseMpesaText(data.text, "M-Pesa Image/OCR");
     }finally{await worker.terminate();}
@@ -5191,6 +5397,89 @@ function showOcrReview(text, onConfirm, confidence, onCancel) {
   $('ocrReviewResolve').onclick = () => { const t = $('ocrReviewText').value; box.remove(); onConfirm(t); };
 }
 
+/* ══════════ STRUCTURED CONTACT REVIEW (handwritten OCR) ══════════ */
+// Handwriting OCR rarely yields perfect digits, so instead of a raw-text
+// textarea we present the page as an editable table — one Name/Phone/Amount
+// row per detected line, with live phone validation. The user fixes what the
+// OCR mangled and hits Resolve; only rows with a valid Kenyan mobile go on.
+function showContactsReview(rows, onConfirm, confidence, onCancel) {
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;display:flex;align-items:center;justify-content:center;padding:14px;';
+  const confText = confidence != null ? `<span style="color:${confidence < 45 ? 'var(--red2)' : confidence < 70 ? 'var(--amber)' : 'var(--green)'};font-weight:700">${Math.round(confidence)}% OCR confidence</span> · ` : '';
+  box.innerHTML = `
+    <div style="background:#1a2129;border:1px solid #2c3945;border-radius:12px;max-width:720px;width:100%;max-height:94vh;overflow:auto;padding:18px;">
+      <h3 style="margin-bottom:4px">📇 Review contact rows</h3>
+      <p style="color:var(--muted);font-size:.8rem;margin-bottom:12px;line-height:1.55">
+        ${confText}one row per line read from the page. <b>Fix the phone numbers</b> (07XX XXX XXX);
+        ✖ drops a junk row, <b>+ Add row</b> inserts a missing one. Only rows with a <b style="color:var(--green)">green</b> phone are used.
+      </p>
+      <div style="display:grid;grid-template-columns:1.5fr 1.2fr .6fr 24px;gap:6px 8px;font-size:.7rem;color:var(--muted);padding:0 2px 6px">
+        <div>Name</div><div>Phone</div><div>Amount</div><div></div>
+      </div>
+      <div id="crRows" style="display:flex;flex-direction:column;gap:6px;max-height:52vh;overflow:auto;padding-right:4px;"></div>
+      <div style="display:flex;gap:10px;margin-top:12px;align-items:center;flex-wrap:wrap">
+        <button id="crAdd" class="btn ghost sm">＋ Add row</button>
+        <span id="crCount" style="margin-left:auto;font-size:.8rem;color:var(--muted)"></span>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap">
+        <button id="crCancel" class="btn ghost">Cancel</button>
+        <button id="crResolve" class="btn green" disabled>✅ Resolve 0 rows</button>
+      </div>
+    </div>`;
+  document.body.appendChild(box);
+  const rowsEl = box.querySelector('#crRows');
+  const countEl = box.querySelector('#crCount');
+  const resolveBtn = box.querySelector('#crResolve');
+  const inputCss = 'width:100%;background:var(--card2);border:1px solid var(--border);color:var(--text);padding:7px 8px;border-radius:7px;font-size:.85rem;font-family:inherit;outline:none;';
+
+  function normalizedPhone(v) {
+    let c = String(v || '').replace(/[^\d+]/g, '');
+    if (c.startsWith('+254')) c = '0' + c.slice(4);
+    else if (c.startsWith('254')) c = '0' + c.slice(3);
+    return c;
+  }
+  function refresh() {
+    const inputs = rowsEl.querySelectorAll('.cr-phone');
+    let valid = 0;
+    inputs.forEach(inp => {
+      const p = normalizedPhone(inp.value);
+      const ok = /^0[17]\d{8}$/.test(p);
+      inp.style.borderColor = ok ? 'var(--green)' : (p.length >= 7 ? 'var(--amber)' : 'var(--border)');
+      if (ok) valid++;
+    });
+    countEl.textContent = `${valid} of ${inputs.length} row(s) have a valid phone`;
+    resolveBtn.disabled = valid === 0;
+    resolveBtn.textContent = `✅ Resolve ${valid} row${valid === 1 ? '' : 's'}`;
+  }
+  function addRow(row) {
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'display:grid;grid-template-columns:1.5fr 1.2fr .6fr 24px;gap:6px 8px;align-items:center;';
+    wrap.innerHTML = `
+      <input class="cr-name" style="${inputCss}" placeholder="Name" value="${(row.name || '').replace(/"/g, '&quot;')}">
+      <input class="cr-phone" style="${inputCss}" placeholder="07XX XXX XXX" value="${(row.phone || row.phoneRaw || '').replace(/"/g, '&quot;')}">
+      <input class="cr-amt" style="${inputCss}" placeholder="—" value="${(row.amount || '').replace(/"/g, '&quot;')}">
+      <button class="cr-del" title="drop row" style="background:none;border:none;color:var(--red2);cursor:pointer;font-size:1rem;padding:0">✕</button>`;
+    wrap.querySelector('.cr-del').onclick = () => { wrap.remove(); refresh(); };
+    wrap.querySelectorAll('input').forEach(inp => inp.addEventListener('input', refresh));
+    rowsEl.appendChild(wrap);
+  }
+  (rows && rows.length ? rows : [{ name: '', phone: '', phoneRaw: '', amount: '' }]).forEach(addRow);
+  box.querySelector('#crAdd').onclick = () => { addRow({ name: '', phone: '', phoneRaw: '', amount: '' }); refresh(); };
+  box.querySelector('#crCancel').onclick = () => { box.remove(); if (onCancel) onCancel(); };
+  resolveBtn.onclick = () => {
+    const out = [];
+    rowsEl.querySelectorAll(':scope > div').forEach(div => {
+      const name = div.querySelector('.cr-name').value.replace(/[^A-Za-z'’ .-]/g, ' ').replace(/\s+/g, ' ').trim();
+      const phone = normalizedPhone(div.querySelector('.cr-phone').value);
+      const amount = div.querySelector('.cr-amt').value.replace(/[^\d.]/g, '');
+      if (/^0[17]\d{8}$/.test(phone) && name && !isMerchant(name)) out.push({ name: toTitleCase(name), phone, amount });
+    });
+    box.remove();
+    onConfirm(out);
+  };
+  refresh();
+}
+
 /* ══════════ RESOLVER FILE ATTACHMENT ══════════ */
 // Wait for an OCR review to finish before moving on to the next selected file.
 // Without this promise, selecting several low-confidence images would stack
@@ -5203,15 +5492,20 @@ function reviewResolverContacts(text, confidence) {
       finished = true;
       resolve();
     };
-    showOcrReview(text, editedText => {
-      const reviewed = parseContactListFromText(editedText);
+    const rows = buildContactRows(text);
+    if (!rows.length && !String(text || '').trim()) {
+      $('resolverProgress').textContent = '⚠️ Nothing readable found on the page.';
+      done();
+      return;
+    }
+    showContactsReview(rows, reviewed => {
       if (!reviewed.length) {
         $('resolverProgress').textContent = '❌ No valid contacts after review.';
         done();
         return;
       }
       const n = resolveContacts(reviewed, true);
-      $('resolverProgress').innerHTML = `✅ ${n} contact(s) resolved after review · ${reviewed.length} extracted`;
+      $('resolverProgress').innerHTML = `✅ ${n} contact(s) resolved after review · ${reviewed.length} valid row(s)`;
       toast(`📇 ${n} masked contacts resolved`);
       done();
     }, confidence, () => {
@@ -5236,11 +5530,14 @@ async function handleResolverFile(file) {
         $('resolverProgress').innerHTML = '<span class="spinner"></span> No embedded text. Running OCR…';
         text = await ocrPdf(file);
       }
+      // Repair handwriting misreads before matching (digit letters, split numbers)
+      text = repairContactsOcrText(text);
       const contacts = parseContactListFromText(text);
       if (contacts.length >= 2) {
         const n = resolveContacts(contacts, true);
         $('resolverProgress').innerHTML = `✅ ${n} contact(s) auto-resolved from PDF · ${contacts.length} extracted`;
         toast(`📇 ${n} masked contacts resolved from PDF`);
+        if (n > 0 && n < contacts.length) await reviewResolverContacts(text);
         return;
       }
       // Show review for low-confidence PDF results and wait before processing
@@ -5264,8 +5561,9 @@ async function handleResolverFile(file) {
       canvas.width = w; canvas.height = h;
       ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
       ctx.drawImage(img, 0, 0, w, h);
-      // Preprocess for handwriting
+      // Preprocess for handwriting + strip notebook/table ruling
       preprocessForHandwriting(canvas);
+      deslateRuledLines(canvas);
       $('resolverProgress').innerHTML = '<span class="spinner"></span> OCR reading image (handwriting optimized)…';
       const worker = await Tesseract.createWorker('eng', 1, {
         logger: m => { if (m.status) $('resolverProgress').innerHTML = `<span class="spinner"></span> ${m.status}… ${Math.round((m.progress || 0) * 100)}%`; }
@@ -5277,9 +5575,9 @@ async function handleResolverFile(file) {
           tessedit_pageseg_mode: '6'
         });
         const { data } = await worker.recognize(canvas);
-        const rawText = data.text;
         const words = data.words || [];
         const wordConf = words.length ? words.reduce((s, w) => s + (w.confidence || 0), 0) / words.length : (data.confidence || 0);
+        const rawText = repairContactsOcrText(data.text);
 
         // If OCR confidence is terrible or no phone digits found, go straight to review
         if (wordConf < 45 || !rawText.match(/\d{5,}/)) {
@@ -5294,6 +5592,7 @@ async function handleResolverFile(file) {
           const n = resolveContacts(contacts, true);
           $('resolverProgress').innerHTML = `✅ ${n} contact(s) auto-resolved · ${contacts.length} extracted · confidence ${Math.round(wordConf)}%`;
           toast(`📇 ${n} masked contacts resolved from image`);
+          if (n > 0 && n < contacts.length) await reviewResolverContacts(rawText, wordConf);
           return;
         }
         // Few matches → show review dialog, then continue with the next file.

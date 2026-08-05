@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpaxButchery | Analytics v2.4</title>
+<title>SpaxButchery | Analytics v2.5</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
@@ -95,8 +95,8 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
 
 <header>
   <div class="logo"><div class="logo-badge">🥩</div>
-    <div><h1>SpaxButchery Analytics <span style="color:var(--amber);font-size:.85rem">v2.4</span></h1>
-    <div class="sub">Ledger Photo Capture · PDF + OCR Statements · Dedup Guard · AI Accounts · Bulk SMS</div></div></div>
+    <div><h1>SpaxButchery Analytics <span style="color:var(--amber);font-size:.85rem">v2.5</span></h1>
+    <div class="sub">Ledger Photo Capture · Kimi Vision AI · PDF + OCR Statements · Dedup Guard · AI Accounts · Bulk SMS</div></div></div>
   <div class="hdr-stats">
     <div class="hdr-stat">👥 <span id="hCust">—</span> customers</div>
     <div class="hdr-stat">💰 KES <span id="hRev">—</span></div>
@@ -187,6 +187,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
         <button class="btn blue sm" onclick="downloadLedgerTemplate()">⬇️ Download CSV Ledger Template</button>
         <button class="btn sm" style="background:var(--amber);color:#000;" onclick="document.getElementById('ledgerImageInput').click()">📸 Upload Sheet Photo (JPG/PNG)</button>
         <input type="file" id="ledgerImageInput" accept="image/jpeg,image/png,.jpg,.jpeg,.png" style="display:none" onchange="handleLedgerPhoto(this)">
+        <button class="btn sm" id="kimiLedgerBtn" style="background:linear-gradient(135deg,#6c2bd9,#1a1a2e);color:#fff;display:none;" onclick="kimiLedgerVision()" title="Use Kimi Vision AI for better handwritten OCR">🌙 Kimi Vision OCR</button>
       </div>
       <img id="ledgerPhotoPreview" alt="Uploaded sheet" style="display:none;max-height:180px;max-width:100%;border-radius:8px;border:1px solid var(--border);margin-bottom:10px;">
       <div id="ledgerOcrStatus" style="font-size:.82rem;color:var(--muted);margin-bottom:12px;line-height:1.6;"></div>
@@ -371,7 +372,8 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     <h3>🔗 Masked Contact Resolver</h3>
     <div class="hint" id="maskedCount">—</div>
     <div class="note">🔍 Masked <code>0723***321</code> matches any full number starting <code>0723</code> &amp; ending <code>321</code>. Name-match too → auto-applied. Pattern-only → review list.<br>
-      <b>📎 Attach file:</b> Drop a <b>PDF</b>, CSV, Excel, screenshot, or <b>handwritten photo</b> of a contact list. It auto-extracts names + phones and resolves masked contacts. PDFs use embedded text or OCR fallback; handwriting gets fast adaptive thresholding + a review step.</div>
+      <b>📎 Attach file:</b> Drop a <b>PDF</b>, CSV, Excel, screenshot, or <b>handwritten photo</b> of a contact list. It auto-extracts names + phones and resolves masked contacts. PDFs use embedded text or OCR fallback; handwriting gets fast adaptive thresholding + a review step.<br>
+      <b>🌙 Kimi Vision AI:</b> When Tesseract struggles with handwriting, Kimi Vision automatically kicks in (Auto mode) or you can use it manually from Settings → Kimi Vision AI.</div>
     <div class="drop" id="resolverDrop" style="padding:24px;margin-bottom:14px">
       <div class="big">📎</div>
       <div><b>Drop one or more contact lists here</b> or click to browse</div>
@@ -452,6 +454,34 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     </div>
 
     <div id="syncActionResult" style="margin-top:16px;font-size:.85rem;min-height:24px;"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h3>🌙 Kimi Vision AI — Handwritten OCR</h3>
+    <div class="hint">Moonshot AI's Kimi reads handwriting far better than Tesseract — use it when sheet photos are hard to OCR</div>
+    <div class="note">
+      <b>How it works:</b><br>
+      <b>① Auto (API key configured):</b> The image is sent to Kimi's vision model via your Google Apps Script proxy. Extracted text is returned automatically — no manual steps.<br>
+      <b>② Manual (no API key):</b> The image is copied to your clipboard and Kimi.com opens in a new tab. Paste the image (Ctrl/Cmd+V), ask Kimi to read it, then paste the result back into the text box.<br><br>
+      <b>To enable Auto mode:</b> Add a <code>kimiVision</code> handler to your Google Apps Script that proxies to <code>https://api.moonshot.cn/v1/chat/completions</code> using your Moonshot API key. <a href="https://platform.moonshot.cn/" target="_blank" style="color:var(--blue)">Get a key →</a>
+    </div>
+    <div style="display:grid;gap:10px;margin-top:10px;">
+      <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:14px;">
+        <div style="font-weight:600;margin-bottom:6px;">⚙️ Kimi Vision API Settings</div>
+        <div style="font-size:.8rem;color:var(--muted);margin-bottom:10px;">
+          Leave blank to use Manual (clipboard) mode only. Enter your Moonshot API key in the Google Apps Script to enable Auto mode.
+        </div>
+        <div class="flex" style="gap:8px;flex-wrap:wrap;">
+          <select id="kimiVisionMode" style="flex:1;min-width:200px;">
+            <option value="auto">⚡ Auto — Use API if available, else clipboard</option>
+            <option value="manual">📋 Manual — Always use clipboard + open Kimi</option>
+            <option value="api">🔑 API only — Skip if not configured</option>
+          </select>
+          <button class="btn ghost sm" onclick="testKimiVision()">🧪 Test Connection</button>
+        </div>
+        <div id="kimiVisionStatus" style="margin-top:8px;font-size:.8rem;color:var(--muted);min-height:20px;"></div>
+      </div>
+    </div>
   </div>
 
   <div class="card" style="margin-top:16px;">
@@ -582,7 +612,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.4 · Local data · PDF text + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.5 · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -2877,6 +2907,11 @@ async function handleLedgerPhoto(input) {
     const thumb = $('ledgerPhotoPreview');
     if (thumb) { thumb.src = img.src; thumb.style.display = 'block'; }
 
+    // Store image for Kimi Vision (available via the 🌙 button after OCR)
+    const reader2 = new FileReader();
+    reader2.onload = () => storeKimiImage(file, reader2.result, 'ledger');
+    reader2.readAsDataURL(file);
+
     // Draw to canvas on a white background. Long side is normalised to
     // 2000–2600px: small photos are UPSCALED (thicker strokes read better),
     // huge ones capped for memory.
@@ -2929,15 +2964,50 @@ async function handleLedgerPhoto(input) {
     const cleaned = cleanLedgerOcrText(text);
     if ($('ledgerPasteText')) $('ledgerPasteText').value = cleaned;
 
+    // Show the Kimi Vision button so user can always try AI OCR
+    const kimiBtn = $('kimiLedgerBtn');
+    if (kimiBtn) kimiBtn.style.display = 'inline-flex';
+
     if (parsed && parsed.items.length) {
       const dateNote = parsed.dateDetected
         ? `date <b>${parsed.date}</b>`
         : `date <b>not read — defaulted to today (${parsed.date})</b>; add the sheet date as the first line if different`;
-      setStatus(`✅ Captured <b>${parsed.items.length}</b> item row(s) from the photo — ${dateNote}, revenue est. <b>${kes(parsed.revenue)}</b>, C/H <b>${kes(parsed.ch)}</b>, M-Pesa <b>${kes(parsed.mpesa)}</b>, Exp <b>${kes(parsed.exp)}</b>.<br>👀 Handwriting OCR can slip — review the figures in the box below, then hit <b>⚡ Parse & Reconcile Daily Ledger</b>.`);
+      setStatus(`✅ Captured <b>${parsed.items.length}</b> item row(s) from the photo — ${dateNote}, revenue est. <b>${kes(parsed.revenue)}</b>, C/H <b>${kes(parsed.ch)}</b>, M-Pesa <b>${kes(parsed.mpesa)}</b>, Exp <b>${kes(parsed.exp)}</b>.<br>👀 Handwriting OCR can slip — review the figures in the box below, then hit <b>⚡ Parse & Reconcile Daily Ledger</b>.<br><span style="font-size:.78rem;color:var(--muted)">💡 Figures look wrong? Try <b>🌙 Kimi Vision OCR</b> — AI reads handwriting better than Tesseract.</span>`);
       toast('📸 Sheet captured — review the figures, then Parse');
     } else {
-      setStatus('⚠️ OCR finished but no ledger rows were recognised. The raw text is in the box below — tidy it up (one item + figures per line, e.g. <code>Beef 6.4 0 0.34 2.76 3.3 2772</code>) then hit Parse.');
-      toast('⚠️ No ledger rows detected — please review the text');
+      // Tesseract failed — offer Kimi Vision automatically
+      const kimiMode = getKimiVisionMode();
+      if (kimiMode === 'auto' || kimiMode === 'api') {
+        // Auto mode: try Kimi Vision API right away as a fallback
+        setStatus('⚠️ Tesseract couldn\'t read the handwriting. <span class="spinner"></span> Trying <b>🌙 Kimi Vision AI</b>…');
+        const dataUrl = await fileToBase64(file);
+        const prompt = buildKimiPrompt('ledger');
+        const kimiResult = await kimiVisionAPI(dataUrl, prompt);
+        if (kimiResult) {
+          const cleaned2 = cleanLedgerOcrText(kimiResult);
+          if ($('ledgerPasteText')) $('ledgerPasteText').value = cleaned2;
+          const parsed2 = parseDailyLedgerText(cleaned2);
+          if (parsed2 && parsed2.items.length) {
+            const dateNote2 = parsed2.dateDetected
+              ? `date <b>${parsed2.date}</b>`
+              : `date <b>not read — defaulted to today (${parsed2.date})</b>`;
+            setStatus(`🌙 <b>Kimi Vision AI</b> captured <b>${parsed2.items.length}</b> row(s) — ${dateNote2}, revenue est. <b>${kes(parsed2.revenue)}</b>, C/H <b>${kes(parsed2.ch)}</b>, M-Pesa <b>${kes(parsed2.mpesa)}</b>.<br>✅ AI read the handwriting! Review the figures, then hit <b>⚡ Parse & Reconcile Daily Ledger</b>.`);
+            toast('🌙 Kimi Vision AI read the handwriting!');
+            return;
+          }
+          // Kimi returned text but couldn't parse it as ledger
+          if ($('ledgerPasteText')) $('ledgerPasteText').value = kimiResult;
+          setStatus(`🌙 <b>Kimi Vision AI</b> extracted text but it doesn't match the expected ledger format. The text is in the box below — tidy it up then hit Parse.`);
+          toast('🌙 Kimi extracted text — review and tidy it up');
+          return;
+        }
+        // API not available
+        setStatus('⚠️ OCR finished but no ledger rows were recognised, and Kimi Vision API is not configured.<br>The raw text is in the box below — tidy it up (one item + figures per line, e.g. <code>Beef 6.4 0 0.34 2.76 3.3 2772</code>) then hit Parse.<br><span style="color:var(--blue)">💡 <b>Try 🌙 Kimi Vision OCR</b> above — AI reads handwriting much better than Tesseract!</span>');
+      } else {
+        // Manual mode — just point them to the Kimi button
+        setStatus('⚠️ OCR finished but no ledger rows were recognised. The raw text is in the box below — tidy it up (one item + figures per line, e.g. <code>Beef 6.4 0 0.34 2.76 3.3 2772</code>) then hit Parse.<br><span style="color:var(--blue)">💡 <b>Try 🌙 Kimi Vision OCR</b> above — AI reads handwriting much better than Tesseract!</span>');
+      }
+      toast('⚠️ No ledger rows detected — try 🌙 Kimi Vision OCR');
     }
   } catch (err) {
     console.error(err);
@@ -4411,7 +4481,33 @@ async function handleImage(file) {
       // Fallback: M-Pesa transaction parsing
       const txs = parseMpesaText(text, "M-Pesa Image/OCR");
       if (!txs.length) {
-        toast('❌ No M-Pesa transactions or contact list found in image. Try a clearer photo or screenshot.');
+        // Tesseract found nothing — try Kimi Vision AI
+        const kimiMode = getKimiVisionMode();
+        if (kimiMode === 'auto' || kimiMode === 'api') {
+          $('pdfProgress').innerHTML = '<span class="spinner"></span> 🌙 Tesseract found nothing — trying <b>Kimi Vision AI</b>…';
+          const dataUrl = await fileToBase64(file);
+          const prompt = buildKimiPrompt('mpesa');
+          const kimiResult = await kimiVisionAPI(dataUrl, prompt);
+          if (kimiResult) {
+            // Try parsing Kimi's output
+            const kimiContacts = parseContactListFromText(kimiResult);
+            if (kimiContacts.length) {
+              const n = resolveContacts(kimiContacts, true);
+              toast(`🌙 Kimi Vision AI read contacts — ${n} resolved`);
+              return;
+            }
+            const kimiTxs = parseMpesaText(kimiResult, "Kimi Vision OCR");
+            if (kimiTxs.length) {
+              showPreview(kimiTxs, '🌙 Kimi Vision: ' + file.name);
+              toast(`🌙 Kimi Vision AI found ${kimiTxs.length} transaction(s)!`);
+              return;
+            }
+          }
+        }
+        // Both failed or manual mode
+        storeKimiImage(file, await fileToBase64(file), 'mpesa');
+        $('pdfProgress').textContent = '';
+        toast('❌ No transactions found. Try 🌙 Kimi Vision OCR from Settings → Kimi Vision AI.');
         return;
       }
       showPreview(txs, 'Image OCR (' + file.name + ')');
@@ -4566,16 +4662,33 @@ async function parseAnyFile(file){
     ctx.drawImage(img,0,0,w,h);
     preprocessForHandwriting(canvas);
     const worker=await Tesseract.createWorker('eng',1);
+    let tessText='';
     try{
       await worker.setParameters({
         tessedit_char_whitelist:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .'-0123456789",
         preserve_interword_spaces:'1'
       });
       const {data}=await worker.recognize(canvas);
+      tessText=data.text||'';
       // Try contact-list first as side-effect, then return M-Pesa txs
-      const contacts=parseContactListFromText(data.text);
+      const contacts=parseContactListFromText(tessText);
       if(contacts.length) resolveContacts(contacts,true);
-      return parseMpesaText(data.text, "M-Pesa Image/OCR");
+      const txs=parseMpesaText(tessText, "M-Pesa Image/OCR");
+      if(txs.length) return txs;
+      // Tesseract found nothing — try Kimi Vision AI as fallback
+      const kimiMode=getKimiVisionMode();
+      if(kimiMode==='auto'||kimiMode==='api'){
+        const dataUrl=await fileToBase64(file);
+        const kimiResult=await kimiVisionAPI(dataUrl, buildKimiPrompt('mpesa'));
+        if(kimiResult){
+          storeKimiImage(file, dataUrl, 'mpesa');
+          const kimiContacts=parseContactListFromText(kimiResult);
+          if(kimiContacts.length) resolveContacts(kimiContacts,true);
+          const kimiTxs=parseMpesaText(kimiResult, "Kimi Vision OCR");
+          if(kimiTxs.length) return kimiTxs;
+        }
+      }
+      return [];
     }finally{await worker.terminate();}
   }
 
@@ -5281,9 +5394,27 @@ async function handleResolverFile(file) {
         const words = data.words || [];
         const wordConf = words.length ? words.reduce((s, w) => s + (w.confidence || 0), 0) / words.length : (data.confidence || 0);
 
-        // If OCR confidence is terrible or no phone digits found, go straight to review
+        // If OCR confidence is terrible or no phone digits found, try Kimi Vision AI first
         if (wordConf < 45 || !rawText.match(/\d{5,}/)) {
-          $('resolverProgress').textContent = `⚠️ OCR confidence low (${Math.round(wordConf)}%). Please review and edit.`;
+          const kimiMode = getKimiVisionMode();
+          if (kimiMode === 'auto' || kimiMode === 'api') {
+            $('resolverProgress').innerHTML = `<span class="spinner"></span> Tesseract confidence low (${Math.round(wordConf)}%). Trying <b>🌙 Kimi Vision AI</b>…`;
+            const dataUrl = await fileToBase64(file);
+            const prompt = buildKimiPrompt('contacts');
+            const kimiResult = await kimiVisionAPI(dataUrl, prompt);
+            if (kimiResult) {
+              const kimiContacts = parseContactListFromText(kimiResult);
+              if (kimiContacts.length >= 2) {
+                const n = resolveContacts(kimiContacts, true);
+                $('resolverProgress').innerHTML = `🌙 <b>Kimi Vision AI</b> extracted ${kimiContacts.length} contact(s) — <b>${n}</b> resolved!`;
+                toast(`🌙 Kimi Vision AI read the handwriting — ${n} contacts resolved`);
+                return;
+              }
+            }
+          }
+          // Kimi not available or didn't help — fall back to manual review
+          storeKimiImage(file, await fileToBase64(file), 'contacts');
+          $('resolverProgress').innerHTML = `⚠️ OCR confidence low (${Math.round(wordConf)}%). Please review and edit. <span style="color:var(--blue)">💡 Try 🌙 Kimi Vision OCR from Settings for better handwriting reading.</span>`;
           await reviewResolverContacts(rawText, wordConf);
           return;
         }
@@ -5297,6 +5428,7 @@ async function handleResolverFile(file) {
           return;
         }
         // Few matches → show review dialog, then continue with the next file.
+        storeKimiImage(file, await fileToBase64(file), 'contacts');
         $('resolverProgress').textContent = '⏳ Waiting for review…';
         await reviewResolverContacts(rawText, wordConf);
       } finally { await worker.terminate(); }
@@ -5903,6 +6035,352 @@ function finishImportModal(body){
 function closeImportModal(){
   $('importModal').style.display = 'none';
 }
+
+/* ══════════ KIMI VISION AI — HANDWRITTEN OCR ══════════ */
+// Kimi (Moonshot AI) has superior vision capabilities for reading handwriting.
+// Two modes:
+// 1. AUTO (API key in Google Apps Script): Sends image to Moonshot API via proxy,
+//    gets structured text back automatically.
+// 2. MANUAL (no API key): Copies image to clipboard, opens Kimi.com with a
+//    context-aware prompt. User pastes the image, gets Kimi's response, then
+//    pastes it back into the app.
+
+// Persistent last-uploaded image (so Kimi button can use it after Tesseract finishes)
+let _kimiLastImage = null; // { file, dataUrl, context }
+let _kimiLastFile = null;
+
+function getKimiVisionMode() {
+  const el = $('kimiVisionMode');
+  return (el && el.value) || localStorage.getItem('kimiVisionMode') || 'auto';
+}
+
+function setKimiVisionStatus(msg, isError) {
+  const el = $('kimiVisionStatus');
+  if (el) {
+    el.innerHTML = msg;
+    el.style.color = isError ? 'var(--red2)' : 'var(--green)';
+  }
+}
+
+// Store the image when it's uploaded, so the Kimi button (which appears later)
+// can access it
+function storeKimiImage(file, dataUrl, context) {
+  _kimiLastFile = file;
+  _kimiLastImage = { file, dataUrl, context };
+  // Show the Kimi button on the ledger area if it's a ledger upload
+  if (context === 'ledger') {
+    const btn = $('kimiLedgerBtn');
+    if (btn) btn.style.display = 'inline-flex';
+  }
+}
+
+// Convert a File/Blob to base64 data URL
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+// Convert data URL to base64 without the prefix
+function dataUrlToBase64(dataUrl) {
+  const idx = dataUrl.indexOf(',');
+  return dataUrl.slice(idx + 1);
+}
+
+/**
+ * Try to call Kimi Vision via the Google Apps Script proxy.
+ * Returns the extracted text or null if not available.
+ */
+async function kimiVisionAPI(imageDataUrl, prompt) {
+  if (!GAS_URL || GAS_URL.includes('YOUR_SCRIPT')) return null;
+  
+  try {
+    const response = await fetch(GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({
+        action: 'kimiVision',
+        image: imageDataUrl,
+        prompt: prompt || 'Extract all text from this handwritten image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.',
+        model: 'moonshot-v1-128k-vision'
+      })
+    });
+    
+    const data = await response.json();
+    if (data.success && data.text) {
+      return data.text;
+    }
+    if (data.error) {
+      console.warn('Kimi Vision API error:', data.error);
+      return null;
+    }
+    return null;
+  } catch (err) {
+    console.warn('Kimi Vision API call failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Clipboard fallback: copies the image and opens Kimi with instructions.
+ * Shows a dialog where the user can paste Kimi's response.
+ */
+function kimiVisionClipboard(file, context, onResult) {
+  const prompt = buildKimiPrompt(context);
+  
+  // Try to copy the image to clipboard
+  const copyPromise = copyImageToClipboard(file);
+  
+  // Open Kimi
+  window.open('https://kimi.moonshot.cn/', '_blank');
+  
+  // Show a dialog where user can paste Kimi's response
+  showKimiPasteDialog(context, prompt, onResult);
+  
+  copyPromise.catch(() => {
+    // Clipboard API may fail — that's OK, user can right-click the image
+    console.log('Clipboard copy not available — user will need to use the image manually');
+  });
+}
+
+function buildKimiPrompt(context) {
+  const prompts = {
+    ledger: `This is a photo of a handwritten daily sales & stock ledger for a Kenyan butchery. Each row contains:
+Item name, Opening Stock (kg), Purchases (kg), Waste (kg), Closing Stock (kg), Sales (kg), Revenue (KES)
+At the bottom there may be: C/H (Cash on Hand), Mpesa, Exp (Expenses)
+
+Please extract ALL text and numbers exactly as written. Keep the same line structure. If a number is hard to read, use your best guess and mark it with [?]. Return ONLY the extracted text.`,
+    
+    contacts: `This image contains a handwritten list of customer names and phone numbers (Kenyan format, starting with 07xx or 01xx). Each line has a name and a phone number.
+
+Please extract ALL names and phone numbers. Format each as: Name, Phone
+If a digit is hard to read, mark with [?]. Return ONLY the extracted list.`,
+    
+    mpesa: `This image contains M-Pesa transaction records or a receipt. Extract all visible text including receipt codes, dates, amounts, phone numbers, and names.
+
+Return ONLY the extracted text preserving the structure.`
+  };
+  return prompts[context] || prompts.mpesa;
+}
+
+function copyImageToClipboard(file) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      // Method 1: Try ClipboardItem with the file directly
+      if (navigator.clipboard && navigator.clipboard.write) {
+        const blob = file instanceof Blob ? file : await (async () => {
+          const r = await new Promise((res, rej) => {
+            const reader = new FileReader();
+            reader.onload = () => res(new Blob([reader.result], { type: file.type }));
+            reader.onerror = rej;
+            reader.readAsArrayBuffer(file);
+          });
+          return r;
+        })();
+        
+        const type = file.type || 'image/png';
+        await navigator.clipboard.write([
+          new ClipboardItem({ [type]: blob })
+        ]);
+        resolve();
+        return;
+      }
+      reject(new Error('Clipboard API not available'));
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+function showKimiPasteDialog(context, prompt, onResult) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:300;display:flex;align-items:center;justify-content:center;padding:16px;';
+  overlay.innerHTML = `
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:620px;width:100%;max-height:90vh;overflow-y:auto;padding:24px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+        <span style="font-size:1.8rem;">🌙</span>
+        <div>
+          <h3 style="margin:0;font-size:1.05rem;">Kimi Vision OCR</h3>
+          <div style="font-size:.78rem;color:var(--muted);">Manual mode — paste image in Kimi, then paste the result back here</div>
+        </div>
+      </div>
+      
+      <div style="background:rgba(108,43,217,.1);border:1px solid rgba(108,43,217,.3);border-radius:8px;padding:12px;margin-bottom:14px;font-size:.82rem;line-height:1.5;">
+        <b>Steps:</b><br>
+        <b>1.</b> Image ${'<span style="color:var(--green)">copied to clipboard ✓</span>' /* will be updated */}<br>
+        <b>2.</b> Kimi opened in a new tab — <b>paste the image</b> (Ctrl/Cmd+V)<br>
+        <b>3.</b> Add this instruction above the image in Kimi's chat:<br>
+        <div style="background:var(--card2);border-radius:6px;padding:8px;margin-top:6px;font-family:monospace;font-size:.78rem;white-space:pre-wrap;max-height:80px;overflow-y:auto;color:var(--blue);">${prompt.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+        <b>4.</b> When Kimi responds, <b>copy its text</b> and paste it below ↓
+      </div>
+      
+      <label style="font-size:.8rem;color:var(--muted);display:block;margin-bottom:6px;">PASTE KIMI'S RESPONSE HERE:</label>
+      <textarea id="kimiPasteResult" rows="10" placeholder="Paste the text that Kimi extracted from your image..." style="width:100%;background:var(--card2);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:8px;font-family:monospace;font-size:.85rem;resize:vertical;line-height:1.5;"></textarea>
+      
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap;">
+        <button class="btn ghost" onclick="this.closest('div[style*=fixed]').remove()">Cancel</button>
+        <button class="btn" style="background:linear-gradient(135deg,#6c2bd9,#1a1a2e);color:#fff;" id="kimiPasteConfirm">✅ Use Kimi's Text</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  
+  // Try to copy image to clipboard and update the status
+  const statusLine = overlay.querySelector('b + span') || overlay.querySelector('b');
+  copyImageToClipboard(_kimiLastFile || (_kimiLastImage && _kimiLastImage.file)).then(() => {
+    // Status already says copied
+  }).catch(() => {
+    // Update status if copy failed
+    const steps = overlay.querySelector('div[style*="background:rgba(108"]');
+    if (steps) {
+      const b1 = steps.querySelector('b:nth-of-type(1)');
+      if (b1) b1.innerHTML = '1. <span style="color:var(--amber)">Image not auto-copied — right-click the preview and "Copy image"</span>';
+    }
+  });
+  
+  $('kimiPasteConfirm').onclick = () => {
+    const text = $('kimiPasteResult').value.trim();
+    overlay.remove();
+    if (text && onResult) {
+      onResult(text);
+    } else if (!text) {
+      toast('⚠️ No text pasted — cancelled');
+    }
+  };
+}
+
+/**
+ * Main orchestrator: tries API first (if mode allows), falls back to clipboard.
+ * @param {File} file - The image file
+ * @param {string} context - 'ledger', 'contacts', or 'mpesa'
+ * @param {function} onResult - Callback with extracted text
+ * @param {function} onProgress - Optional progress callback
+ */
+async function kimiVisionOCR(file, context, onResult, onProgress) {
+  const mode = getKimiVisionMode();
+  const statusFn = (msg) => {
+    if (onProgress) onProgress(msg);
+    if (context === 'ledger') {
+      const s = $('ledgerOcrStatus');
+      if (s) s.innerHTML = msg;
+    }
+  };
+  
+  // Store the image for the Kimi button
+  const dataUrl = await fileToBase64(file);
+  storeKimiImage(file, dataUrl, context);
+  
+  // Try API first if mode allows
+  if (mode === 'auto' || mode === 'api') {
+    statusFn('<span class="spinner"></span> 🌙 Asking Kimi Vision AI to read the handwriting…');
+    const prompt = buildKimiPrompt(context);
+    const result = await kimiVisionAPI(dataUrl, prompt);
+    
+    if (result) {
+      statusFn('✅ <b>Kimi Vision AI</b> extracted the text successfully!');
+      toast('🌙 Kimi Vision AI read the image!');
+      if (onResult) onResult(result, 'api');
+      return;
+    }
+    
+    if (mode === 'api') {
+      statusFn('❌ Kimi Vision API not available. Configure your Google Apps Script with a <code>kimiVision</code> handler.');
+      toast('❌ Kimi Vision API not configured');
+      return;
+    }
+    
+    // mode === 'auto' and API not available → fall through to clipboard
+    statusFn('⚠️ API not available — switching to manual clipboard mode…');
+  }
+  
+  // Clipboard fallback
+  kimiVisionClipboard(file, context, (text) => {
+    if (onResult) onResult(text, 'clipboard');
+  });
+}
+
+/**
+ * Kimi Vision for the ledger photo — called by the Kimi button that appears
+ * after a Tesseract OCR pass (whether successful or not)
+ */
+async function kimiLedgerVision() {
+  if (!_kimiLastImage || _kimiLastImage.context !== 'ledger') {
+    toast('❌ Upload a sheet photo first, then use Kimi Vision');
+    return;
+  }
+  
+  const file = _kimiLastImage.file;
+  const status = $('ledgerOcrStatus');
+  
+  kimiVisionOCR(file, 'ledger', (text, source) => {
+    // Put the extracted text into the ledger paste area
+    if ($('ledgerPasteText')) {
+      $('ledgerPasteText').value = text;
+    }
+    
+    if (source === 'api') {
+      // Auto-extracted — try to parse immediately
+      const cleaned = cleanLedgerOcrText(text);
+      const parsed = parseDailyLedgerText(cleaned);
+      if (parsed && parsed.items.length) {
+        const dateNote = parsed.dateDetected
+          ? `date <b>${parsed.date}</b>`
+          : `date <b>not read — defaulted to today (${parsed.date})</b>`;
+        if (status) status.innerHTML = `🌙 <b>Kimi Vision AI</b> captured <b>${parsed.items.length}</b> item row(s) — ${dateNote}, revenue est. <b>${kes(parsed.revenue)}</b>.<br>👀 Review the figures, then hit <b>⚡ Parse & Reconcile Daily Ledger</b>.`;
+      } else {
+        if (status) status.innerHTML = `🌙 <b>Kimi Vision AI</b> extracted text but no ledger rows detected. The text is in the box below — tidy it up, then hit Parse.`;
+      }
+    } else {
+      // Clipboard — user pasted Kimi's response
+      if (status) status.innerHTML = `🌙 <b>Kimi Vision</b> text pasted from Kimi.com. Review the figures below, then hit <b>⚡ Parse & Reconcile Daily Ledger</b>.`;
+    }
+  }, (msg) => {
+    if (status) status.innerHTML = msg;
+  });
+}
+window.kimiLedgerVision = kimiLedgerVision;
+
+/**
+ * Test the Kimi Vision API connection
+ */
+async function testKimiVision() {
+  setKimiVisionStatus('<span class="spinner"></span> Testing connection…');
+  
+  // Create a tiny test image (1x1 white pixel)
+  const testCanvas = document.createElement('canvas');
+  testCanvas.width = 10; testCanvas.height = 10;
+  const ctx = testCanvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, 10, 10);
+  ctx.fillStyle = '#000';
+  ctx.font = '8px sans-serif';
+  ctx.fillText('Hi', 1, 7);
+  const dataUrl = testCanvas.toDataURL('image/png');
+  
+  const result = await kimiVisionAPI(dataUrl, 'What text is in this image? Reply with just the text.');
+  
+  if (result) {
+    setKimiVisionStatus(`✅ Kimi Vision API is working! Response: "${result.slice(0, 50)}${result.length > 50 ? '…' : ''}"`);
+  } else {
+    setKimiVisionStatus('⚠️ API not reachable. Manual (clipboard) mode will be used. Add a <code>kimiVision</code> action to your Google Apps Script to enable Auto mode.', true);
+  }
+}
+window.testKimiVision = testKimiVision;
+
+// Persist Kimi Vision mode setting
+document.addEventListener('DOMContentLoaded', () => {
+  const modeEl = $('kimiVisionMode');
+  if (modeEl) {
+    modeEl.value = localStorage.getItem('kimiVisionMode') || 'auto';
+    modeEl.onchange = () => {
+      localStorage.setItem('kimiVisionMode', modeEl.value);
+    };
+  }
+});
+
 </script>
 <script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a258da75cd208739',t:'MTc4NTc5NzEzMw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a261091cdc45af03',t:'MTc4NTg4MjkzMA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>

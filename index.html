@@ -112,6 +112,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
   <button data-tab="outreach">💬 Outreach</button>
   <button data-tab="contacts">🔗 Contact Resolver</button>
   <button data-tab="transactions">📝 Transactions</button>
+  <button data-tab="analytics360">🎯 Analytics 360</button>
   <button data-tab="sync">⚙️ Sync</button>
 </nav>
 
@@ -308,6 +309,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
       <span class="chip">top 10 customers</span><span class="chip">revenue summary</span>
       <span class="chip">who is at risk?</span><span class="chip">customers who spent over 5000</span>
       <span class="chip">who hasn't visited in 100 days?</span><span class="chip">recommendations</span>
+      <span class="chip">profit</span><span class="chip">forecast</span><span class="chip">bleeds</span>
       <span class="chip">find Winfred</span>
     </div>
     <div class="chat" id="chat">
@@ -522,6 +524,83 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     <div class="scroll-y" style="max-height:520px"><table id="txTable">
       <thead><tr><th>Date</th><th>Name</th><th>Phone</th><th>Receipt</th><th>Amount</th><th>Product</th><th>Source</th></tr></thead>
       <tbody></tbody></table></div>
+  </div>
+</section>
+
+<!-- Analytics 360 -->
+<section id="analytics360" class="tab">
+  <div class="kpi-grid" id="anKpis"></div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3>🔮 Revenue Forecast — next 3 months</h3>
+      <div class="hint">Seasonal trend model on monthly history (band = ±20%)</div>
+      <div class="chart-box"><canvas id="anForecastChart"></canvas></div>
+      <div id="anForecastText" style="font-size:.85rem;color:var(--muted);margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <h3>📅 Daily Revenue — 28 days + 7-day projection</h3>
+      <div class="hint">Day-of-week rhythm × recent momentum</div>
+      <div class="chart-box"><canvas id="anDailyChart"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card" style="border-left: 4px solid var(--blue);">
+    <h3 style="color:var(--blue)">🧾 Profit &amp; Loss — last 30 days</h3>
+    <div class="hint" id="anPlHint">COGS is estimated at 70% of the implied selling price until you set real cost/kg per item below.</div>
+    <div id="anPlBody"></div>
+  </div>
+
+  <div class="card" style="border-left: 4px solid var(--red);">
+    <h3 style="color:var(--red)">🩸 Profit Bleeds</h3>
+    <div class="hint">Ranked by estimated KES impact — fix the top item first</div>
+    <div id="anBleeds"></div>
+  </div>
+
+  <div class="card">
+    <h3>🏷️ Price Watch — KES/kg per item</h3>
+    <div class="hint">Implied selling price from daily sheets (cash ÷ kg). Falling prices or prices below cost are flagged.</div>
+    <div class="scroll-y" style="max-height:320px"><table>
+      <thead><tr><th>Item</th><th>Latest</th><th>7-day avg</th><th>Min</th><th>Max</th><th>Days</th><th>Trend</th><th>Cost/kg</th></tr></thead>
+      <tbody id="anPriceBody"></tbody></table></div>
+    <div style="font-size:.78rem;color:var(--muted);margin-top:8px">Set cost/kg per item to unlock real gross margins and margin-floor alerts. Costs are saved instantly.</div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3>💸 Daily Expenses</h3>
+      <div class="hint">Track wages, power, water, transport… → burn rate &amp; % of revenue</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <input type="date" id="anExpDate" style="width:140px">
+        <select id="anExpCat" style="flex:1;min-width:110px">
+          <option>Wages</option><option>Electricity</option><option>Water</option>
+          <option>Transport</option><option>Supplies</option><option>Rent</option><option>Misc</option>
+        </select>
+        <input type="number" id="anExpAmt" placeholder="Amount KES" style="width:120px">
+        <input id="anExpNote" placeholder="Note (optional)" style="width:140px">
+        <button class="btn sm" onclick="addDailyExpense()">➕ Add</button>
+      </div>
+      <div id="anExpSummary" style="font-size:.85rem;margin-bottom:10px"></div>
+      <div class="scroll-y" style="max-height:200px"><table>
+        <thead><tr><th>Date</th><th>Category</th><th>Amount</th><th>Note</th><th></th></tr></thead>
+        <tbody id="anExpTable"></tbody></table></div>
+    </div>
+    <div class="card">
+      <h3>🏢 Monthly Overheads</h3>
+      <div class="hint">Recurring fixed costs (rent, licences, salaries…) — burden auto-posts into the P&amp;L</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <input id="anOvName" placeholder="e.g. Rent" style="flex:1;min-width:100px">
+        <input type="number" id="anOvAmt" placeholder="Amount KES" style="width:110px">
+        <select id="anOvCadence" style="width:110px">
+          <option value="daily">per day</option><option value="weekly">per week</option><option value="monthly">per month</option>
+        </select>
+        <button class="btn sm" onclick="addOverhead()">➕ Add</button>
+      </div>
+      <div id="anOvSummary" style="font-size:.85rem;margin-bottom:10px"></div>
+      <div class="scroll-y" style="max-height:200px"><table>
+        <thead><tr><th>Name</th><th>Amount</th><th>Cadence</th><th>Burden (30d)</th><th></th></tr></thead>
+        <tbody id="anOvTable"></tbody></table></div>
+    </div>
   </div>
 </section>
 
@@ -2559,7 +2638,10 @@ function seedDB(){
     importedRev:0,importedTx:0,resolved:0,seen:{},
     transactions:[],
     customerTx:{},
-    dailyLedgers:[]
+    dailyLedgers:[],
+    dailyExpenses:[],
+    overheads:[],
+    itemCosts:{}
   };
 }
 function load(){
@@ -2573,6 +2655,9 @@ function load(){
     if(!DB.customerTx)DB.customerTx={};
     if(DB.cogs)delete DB.cogs; // COGS & net margin model removed
     if(!DB.dailyLedgers)DB.dailyLedgers=[];
+    if(!DB.dailyExpenses)DB.dailyExpenses=[];
+    if(!DB.overheads)DB.overheads=[];
+    if(!DB.itemCosts)DB.itemCosts={};
     // Heal dedup maps written in the old cloud-sync key format ('R:...'/'C:...'),
     // which never matched the local transactionKey scheme and silently disabled
     // the duplicate guard for re-imported statements. Rebuild from the stored
@@ -3191,6 +3276,297 @@ function findCustomer(phone,name){
   return null;
 }
 
+/* ══════════ ANALYTICS 360° — forecasting · P&L · bleeds · prices · expenses ══════════ */
+function anToday(){ return getTodayEAT(); }
+function anAddDays(d, k){ const dt=new Date(d+'T12:00:00'); dt.setDate(dt.getDate()+k); return dt.toISOString().slice(0,10); }
+function anNextMonthKey(mk, k){
+  let y=+mk.slice(0,4), m=+mk.slice(5,7)-1+k;
+  y+=Math.floor(m/12); m=((m%12)+12)%12+1;
+  return y+'-'+String(m).padStart(2,'0');
+}
+const anItemKey = n => String(n||'').toLowerCase().replace(/\s+/g,' ').trim();
+function itemCostOf(name){ const v=(DB.itemCosts||{})[anItemKey(name)]; return v>0 ? Number(v) : 0; }
+
+// Daily-sheet item columns are OS · PUR · WASTE · CS · SALES kg · CASH KES
+// (the notebook "Total" column is usually blank). Derive per-item stock from
+// the raw figures so old ledger entries upgrade without re-parsing.
+function ledgerItemStock(it){
+  const n=(it.rawNums||[]).map(Number).filter(x=>!isNaN(x)&&isFinite(x));
+  if(n.length>=6) return {os:n[0],pur:n[1],waste:n[2],cs:n[3],salesKg:n[4],cash:n[5],cols:6};
+  if(n.length===5) return {os:n[0],pur:n[1],waste:n[2],cs:n[3],salesKg:n[4],cash:0,cols:5};
+  if(n.length===4) return {os:n[0],pur:n[1],waste:n[2],cs:n[3],salesKg:0,cash:0,cols:4};
+  return {os:0,pur:0,waste:0,cs:0,salesKg:Number(it.salesKg||0),cash:Number(it.cash||0),cols:0};
+}
+const impliedPrice = st => (st.salesKg>0 && st.cash>0) ? st.cash/st.salesKg : 0;
+function estCostRate(){
+  let totKes=0,totKg=0;
+  (DB.dailyLedgers||[]).forEach(l=>(l.items||[]).forEach(it=>{
+    const st=ledgerItemStock(it);
+    if(st.salesKg>0&&st.cash>0){ totKg+=st.salesKg; totKes+=st.cash; }
+  }));
+  const avg=totKg?totKes/totKg:840;
+  return Math.round(avg*0.7);
+}
+
+// Daily revenue: ledger sheets are the authoritative figure for their day;
+// M-Pesa transactions fill the days without a sheet (avoids double counting).
+function dailyRevenueMap(){
+  const ledgerDates=new Set((DB.dailyLedgers||[]).map(l=>stripTime(l.date||'')));
+  const m={};
+  (DB.transactions||[]).forEach(t=>{
+    const d=stripTime(t.date||''), a=Number(t.amount||0);
+    if(d&&a&&!ledgerDates.has(d)) m[d]=(m[d]||0)+a;
+  });
+  (DB.dailyLedgers||[]).forEach(l=>{
+    const d=stripTime(l.date||'');
+    if(d&&l.revenue) m[d]=(m[d]||0)+Number(l.revenue||0);
+  });
+  return m;
+}
+
+function monthlyForecast(){
+  const L=(DB.monthly.labels||[]).slice(), R=(DB.monthly.revenue||[]).slice();
+  if(L.length<6) return {labels:L,actual:R,fc:[],fcLabels:[],slope:0};
+  const byM={};
+  L.forEach((l,i)=>{ const m=l.slice(5,7); (byM[m]=byM[m]||[]).push(R[i]); });
+  const season={};
+  Object.keys(byM).forEach(m=>season[m]=byM[m].reduce((a,b)=>a+b,0)/byM[m].length);
+  const n=R.length, ym=R.reduce((a,b)=>a+b,0)/n, xm=(n-1)/2;
+  let num=0,den=0;
+  R.forEach((y,i)=>{ num+=(i-xm)*(y-ym); den+=(i-xm)*(i-xm); });
+  const slope=den?num/den:0;
+  const fc=[],fcLabels=[];
+  for(let k=1;k<=3;k++){
+    const mk=anNextMonthKey(L[n-1],k); fcLabels.push(mk);
+    const s=season[mk.slice(5,7)]||ym;
+    fc.push(Math.max(0,Math.round((R[n-1]+slope*k)*(s/ym))));
+  }
+  return {labels:L,actual:R,fc,fcLabels,slope};
+}
+
+function expenseTotal30(){
+  const today=anToday(), since=anAddDays(today,-29);
+  const byCat={}; let total=0;
+  (DB.dailyExpenses||[]).forEach(e=>{
+    const d=stripTime(e.date||''); if(d<since||d>today) return;
+    const a=Number(e.amount||0); total+=a;
+    byCat[e.category||'Misc']=(byCat[e.category||'Misc']||0)+a;
+  });
+  const cats=Object.entries(byCat).sort((a,b)=>b[1]-a[1]);
+  return {total,byCat,cats};
+}
+function overheadBurdenOf(o){
+  const a=Number(o.amount||0);
+  if(o.cadence==='daily') return a*30;
+  if(o.cadence==='weekly') return a*(30/7);
+  return a;
+}
+function overheadBurden30(){ return (DB.overheads||[]).reduce((s,o)=>s+overheadBurdenOf(o),0); }
+
+function pAndL30(){
+  const today=anToday(), since=anAddDays(today,-29);
+  const dm=dailyRevenueMap();
+  let rev=0; Object.keys(dm).forEach(d=>{ if(d>=since&&d<=today) rev+=dm[d]; });
+  let cogs=0, cogsUnknown=0, wasteKes=0;
+  (DB.dailyLedgers||[]).forEach(l=>{
+    const d=stripTime(l.date||''); if(d<since||d>today) return;
+    (l.items||[]).forEach(it=>{
+      const st=ledgerItemStock(it);
+      const cost=itemCostOf(it.item);
+      if(st.salesKg>0){
+        if(cost>0) cogs+=st.salesKg*cost;
+        else { cogs+=st.salesKg*estCostRate(); cogsUnknown+=st.salesKg; }
+      }
+      if(st.waste>0) wasteKes+=st.waste*(cost||impliedPrice(st)||estCostRate());
+    });
+  });
+  const gross=rev-cogs, exp=expenseTotal30().total, ov=overheadBurden30();
+  const net=gross-exp-ov;
+  const gpPct=rev?(gross/rev*100):0, npPct=rev?(net/rev*100):0;
+  const dailyGp=gross/30, fixedDaily=(exp+ov)/30;
+  const beDays=dailyGp>0?Math.ceil(fixedDaily/dailyGp):0;
+  return {rev,cogs,gross,exp,ov,net,gpPct,npPct,cogsUnknown,wasteKes,dailyRev:rev/30,beDays};
+}
+
+function priceWatch(){
+  const today=anToday(), since=anAddDays(today,-7);
+  const byItem={};
+  (DB.dailyLedgers||[]).forEach(l=>{
+    const d=stripTime(l.date||'');
+    (l.items||[]).forEach(it=>{
+      const st=ledgerItemStock(it), p=impliedPrice(st);
+      if(!p) return;
+      const k=anItemKey(it.item);
+      (byItem[k]=byItem[k]||{item:it.item,pts:[]}).pts.push({d,p});
+    });
+  });
+  const rows=Object.values(byItem).map(r=>{
+    const pts=r.pts.sort((a,b)=>a.d.localeCompare(b.d));
+    const last=pts[pts.length-1];
+    const recent=pts.filter(p=>p.d>=since);
+    const avg7=recent.length?recent.reduce((s,p)=>s+p.p,0)/recent.length:last.p;
+    const ps=pts.map(p=>p.p);
+    const min=Math.min(...ps), max=Math.max(...ps);
+    const deltaPct=avg7?Math.round((last.p/avg7-1)*100):0;
+    const cost=itemCostOf(r.item);
+    let status='stable';
+    if(deltaPct<=-10) status='falling';
+    if(cost>0&&last.p<cost) status='belowCost';
+    return {item:r.item,last:last.p,avg7,min,max,n:pts.length,deltaPct,status,cost};
+  });
+  rows.sort((a,b)=>b.last-a.last);
+  return {rows,globalAvg:rows.length?rows.reduce((s,r)=>s+r.last,0)/rows.length:0};
+}
+
+function bleedReport(){
+  const out=[];
+  const cs=DB.customers||[];
+  const lost=cs.filter(c=>c.days>90), risk=cs.filter(c=>c.days>60&&c.days<=90);
+  const lostKes=lost.reduce((s,c)=>s+(c.spent||0),0), riskKes=risk.reduce((s,c)=>s+(c.spent||0),0);
+  if(lostKes+riskKes>0) out.push({icon:'👥',title:'Customer churn — revenue locked in idle customers',
+    detail:`${lost.length} lost + ${risk.length} at-risk tracked customers hold ${kes(lostKes+riskKes)} lifetime value. At-risk (${kes(riskKes)}) is the recoverable part.`,
+    amount:Math.round(riskKes),action:'Bulk SMS the at-risk list now'});
+  let varTotal=0,bad=0,worst={d:'',v:0};
+  (DB.dailyLedgers||[]).forEach(l=>{
+    const v=Number(l.variance||0), r=Number(l.revenue||0);
+    if(!v) return;
+    if(Math.abs(v)>r*0.05+100){ bad++; varTotal+=Math.abs(v); }
+    if(Math.abs(v)>Math.abs(worst.v)) worst={d:l.date,v};
+  });
+  if(bad) out.push({icon:'🧮',title:'Till reconciliation variance',
+    detail:`${bad} day(s) where cash + M-Pesa ≠ declared sales (worst ${stripTime(worst.d)}: ${worst.v>0?'+':''}${Math.round(worst.v)} KES). Miscounts, unrecorded sales or theft.`,
+    amount:Math.round(varTotal),action:'Review those ledger days'});
+  const pl=pAndL30();
+  if(pl.wasteKes>0) out.push({icon:'🗑️',title:'Waste & shrinkage (30d)',
+    detail:`${kes(pl.wasteKes)} of stock recorded as waste — valued at retail price.`,
+    amount:Math.round(pl.wasteKes),action:'Compare waste kg vs purchases kg'});
+  const pw=priceWatch();
+  const falling=pw.rows.filter(r=>r.status==='falling'||r.status==='belowCost');
+  if(falling.length) out.push({icon:'📉',title:'Price erosion',
+    detail:falling.map(r=>`${r.item} ${r.deltaPct>0?'+':''}${r.deltaPct}% vs 7-day avg${r.status==='belowCost'?' · below cost!':''}`).join(' · '),
+    amount:0,action:'Check weighing, pricing and shrinkage'});
+  let unrec=0;
+  (DB.dailyLedgers||[]).forEach(l=>(l.items||[]).forEach(it=>{
+    const st=ledgerItemStock(it);
+    if(st.cols>=6 && Math.abs(st.os-st.waste-st.salesKg-st.cs)>0.5) unrec++;
+  }));
+  if(unrec) out.push({icon:'⚖️',title:'Stock ledger does not balance',
+    detail:`${unrec} item line(s) where OS − waste − sales ≠ closing stock. Unrecorded sales or stock loss.`,
+    amount:0,action:'Audit those item lines'});
+  out.sort((a,b)=>(b.amount||0)-(a.amount||0));
+  return out;
+}
+
+/* ── capture forms ── */
+function addDailyExpense(){
+  const d=$('anExpDate').value||anToday();
+  const cat=$('anExpCat').value;
+  const amt=parseFloat($('anExpAmt').value);
+  if(!(amt>0)){ toast('❌ Enter an amount'); return; }
+  (DB.dailyExpenses=DB.dailyExpenses||[]).push({date:d,category:cat,amount:amt,note:($('anExpNote').value||'').trim()});
+  $('anExpAmt').value=''; $('anExpNote').value='';
+  save(); toast('✅ Expense added');
+}
+function delDailyExpense(i){ if(!confirm('Delete this expense?'))return; DB.dailyExpenses.splice(i,1); save(); }
+function addOverhead(){
+  const name=($('anOvName').value||'').trim();
+  const amt=parseFloat($('anOvAmt').value);
+  if(!name||!(amt>0)){ toast('❌ Enter name and amount'); return; }
+  (DB.overheads=DB.overheads||[]).push({name,amount:amt,cadence:$('anOvCadence').value});
+  $('anOvName').value=''; $('anOvAmt').value='';
+  save(); toast('✅ Overhead added');
+}
+function delOverhead(i){ if(!confirm('Remove this overhead?'))return; DB.overheads.splice(i,1); save(); }
+function saveItemCost(name,val){
+  const k=anItemKey(name), v=parseFloat(val);
+  if(v>0) DB.itemCosts[k]=v; else delete DB.itemCosts[k];
+  save(); toast('✅ Cost saved — P&L recalculated');
+}
+
+/* ── render ── */
+let anFcChart=null, anDayChart=null;
+function renderAnalytics(){
+  const tab=$('analytics360');
+  if(!tab) return;
+  const today=anToday();
+  const pl=pAndL30(), fc=monthlyForecast(), bl=bleedReport(), pw=priceWatch(), ex=expenseTotal30();
+  const ovBurden=overheadBurden30();
+
+  $('anKpis').innerHTML=[
+    {label:'Next-month Forecast',value:fc.fc.length?kes(fc.fc[0]):'—',detail:fc.fc.length?`${fc.fcLabels[0]} · band ±20%`:'need 6+ months of history',accent:'var(--red)'},
+    {label:'Gross Margin (30d)',value:pl.gpPct.toFixed(0)+'%',detail:pl.cogsUnknown?'COGS partly estimated':'COGS from item costs',accent:'var(--amber)'},
+    {label:'Net Profit (30d)',value:kes(pl.net),detail:pl.npPct.toFixed(0)+'% of revenue',accent:pl.net>=0?'var(--green)':'var(--red)'},
+    {label:'Break-even',value:pl.beDays?pl.beDays+' days':'—',detail:'of monthly costs covered by gross margin',accent:'var(--blue)'}
+  ].map(k=>`<div class="kpi" style="--accent:${k.accent}"><div class="label">${k.label}</div><div class="value">${k.value}</div><div class="detail">${k.detail}</div></div>`).join('');
+
+  const plRows=[
+    ['💰 Revenue (ledger-preferred daily series)',pl.rev,null],
+    ['➖ COGS (sales kg × cost/kg)',pl.cogs,pl.rev?(pl.cogs/pl.rev*100):null],
+    ['＝ Gross profit',pl.gross,pl.gpPct],
+    ['➖ Daily expenses',pl.exp,pl.rev?(pl.exp/pl.rev*100):null],
+    ['➖ Overheads (prorated 30d)',pl.ov,pl.rev?(pl.ov/pl.rev*100):null],
+    ['＝ <b>Net profit</b>',pl.net,pl.npPct]
+  ];
+  $('anPlBody').innerHTML=plRows.map(r=>`<div style="display:flex;justify-content:space-between;padding:7px 2px;border-bottom:1px solid var(--border);font-size:.9rem"><span>${r[0]}</span><span style="font-weight:600">${kes(r[1])}${r[2]!=null?' <small style="color:var(--muted)">'+r[2].toFixed(0)+'%</small>':''}</span></div>`).join('')
+    +`<div style="font-size:.8rem;color:var(--muted);margin-top:8px">Waste valued at ${kes(pl.wasteKes)} (30d) · est. cost/kg for unpriced items: ${kes(estCostRate())} (70% of implied selling avg) — set real costs in Price Watch to firm up margins.</div>`;
+
+  $('anBleeds').innerHTML=bl.length?bl.map(b=>`<div style="display:flex;gap:12px;align-items:flex-start;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:10px">
+    <div style="font-size:1.4rem">${b.icon}</div>
+    <div style="flex:1">
+      <div style="font-weight:600">${b.title}</div>
+      <div style="font-size:.82rem;color:var(--muted);margin-top:3px;line-height:1.5">${b.detail}</div>
+      ${b.action?`<div style="font-size:.78rem;color:var(--blue);margin-top:6px">→ ${b.action}</div>`:''}
+    </div>
+    ${b.amount?`<div style="font-weight:700;color:var(--red)">${kes(b.amount)}</div>`:''}
+  </div>`).join(''):'<div style="color:var(--muted);font-size:.9rem">✅ No major bleeds detected with the current data.</div>';
+
+  const statusIcon=s=>s==='falling'?'📉':s==='belowCost'?'🚨':'🟢';
+  $('anPriceBody').innerHTML=pw.rows.length?pw.rows.map(r=>`<tr>
+    <td>${r.item}</td><td><b>${Math.round(r.last)}</b></td><td>${Math.round(r.avg7)}</td><td>${Math.round(r.min)}</td><td>${Math.round(r.max)}</td><td>${r.n}</td>
+    <td>${statusIcon(r.status)} ${r.deltaPct>0?'+':''}${r.deltaPct}%</td>
+    <td><input type="number" value="${r.cost||''}" placeholder="set cost" style="width:90px;padding:5px 8px;font-size:.8rem" onchange="saveItemCost('${String(r.item).replace(/'/g,"\\'")}', this.value)"></td>
+  </tr>`).join(''):'<tr><td colspan="8" style="color:var(--muted)">No daily ledger items yet — import a daily sheet to populate prices.</td></tr>';
+
+  $('anExpSummary').innerHTML=`<b>${kes(ex.total)}</b> in 30 days · <b>${kes(ex.total/30)}/day</b> burn${pl.rev?` · <b>${(ex.total/pl.rev*100).toFixed(1)}%</b> of revenue`:''}${ex.cats.length?` · Top: ${ex.cats.slice(0,3).map(c=>`${c[0]} ${kes(c[1])}`).join(', ')}`:''}`;
+  const expList=(DB.dailyExpenses||[]).map((e,i)=>({e,i})).sort((a,b)=>(b.e.date||'').localeCompare(a.e.date||'')).slice(0,14);
+  $('anExpTable').innerHTML=expList.length?expList.map(({e,i})=>`<tr><td>${e.date}</td><td>${e.category}</td><td style="font-weight:600">${kes(e.amount)}</td><td style="color:var(--muted)">${e.note||''}</td><td><button class="btn ghost sm" onclick="delDailyExpense(${i})">✕</button></td></tr>`).join(''):'<tr><td colspan="5" style="color:var(--muted)">No expenses recorded yet.</td></tr>';
+
+  $('anOvSummary').innerHTML=`<b>${kes(ovBurden)}</b> fixed-cost burden per 30 days${pl.rev?` · <b>${(ovBurden/pl.rev*100).toFixed(1)}%</b> of revenue`:''}`;
+  $('anOvTable').innerHTML=(DB.overheads||[]).map((o,i)=>`<tr><td>${o.name}</td><td>${kes(o.amount)}</td><td>${o.cadence}</td><td>${kes(Math.round(overheadBurdenOf(o)))}</td><td><button class="btn ghost sm" onclick="delOverhead(${i})">✕</button></td></tr>`).join('')||'<tr><td colspan="5" style="color:var(--muted)">No overheads yet — add rent, licences, salaries…</td></tr>';
+
+  if(typeof Chart!=='undefined'){
+    // Monthly forecast chart
+    const fcLabels=[...fc.labels,...fc.fcLabels];
+    const fcData=[...fc.actual,...Array(fc.fc.length).fill(null)];
+    const fcF=[...Array(fc.actual.length).fill(null),...fc.fc];
+    if(anFcChart)anFcChart.destroy();
+    anFcChart=new Chart($('anForecastChart'),{type:'bar',data:{labels:fcLabels,datasets:[
+      {label:'Actual',data:fcData,backgroundColor:'rgba(230,57,70,.65)',borderRadius:6},
+      {label:'Forecast',data:fcF,backgroundColor:'rgba(244,162,97,.5)',borderRadius:6}
+    ]},options:{maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>kes(c.raw||0)}}},scales:{y:{ticks:{callback:v=>(v/1000)+'K'}}}}});
+    // Daily revenue + 7-day projection
+    const dm=dailyRevenueMap();
+    const dLabels=[]; for(let k=27;k>=0;k--) dLabels.push(anAddDays(today,-k));
+    const actual=dLabels.map(d=>Math.round(dm[d]||0));
+    const dow={};
+    dLabels.forEach((d,i)=>{ const w=new Date(d+'T12:00:00').getDay(); (dow[w]=dow[w]||[]).push(actual[i]); });
+    const dowAvg={}; Object.keys(dow).forEach(w=>dowAvg[w]=dow[w].reduce((a,b)=>a+b,0)/dow[w].length);
+    const overall=actual.reduce((a,b)=>a+b,0)/28;
+    const last7=actual.slice(21).reduce((a,b)=>a+b,0)/7, prev7=actual.slice(14,21).reduce((a,b)=>a+b,0)/7;
+    const mm=prev7?Math.min(1.4,Math.max(0.7,last7/prev7)):1;
+    const fLabels=[]; for(let k=1;k<=7;k++) fLabels.push(anAddDays(today,k));
+    const f7=fLabels.map(d=>{ const w=new Date(d+'T12:00:00').getDay(); return Math.max(0,Math.round((dowAvg[w]||overall)*mm)); });
+    if(anDayChart)anDayChart.destroy();
+    anDayChart=new Chart($('anDailyChart'),{type:'line',data:{labels:[...dLabels,...fLabels],datasets:[
+      {label:'Revenue',data:[...actual,...Array(7).fill(null)],borderColor:'rgba(76,201,240,.9)',backgroundColor:'rgba(76,201,240,.12)',fill:true,tension:.35,pointRadius:0},
+      {label:'Projection',data:[...Array(27).fill(null),actual[27],...f7],borderColor:'rgba(244,162,97,.9)',borderDash:[6,4],fill:false,tension:.35,pointRadius:0}
+    ]},options:{maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:8}},y:{ticks:{callback:v=>(v/1000)+'K'}}}}});
+  }
+  $('anForecastText').innerHTML=fc.fc.length
+    ?`Next month <b>${fc.fcLabels[0]}</b>: ~<b>${kes(fc.fc[0])}</b> (band ${kes(Math.round(fc.fc[0]*0.8))} – ${kes(Math.round(fc.fc[0]*1.2))}) · trend ${fc.slope>=0?'+':''}${kes(Math.round(fc.slope))}/month`
+    :'Not enough monthly history yet (need 6+ months).';
+}
+
 /* ══════════ NAV ══════════ */
 function activateTab(id){
   const b=document.querySelector(`nav button[data-tab="${id}"]`);
@@ -3198,6 +3574,7 @@ function activateTab(id){
   document.querySelectorAll('nav button,.tab').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');$(id).classList.add('active');
   if(id==='outreach')renderSeg();
+  if(id==='analytics360')renderAnalytics();
 }
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   activateTab(b.dataset.tab);
@@ -3250,6 +3627,7 @@ $('kpiGrid').innerHTML=`
     datasets:[{data:[active,risk,lost],backgroundColor:['#2ec4b6','#f4a261','#e63946'],borderColor:'#1a2129',borderWidth:2}]},
     options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom'}}}});
   renderCustTable();renderMaskTable();renderSeg();renderTransactions();
+  if($('analytics360') && $('analytics360').classList.contains('active')) renderAnalytics();
 }
 
 /* ══════════ CUSTOMER TABLE ══════════ */
@@ -5112,6 +5490,12 @@ function dataSnapshot(){
   s+=`Segments (report-wide): Active≤30d:336, AtRisk 61-90d:147, Lost90+d:1186. Reachable contacts: ${(((REPORT.valid+DB.resolved)/REPORT.totalCustomers)*100).toFixed(0)}%.\n`;
   s+=`Tracked list: Active:${act} AtRisk:${rk} Lost:${lo}.\n`;
   s+=`Monthly revenue: `+DB.monthly.labels.map((l,i)=>`${l}:${DB.monthly.revenue[i]}`).join(', ')+'.\n';
+  try{
+    const pl360=pAndL30(), fc360=monthlyForecast(), bl360=bleedReport();
+    s+=`360° analytics (30d): revenue KES ${Math.round(pl360.rev)}, COGS KES ${Math.round(pl360.cogs)} (${pl360.cogsUnknown?`${Math.round(pl360.cogsUnknown)}kg at estimated cost`: 'actual costs'}), gross KES ${Math.round(pl360.gross)} (${pl360.gpPct.toFixed(0)}%), daily expenses KES ${Math.round(pl360.exp)}, overheads KES ${Math.round(pl360.ov)}, net KES ${Math.round(pl360.net)} (${pl360.npPct.toFixed(0)}%), waste KES ${Math.round(pl360.wasteKes)}, break-even ${pl360.beDays||'n/a'} days.\n`;
+    if(fc360.fc.length)s+=`Revenue forecast: `+fc360.fcLabels.map((l,i)=>`${l}:KES ${Math.round(fc360.fc[i])}`).join(', ')+'.\n';
+    if(bl360.length)s+=`Top profit bleeds: `+bl360.slice(0,3).map(b=>b.title).join('; ')+'.\n';
+  }catch(e){}
   s+=`Top 25 customers (name|KES spent|visits|days since visit):\n`;
   s+=cs.slice(0,25).map(c=>`${c.name}|${Math.round(c.spent)}|${c.visits}|${c.days}${c.masked?'|masked-contact':''}`).join('\n');
   return s;
@@ -5162,8 +5546,26 @@ function aiAnswer(q){
     if(r.length)return `🔍 Found ${r.length}:\n`+r.slice(0,6).map(c=>`<b>${c.name}</b> (${c.contact}) — ${kes(c.spent)}, ${c.visits} visits, ${c.days}d ago, ${statusOf(c.days)[0]}`).join('\n');
     return `😕 No match for "${t}".`;}
   const d=cs.filter(c=>c.name.toLowerCase().split(' ').some(w=>w.length>3&&q.includes(w)));
+  if(/profit|margin|p&l|net income|bottom line/.test(q)){
+    const pl=pAndL30();
+    return `🧾 <b>P&L — last 30 days</b>\n💰 Revenue: ${kes(pl.rev)}\n➖ COGS: ${kes(pl.cogs)}${pl.cogsUnknown?' (partly estimated)':''}\n＝ Gross: ${kes(pl.gross)} (${pl.gpPct.toFixed(0)}%)\n➖ Expenses: ${kes(pl.exp)} · Overheads: ${kes(pl.ov)}\n＝ <b>Net: ${kes(pl.net)} (${pl.npPct.toFixed(0)}%)</b>\n🗑️ Waste: ${kes(pl.wasteKes)} · Break-even: ${pl.beDays||'n/a'} days`;
+  }
+  if(/forecast|predict|project|next month/.test(q)){
+    const fc=monthlyForecast();
+    if(!fc.fc.length) return `🔮 Not enough monthly history yet for a reliable forecast (need 6+ months).`;
+    return `🔮 <b>Revenue forecast</b>\n`+fc.fcLabels.map((l,i)=>`${l}: ~${kes(fc.fc[i])} (±20%)`).join('\n')+`\nTrend: ${fc.slope>=0?'+':''}${kes(Math.round(fc.slope))}/month`;
+  }
+  if(/expense|overhead|cost burn|spending/.test(q)){
+    const ex=expenseTotal30(), ov=overheadBurden30();
+    return `💸 <b>Spending — 30 days</b>\nDaily expenses: ${kes(ex.total)} (${kes(ex.total/30)}/day)${ex.cats.length?`\n`+ex.cats.slice(0,4).map(c=>`• ${c[0]}: ${kes(c[1])}`).join('\n'):''}\nOverheads: ${kes(ov)}`;
+  }
+  if(/bleed|loss|leak|waste|theft/.test(q)){
+    const bl=bleedReport();
+    if(!bl.length) return `✅ No major profit bleeds detected with the current data.`;
+    return `🩸 <b>Top profit bleeds</b>\n`+bl.slice(0,4).map(b=>`${b.icon} ${b.title}${b.amount?' — '+kes(b.amount):''}`).join('\n')+`\n\n→ Full detail in the 🎯 Analytics 360 tab.`;
+  }
   if(d.length)return `🔍 Did you mean:\n`+d.slice(0,5).map(c=>`<b>${c.name}</b> — ${kes(c.spent)}, ${c.days}d away`).join('\n');
-  return `🤔 Try: "top 10 customers" · "who is at risk?" · "spent over 5000" · "hasn't visited in 120 days" · "find [name]" · "recommendations" — or use your own AI account above.`;
+  return `🤔 Try: "top 10 customers" · "who is at risk?" · "spent over 5000" · "hasn't visited in 120 days" · "find [name]" · "recommendations" · "profit" · "forecast" · "bleeds" — or use your own AI account above.`;
 }
 function ask(q){if(!q.trim())return;addMsg(q.replace(/</g,'&lt;'),'user');setTimeout(()=>addMsg(aiAnswer(q),'bot'),250);$('aiInput').value='';}
 $('aiSend').onclick=()=>ask($('aiInput').value);

@@ -463,15 +463,27 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     <div class="hint">Moonshot AI's Kimi reads handwriting far better than Tesseract — use it when sheet photos are hard to OCR</div>
     <div class="note">
       <b>How it works:</b><br>
-      <b>① Auto (API key configured):</b> The image is sent to Kimi's vision model via your Google Apps Script proxy. Extracted text is returned automatically — no manual steps.<br>
-      <b>② Manual (no API key):</b> The image is copied to your clipboard and Kimi.com opens in a new tab. Paste the image (Ctrl/Cmd+V), ask Kimi to read it, then paste the result back into the text box.<br><br>
-      <b>To enable Auto mode:</b> Add a <code>kimiVision</code> handler to your Google Apps Script that proxies to <code>https://api.moonshot.cn/v1/chat/completions</code> using your Moonshot API key. <a href="https://platform.moonshot.cn/" target="_blank" style="color:var(--blue)">Get a key →</a>
+      <b>① Auto — direct API key:</b> Paste your Moonshot API key below and sheet photos go straight to Kimi's vision model from your device.<br>
+      <b>② Auto — via your own proxy (optional):</b> If your browser blocks the direct call (CORS), add your own tiny Google Apps Script as a proxy — the app then routes through it.<br>
+      <b>③ Manual (no key):</b> The image is copied to your clipboard and Kimi.com opens in a new tab. Paste the image (Ctrl/Cmd+V), ask Kimi to read it, then paste the result back into the text box.<br><br>
+      <b>Model:</b> defaults to <code>kimi-k3</code> (the current Kimi model). Older keys can still use <code>moonshot-v1-128k-vision-preview</code> — the app auto-falls back through available models. <a href="https://platform.moonshot.cn/" target="_blank" style="color:var(--blue)">Get a key →</a>
     </div>
     <div style="display:grid;gap:10px;margin-top:10px;">
       <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:14px;">
         <div style="font-weight:600;margin-bottom:6px;">⚙️ Kimi Vision API Settings</div>
         <div style="font-size:.8rem;color:var(--muted);margin-bottom:10px;">
-          Leave blank to use Manual (clipboard) mode only. Enter your Moonshot API key in the Google Apps Script to enable Auto mode.
+          🔐 Your key is stored <b>only on this device</b> (never synced to the cloud). Leave everything blank for Manual (clipboard) mode only.
+        </div>
+        <div class="flex" style="gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+          <input type="password" id="kimiApiKey" placeholder="Moonshot API key (sk-…)" autocomplete="off" style="flex:1;min-width:220px">
+          <select id="kimiApiBase" style="width:auto">
+            <option value="https://api.moonshot.cn/v1">🇨🇳 api.moonshot.cn</option>
+            <option value="https://api.moonshot.ai/v1">🌍 api.moonshot.ai</option>
+          </select>
+          <input id="kimiModel" placeholder="Model: kimi-k3" style="width:200px">
+        </div>
+        <div style="margin-bottom:10px;">
+          <input id="kimiProxyUrl" placeholder="Optional proxy URL — your Google Apps Script (…/exec) or any relay" style="width:100%;box-sizing:border-box">
         </div>
         <div class="flex" style="gap:8px;flex-wrap:wrap;">
           <select id="kimiVisionMode" style="flex:1;min-width:200px;">
@@ -482,6 +494,40 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
           <button class="btn ghost sm" onclick="testKimiVision()">🧪 Test Connection</button>
         </div>
         <div id="kimiVisionStatus" style="margin-top:8px;font-size:.8rem;color:var(--muted);min-height:20px;"></div>
+        <details style="margin-top:10px;font-size:.78rem;color:var(--muted)">
+          <summary style="cursor:pointer;color:var(--blue)">🔄 Need a proxy? Copy-paste this Google Apps Script (2 minutes)</summary>
+          <ol style="margin:8px 0 8px 18px;line-height:1.6">
+            <li>Open <a href="https://script.google.com/" target="_blank" style="color:var(--blue)">script.google.com</a> → New project → paste the script below → replace <code>YOUR_API_KEY</code>.</li>
+            <li>Deploy → New deployment → type <b>Web app</b> → Execute as: <b>Me</b> · Who has access: <b>Anyone</b> → Deploy.</li>
+            <li>Copy the <code>…/exec</code> URL into the proxy field above.</li>
+          </ol>
+          <pre style="background:#0f1419;border:1px solid var(--border);border-radius:8px;padding:10px;overflow-x:auto;white-space:pre-wrap">function doPost(e) {
+  var body = JSON.parse(e.postData.contents);
+  if (body.action !== 'kimiVision') {
+    return ContentService.createTextOutput(JSON.stringify({success:false,error:'unknown action'})).setMimeType(ContentService.MimeType.JSON);
+  }
+  var payload = {
+    model: body.model || 'kimi-k3',
+    temperature: 0.1,
+    messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: body.image } },
+      { type: 'text', text: body.prompt }
+    ]}]
+  };
+  var res = UrlFetchApp.fetch('https://api.moonshot.cn/v1/chat/completions', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer YOUR_API_KEY' },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+  var data = JSON.parse(res.getContentText());
+  if (data.choices && data.choices[0]) {
+    return ContentService.createTextOutput(JSON.stringify({success:true,text:data.choices[0].message.content})).setMimeType(ContentService.MimeType.JSON);
+  }
+  return ContentService.createTextOutput(JSON.stringify({success:false,error:data.error||data})).setMimeType(ContentService.MimeType.JSON);
+}</pre>
+        </details>
       </div>
     </div>
   </div>
@@ -6630,38 +6676,145 @@ function dataUrlToBase64(dataUrl) {
   return dataUrl.slice(idx + 1);
 }
 
+// Settings accessors (localStorage — device only, never in DB/cloud sync)
+function getKimiApiKey(){ return (localStorage.getItem('kimiApiKey')||'').trim(); }
+function getKimiApiBase(){ return (localStorage.getItem('kimiApiBase')||'').trim() || 'https://api.moonshot.cn/v1'; }
+function getKimiModel(){ return (localStorage.getItem('kimiModel')||'').trim() || 'kimi-k3'; }
+function getKimiProxyUrl(){ return (localStorage.getItem('kimiProxyUrl')||'').trim(); }
+
+// Last error from kimiVisionAPI — shown by Test Connection & status messages.
+let _kimiLastError = '';
+
+// Downscale the photo before sending: phone photos are 3–6 MB; Moonshot reads
+// handwriting fine at ≤1568px, and smaller payloads fail less and cost less.
+function prepareKimiImage(dataUrl) {
+  return new Promise(resolve => {
+    let done = false;
+    const fallback = () => { if (!done) { done = true; resolve(dataUrl); } };
+    const t = setTimeout(fallback, 1500);
+    try {
+      const img = new Image();
+      img.onload = () => {
+        clearTimeout(t);
+        if (done) return;
+        try {
+          const MAX = 1568;
+          let w = img.naturalWidth || img.width || 1000;
+          let h = img.naturalHeight || img.height || 1000;
+          if (w > MAX || h > MAX) { const s = MAX / Math.max(w, h); w = Math.round(w * s); h = Math.round(h * s); }
+          const c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          const ctx = c.getContext('2d');
+          if (!ctx) { fallback(); return; }
+          ctx.drawImage(img, 0, 0, w, h);
+          done = true;
+          resolve(c.toDataURL('image/jpeg', 0.85));
+        } catch (e) { fallback(); }
+      };
+      img.onerror = fallback;
+      img.src = dataUrl;
+    } catch (e) { fallback(); }
+  });
+}
+
+async function _kimiDirectCall(base, key, model, imageDataUrl, prompt) {
+  const res = await fetch(base.replace(/\/+$/, '') + '/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+    body: JSON.stringify({
+      model: model,
+      temperature: 0.1,
+      messages: [{ role: 'user', content: [
+        { type: 'image_url', image_url: { url: imageDataUrl } },
+        { type: 'text', text: prompt || 'Extract all text from this image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.' }
+      ] }]
+    })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error((data.error && (data.error.message || data.error.msg)) || ('HTTP ' + res.status));
+    err.status = res.status;
+    throw err;
+  }
+  const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  if (!text) throw new Error('No text in API response');
+  return String(text).trim();
+}
+
 /**
- * Try to call Kimi Vision via the Google Apps Script proxy.
- * Returns the extracted text or null if not available.
+ * Kimi Vision OCR — direct Moonshot API (user key) or user's own proxy.
+ * Returns extracted text, or null on failure (see _kimiLastError).
  */
 async function kimiVisionAPI(imageDataUrl, prompt) {
-  if (!GAS_URL || GAS_URL.includes('YOUR_SCRIPT')) return null;
-  
-  try {
-    const response = await fetch(GAS_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: JSON.stringify({
-        action: 'kimiVision',
-        image: imageDataUrl,
-        prompt: prompt || 'Extract all text from this handwritten image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.',
-        model: 'moonshot-v1-128k-vision'
-      })
-    });
-    
-    const data = await response.json();
-    if (data.success && data.text) {
-      return data.text;
-    }
-    if (data.error) {
-      console.warn('Kimi Vision API error:', data.error);
+  _kimiLastError = '';
+  const proxy = getKimiProxyUrl();
+  const key = getKimiApiKey();
+  const base = getKimiApiBase();
+  const cfgModel = getKimiModel();
+
+  const prepared = await prepareKimiImage(imageDataUrl);
+  const fallbackPrompt = 'Extract all text from this handwritten image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.';
+
+  // 1) User's own proxy (Google Apps Script or any relay)
+  if (proxy) {
+    try {
+      const response = await fetch(proxy, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'kimiVision', image: prepared, prompt: prompt || fallbackPrompt, model: cfgModel })
+      });
+      const data = await response.json().catch(() => null);
+      if (data && data.success && data.text) return String(data.text).trim();
+      // Accept OpenAI-compatible relays too (choices[0].message.content)
+      const openAiText = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+      if (openAiText) return String(openAiText).trim();
+      let errInfo = data && (data.error || data.message);
+      if (errInfo && typeof errInfo !== 'string') errInfo = errInfo.message || JSON.stringify(errInfo);
+      _kimiLastError = 'Proxy: ' + (errInfo || ('HTTP ' + response.status));
+      console.warn('Kimi proxy error:', _kimiLastError);
+      return null;
+    } catch (err) {
+      _kimiLastError = 'Proxy unreachable: ' + (err && err.message || err);
+      console.warn('Kimi proxy call failed:', err);
       return null;
     }
-    return null;
-  } catch (err) {
-    console.warn('Kimi Vision API call failed:', err);
+  }
+
+  // 2) Direct Moonshot API with the user's key
+  if (!key) {
+    _kimiLastError = 'No API key or proxy configured — open Settings → Kimi Vision AI.';
     return null;
   }
+
+  // Try the configured model, then fall back through known-good vision models
+  // (the moonshot-v1 series is sunset for new accounts; kimi-k3 is current).
+  const models = [...new Set([cfgModel, 'kimi-k3', 'moonshot-v1-128k-vision-preview', 'moonshot-v1-32k-vision-preview'])];
+  for (const model of models) {
+    try {
+      return await _kimiDirectCall(base, key, model, prepared, prompt || fallbackPrompt);
+    } catch (err) {
+      const status = err && err.status;
+      const msg = (err && err.message) || String(err);
+      if (status === 401 || status === 403) {
+        _kimiLastError = '❌ API key rejected (HTTP ' + status + '). Check the key and that the platform matches it (api.moonshot.cn vs api.moonshot.ai).';
+        console.warn(_kimiLastError);
+        return null;
+      }
+      const modelIssue = status === 404 || /model|not found|invalid|does not exist|no such/i.test(msg);
+      if (!modelIssue) {
+        if (/fetch|network|failed to load|load failed/i.test(msg)) {
+          _kimiLastError = 'Browser could not reach the Moonshot API (CORS/network). Add a proxy URL in Settings → Kimi Vision AI, or use Manual mode. Detail: ' + msg;
+        } else {
+          _kimiLastError = 'Kimi API error: ' + msg;
+        }
+        console.warn(_kimiLastError);
+        return null;
+      }
+      console.warn('Kimi model "' + model + '" rejected (' + msg + ') — trying next fallback');
+      _kimiLastError = 'Model "' + model + '" unavailable: ' + msg;
+    }
+  }
+  return null;
 }
 
 /**
@@ -6827,7 +6980,7 @@ async function kimiVisionOCR(file, context, onResult, onProgress) {
     }
     
     if (mode === 'api') {
-      statusFn('❌ Kimi Vision API not available. Configure your Google Apps Script with a <code>kimiVision</code> handler.');
+      statusFn('❌ Kimi Vision API not available. ' + (_kimiLastError || 'Add your Moonshot API key or proxy URL in Settings → Kimi Vision AI, then test the connection.'));
       toast('❌ Kimi Vision API not configured');
       return;
     }
@@ -6888,8 +7041,11 @@ window.kimiLedgerVision = kimiLedgerVision;
  */
 async function testKimiVision() {
   setKimiVisionStatus('<span class="spinner"></span> Testing connection…');
-  
-  // Create a tiny test image (1x1 white pixel)
+  if (!getKimiApiKey() && !getKimiProxyUrl()) {
+    setKimiVisionStatus('⚠️ Nothing configured yet. Paste your Moonshot API key above (or set a proxy URL), then test again.', true);
+    return;
+  }
+  // Create a tiny test image (10x10 with "Hi")
   const testCanvas = document.createElement('canvas');
   testCanvas.width = 10; testCanvas.height = 10;
   const ctx = testCanvas.getContext('2d');
@@ -6904,13 +7060,14 @@ async function testKimiVision() {
   
   if (result) {
     setKimiVisionStatus(`✅ Kimi Vision API is working! Response: "${result.slice(0, 50)}${result.length > 50 ? '…' : ''}"`);
+    toast('✅ Kimi Vision API connected');
   } else {
-    setKimiVisionStatus('⚠️ API not reachable. Manual (clipboard) mode will be used. Add a <code>kimiVision</code> action to your Google Apps Script to enable Auto mode.', true);
+    setKimiVisionStatus('❌ ' + (_kimiLastError || 'API call failed — check the browser console (F12) for details.'), true);
   }
 }
 window.testKimiVision = testKimiVision;
 
-// Persist Kimi Vision mode setting
+// Persist Kimi Vision settings
 document.addEventListener('DOMContentLoaded', () => {
   const modeEl = $('kimiVisionMode');
   if (modeEl) {
@@ -6918,6 +7075,25 @@ document.addEventListener('DOMContentLoaded', () => {
     modeEl.onchange = () => {
       localStorage.setItem('kimiVisionMode', modeEl.value);
     };
+  }
+  const kvBind = (id, storeKey, trim) => {
+    const el = $(id);
+    if (!el) return;
+    el.value = localStorage.getItem(storeKey) || '';
+    el.onchange = () => localStorage.setItem(storeKey, trim ? (el.value || '').trim() : el.value);
+  };
+  kvBind('kimiApiKey', 'kimiApiKey', true);
+  kvBind('kimiApiBase', 'kimiApiBase', true);
+  kvBind('kimiModel', 'kimiModel', true);
+  kvBind('kimiProxyUrl', 'kimiProxyUrl', true);
+
+  // Show the current Kimi config in the status line
+  const st = $('kimiVisionStatus');
+  if (st) {
+    const key = getKimiApiKey(), proxy = getKimiProxyUrl();
+    if (proxy) st.innerHTML = '🔄 Using your proxy. Direct key: ' + (key ? 'set ✓' : 'not set');
+    else if (key) st.innerHTML = '🔑 Key set (…' + key.slice(-4) + ') → ' + getKimiApiBase().replace('https://', '') + ' · model <code>' + getKimiModel() + '</code>';
+    else st.innerHTML = '📋 Manual (clipboard) mode — paste a key above to enable Auto.';
   }
 });
 

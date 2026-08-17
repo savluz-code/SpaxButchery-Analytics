@@ -610,6 +610,21 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
   </div>
 </div>
 
+<!-- Encrypted PDF Password Modal -->
+<div id="pdfPasswordModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:300;align-items:center;justify-content:center;padding:16px;">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:420px;width:100%;padding:24px;text-align:center;">
+    <div style="font-size:3rem;margin-bottom:8px">🔒</div>
+    <h3 style="margin-bottom:6px">Encrypted PDF</h3>
+    <div id="pdfPasswordName" style="color:var(--muted);font-size:.9rem;margin-bottom:6px;word-break:break-word"></div>
+    <div id="pdfPasswordError" style="display:none;color:var(--red);font-size:.85rem;margin-bottom:10px"></div>
+    <input type="password" id="pdfPasswordInput" placeholder="Enter PDF password" autocomplete="off" style="width:100%;box-sizing:border-box;text-align:center;margin-bottom:16px">
+    <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+      <button class="btn ghost" id="pdfPasswordCancel">Cancel</button>
+      <button class="btn blue" id="pdfPasswordOk">🔓 Unlock</button>
+    </div>
+  </div>
+</div>
+
 </main>
 <div class="toast" id="toast"></div>
 <footer>SpaxButchery Analytics v2.5 · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
@@ -3571,16 +3586,99 @@ function mergeBaselineCustomer(c) {
 }
 
 /* ══════════ M-PESA PDF / OCR (from Spax2db) ══════════ */
+/* ── Password-protected (encrypted) PDF support ──
+   Passwords are kept in memory for the session only (never persisted),
+   so repeating an import of the same file won't re-prompt, and the last
+   successful password is auto-tried on other files in the batch. */
+const pdfPasswordMemo = new Map();  // file key → working password
+let lastPdfPassword = null;         // last successful password (auto-tried first)
+
+function pdfFileKey(file) {
+  return (file.name || 'pdf') + ':' + (file.size || 0) + ':' + (file.lastModified || 0);
+}
+
+function pdfPasswordCancelledError(file) {
+  const err = new Error('Password entry cancelled for ' + ((file && file.name) || 'PDF'));
+  err.name = 'PDFPasswordCancelled';
+  return err;
+}
+
+// Show the 🔒 modal and resolve with the entered password, or null on cancel.
+function askPdfPassword(file, errorMsg) {
+  return new Promise(resolve => {
+    const modal = $('pdfPasswordModal');
+    const input = $('pdfPasswordInput');
+    const okBtn = $('pdfPasswordOk');
+    const cancelBtn = $('pdfPasswordCancel');
+    $('pdfPasswordName').textContent = file.name;
+    $('pdfPasswordError').textContent = errorMsg || '';
+    $('pdfPasswordError').style.display = errorMsg ? 'block' : 'none';
+    input.value = '';
+    modal.style.display = 'flex';
+    setTimeout(() => input.focus(), 60);
+
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      modal.style.display = 'none';
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      input.removeEventListener('keydown', onKey);
+      modal.removeEventListener('click', onBackdrop);
+      resolve(value);
+    };
+    const onOk = () => finish(input.value);
+    const onCancel = () => finish(null);
+    const onKey = e => {
+      if (e.key === 'Enter') { e.preventDefault(); onOk(); }
+      else if (e.key === 'Escape') onCancel();
+    };
+    const onBackdrop = e => { if (e.target === modal) onCancel(); };
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    input.addEventListener('keydown', onKey);
+    modal.addEventListener('click', onBackdrop);
+  });
+}
+
 async function loadPdfDocument(file) {
   const buffer = await file.arrayBuffer();
-  try {
-    return await pdfjsLib.getDocument({ data: buffer }).promise;
-  } catch (err) {
-    if (err.name === "PasswordException") {
-      const password = prompt("PDF password:");
+  const key = pdfFileKey(file);
+
+  // 1) Try remembered passwords first (no prompt needed).
+  const remembered = [];
+  if (pdfPasswordMemo.has(key)) remembered.push(pdfPasswordMemo.get(key));
+  if (lastPdfPassword != null && !remembered.includes(lastPdfPassword)) remembered.push(lastPdfPassword);
+  for (const password of remembered) {
+    try {
       return await pdfjsLib.getDocument({ data: buffer, password }).promise;
+    } catch (err) {
+      if (err.name !== 'PasswordException') throw err; // real failure, not a password issue
+      // Password no longer works — fall through to interactive entry.
     }
-    throw err;
+  }
+
+  // 2) Interactive entry with retry until the password works or the user cancels.
+  let lastError = '';
+  for (;;) {
+    const password = await askPdfPassword(file, lastError);
+    if (password === null) throw pdfPasswordCancelledError(file);
+    try {
+      const doc = await pdfjsLib.getDocument({ data: buffer, password }).promise;
+      pdfPasswordMemo.set(key, password);
+      lastPdfPassword = password;
+      if (pdfPasswordMemo.size > 50) pdfPasswordMemo.clear(); // keep session memory bounded
+      return doc;
+    } catch (err) {
+      if (err.name === 'PasswordException') {
+        lastError = err.code === 2
+          ? 'Incorrect password — please try again.'
+          : 'This PDF is encrypted and needs a password to open.';
+        continue; // retry loop
+      }
+      throw err;
+    }
   }
 }
 
@@ -4613,6 +4711,10 @@ async function handleFiles(fileList) {
       possibleMissed += Number(parsed && parsed.possibleMissed || 0);
     } catch (err) {
       console.error(err);
+      if (err && err.name === 'PDFPasswordCancelled') {
+        toast(`🔒 ${file.name}: password not provided — file skipped`);
+        continue;
+      }
       errors.push(`${file.name}: ${err.message || 'unknown error'}`);
     }
   }
@@ -4640,7 +4742,9 @@ async function parseAnyFile(file){
   // ── PDF: embedded text → OCR fallback ──
   if(ext==='pdf'){
     let text='';
-    try{text=await extractPdfText(file);}catch(e){}
+    try{text=await extractPdfText(file);}catch(e){
+      if(e && e.name==='PDFPasswordCancelled') throw e;
+    }
     if(!text.trim()){text=await ocrPdf(file);}
     return parseMpesaText(text);
   }
@@ -4778,7 +4882,9 @@ async function handlePdf(file) {
       $('pdfProgress').innerHTML = '<span class="spinner"></span> Trying embedded text…';
       text = await extractPdfText(file);
       txs = parseMpesaText(text);
-    } catch (e) { }
+    } catch (e) {
+      if (e && e.name === 'PDFPasswordCancelled') throw e;
+    }
     if (!txs.length) {
       $('pdfProgress').innerHTML = '<span class="spinner"></span> No text found. Starting OCR…';
       text = await ocrPdf(file);
@@ -4793,6 +4899,10 @@ async function handlePdf(file) {
   } catch (err) {
     console.error(err);
     $('pdfProgress').textContent = '';
+    if (err && err.name === 'PDFPasswordCancelled') {
+      toast('🔒 Password entry cancelled — PDF not imported');
+      return;
+    }
     toast('❌ PDF read failed: ' + (err.message || 'unknown error'));
   }
 }
@@ -5344,7 +5454,9 @@ async function handleResolverFile(file) {
       let text = '';
       try {
         text = await extractPdfText(file);
-      } catch (e) {}
+      } catch (e) {
+        if (e && e.name === 'PDFPasswordCancelled') throw e;
+      }
       if (!text.trim()) {
         $('resolverProgress').innerHTML = '<span class="spinner"></span> No embedded text. Running OCR…';
         text = await ocrPdf(file);
@@ -5453,6 +5565,10 @@ async function handleResolverFile(file) {
     }
   } catch (err) {
     console.error(err);
+    if (err && err.name === 'PDFPasswordCancelled') {
+      $('resolverProgress').textContent = '🔒 Password entry cancelled — file skipped';
+      return;
+    }
     $('resolverProgress').textContent = '❌ Error: ' + (err.message || 'unknown');
   }
 }
@@ -5472,6 +5588,10 @@ async function handleResolverFiles(fileList) {
       completed++;
     } catch (err) {
       console.error(err);
+      if (err && err.name === 'PDFPasswordCancelled') {
+        toast(`🔒 ${file.name}: password not provided — file skipped`);
+        continue;
+      }
       errors.push(`${file.name}: ${err.message || 'unknown error'}`);
     }
   }
@@ -5893,7 +6013,16 @@ async function handleBackfill(input){
   try{
     let totalImported = 0, totalDupes = 0;
     for(const file of files){
-      const rows = await parseAnyFile(file);
+      let rows;
+      try{
+        rows = await parseAnyFile(file);
+      }catch(err){
+        if(err && err.name === 'PDFPasswordCancelled'){
+          toast('🔒 Skipped ' + file.name + ' (password not provided)');
+          continue;
+        }
+        throw err;
+      }
       if(!rows.length) continue;
       const result = backfillTransactions(rows);
       totalImported += result.imported;
@@ -5940,7 +6069,16 @@ async function handleRebuild(input){
       const file = files[fi];
       const pct = Math.round((fi/files.length)*80);
       updateImportModal('Parsing <b>' + file.name + '</b>…<br><small>File ' + (fi+1) + ' of ' + files.length + '</small>', pct);
-      const rows = await parseAnyFile(file);
+      let rows;
+      try{
+        rows = await parseAnyFile(file);
+      }catch(err){
+        if(err && err.name === 'PDFPasswordCancelled'){
+          updateImportModal('🔒 Skipped <b>' + file.name + '</b> — password not provided', pct);
+          continue;
+        }
+        throw err;
+      }
       if(!rows.length){ updateImportModal('No transactions found in <b>' + file.name + '</b>', pct); continue; }
       updateImportModal('Importing <b>' + rows.length + '</b> rows from <b>' + file.name + '</b>…', pct+10);
       const result = importTransactions(rows);

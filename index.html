@@ -408,6 +408,33 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
 
 
 <section id="sync" class="tab">
+  <div class="card" style="border-left:4px solid var(--amber)">
+    <h3>📋 Code.gs — Mobile Replacement</h3>
+    <div class="hint">script.google.com is not editable on mobile. Use this one-tap page instead.</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+      <a href="code.html" class="btn" style="background:var(--green);color:#04292a;text-decoration:none">📋 Open Code.gs Copy Page</a>
+      <button class="btn ghost" onclick="copyGasScript()">📋 Copy Code.gs Now</button>
+      <a href="google-apps-script.gs" target="_blank" class="btn ghost" style="text-decoration:none">⬇️ Raw google-apps-script.gs</a>
+    </div>
+    <div id="gasCopyStatus" style="font-size:.8rem;color:var(--muted);margin-top:8px"></div>
+    <div style="font-size:.78rem;color:var(--muted);margin-top:8px;line-height:1.5">On phone: tap <b>Copy Code.gs Now</b> (or open the page) → open <b>script.google.com</b> in Chrome → <b>⋮ → Desktop site</b> → open your project → paste over <code>Code.gs</code> → Save.</div>
+  </div>
+  <script>
+  async function copyGasScript(){
+    const s=document.getElementById('gasCopyStatus');
+    if(s) s.textContent='⏳ Loading script…';
+    try{
+      const r=await fetch('google-apps-script.gs?_='+Date.now());
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const t=await r.text();
+      await navigator.clipboard.writeText(t);
+      if(s) s.innerHTML='✅ <b>Copied!</b> Now paste into script.google.com → Code.gs → Save & re-deploy if needed.';
+      if(typeof toast==='function') toast('✅ Code.gs copied — paste into script.google.com');
+    }catch(e){
+      if(s) s.innerHTML='⚠️ Copy failed: '+e.message+'. <a href="code.html" style="color:var(--blue)">Open code.html</a> and use the big button there.';
+    }
+  }
+  </script>
   <div class="card">
     <h3>☁️ Cloud Sync Control</h3>
     <div class="hint">Force push or pull when local and cloud are out of sync</div>

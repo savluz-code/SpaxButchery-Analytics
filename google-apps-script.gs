@@ -1,5 +1,11 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend
+ * SpaxButchery Analytics — Google Apps Script backend  v2.5  (2026-08-18)
+ * ─────────────────────────────────────────────────────────────────
+ * MOBILE: can't edit script.google.com on your phone? Open
+ *   https://savluz-code.github.io/SpaxButchery-Analytics/code.html
+ * on your phone → tap "Copy Entire Code.gs" → paste over Code.gs
+ * in script.google.com (open Chrome → ⋮ → Desktop site). That's it.
+ *
  * Copy everything below into script.google.com → New project → paste → Save.
  *
  * Sheets used (created automatically):

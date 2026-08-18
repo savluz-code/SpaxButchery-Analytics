@@ -462,44 +462,44 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     <h3>🌙 Kimi Vision AI — Handwritten OCR</h3>
     <div class="hint">Moonshot AI's Kimi reads handwriting far better than Tesseract — use it when sheet photos are hard to OCR</div>
     <div class="note">
-      <b>How it works:</b><br>
-      <b>① Auto — direct API key:</b> Paste your Moonshot API key below and sheet photos go straight to Kimi's vision model from your device.<br>
-      <b>② Auto — via your own proxy (optional):</b> If your browser blocks the direct call (CORS), add your own tiny Google Apps Script as a proxy — the app then routes through it.<br>
-      <b>③ Manual (no key):</b> The image is copied to your clipboard and Kimi.com opens in a new tab. Paste the image (Ctrl/Cmd+V), ask Kimi to read it, then paste the result back into the text box.<br><br>
-      <b>Model:</b> defaults to <code>kimi-k3</code> (the current Kimi model). Older keys can still use <code>moonshot-v1-128k-vision-preview</code> — the app auto-falls back through available models. <a href="https://platform.moonshot.cn/" target="_blank" style="color:var(--blue)">Get a key →</a>
+      <b>Why the script is back:</b> Moonshot blocks browser CORS. A Google Apps Script web app calls Moonshot <i>from Google’s servers</i>, so the photo still works from this page.<br>
+      <b>① Recommended — Apps Script proxy:</b> paste the <code>…/exec</code> URL (same deployment as cloud sync is fine). The Moonshot key lives in the script, not in the browser.<br>
+      <b>② Optional — browser key:</b> paste a Moonshot key for a direct try first; if CORS blocks it, the proxy is used automatically.<br>
+      <b>③ No key / no script?</b> Manual mode copies the photo and opens Kimi.com.<br>
+      Full script: <code>google-apps-script.gs</code> in this repo. Model default: <code>kimi-k3</code>.
     </div>
     <div style="display:grid;gap:10px;margin-top:10px;">
       <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:14px;">
-        <div style="font-weight:600;margin-bottom:6px;">⚙️ Kimi Vision API Settings</div>
+        <div style="font-weight:600;margin-bottom:6px;">⚙️ Kimi Vision settings</div>
         <div style="font-size:.8rem;color:var(--muted);margin-bottom:10px;">
-          🔐 Your key is stored <b>only on this device</b> (never synced to the cloud). Leave everything blank for Manual (clipboard) mode only.
+          🔐 Browser key stays on this device. Proxy key stays in Apps Script. Neither is written to the customer database.
         </div>
         <div class="flex" style="gap:8px;flex-wrap:wrap;margin-bottom:8px;">
-          <input type="password" id="kimiApiKey" placeholder="Moonshot API key (sk-…)" autocomplete="off" style="flex:1;min-width:220px">
+          <input type="password" id="kimiApiKey" placeholder="Optional Moonshot key (sk-…) for a direct try" autocomplete="off" style="flex:1;min-width:220px">
           <select id="kimiApiBase" style="width:auto">
-            <option value="https://api.moonshot.cn/v1">🇨🇳 api.moonshot.cn</option>
             <option value="https://api.moonshot.ai/v1">🌍 api.moonshot.ai</option>
+            <option value="https://api.moonshot.cn/v1">🇨🇳 api.moonshot.cn</option>
           </select>
           <input id="kimiModel" placeholder="Model: kimi-k3" style="width:200px">
         </div>
         <div style="margin-bottom:10px;">
-          <input id="kimiProxyUrl" placeholder="Optional proxy URL — your Google Apps Script (…/exec) or any relay" style="width:100%;box-sizing:border-box">
+          <input id="kimiProxyUrl" placeholder="Apps Script proxy URL (…/exec) — CORS bypass" style="width:100%;box-sizing:border-box">
         </div>
         <div class="flex" style="gap:8px;flex-wrap:wrap;">
           <select id="kimiVisionMode" style="flex:1;min-width:200px;">
-            <option value="auto">⚡ Auto — Use API if available, else clipboard</option>
-            <option value="manual">📋 Manual — Always use clipboard + open Kimi</option>
-            <option value="api">🔑 API only — Skip if not configured</option>
+            <option value="auto">⚡ Auto — proxy / direct API, then clipboard</option>
+            <option value="manual">📋 Manual — clipboard + open Kimi.com</option>
+            <option value="api">🔑 API / proxy only</option>
           </select>
           <button class="btn ghost sm" onclick="testKimiVision()">🧪 Test Connection</button>
         </div>
         <div id="kimiVisionStatus" style="margin-top:8px;font-size:.8rem;color:var(--muted);min-height:20px;"></div>
         <details style="margin-top:10px;font-size:.78rem;color:var(--muted)">
-          <summary style="cursor:pointer;color:var(--blue)">🔄 Need a proxy? Copy-paste this Google Apps Script (2 minutes)</summary>
+          <summary style="cursor:pointer;color:var(--blue)">📋 Kimi-only Apps Script (or use the full google-apps-script.gs)</summary>
           <ol style="margin:8px 0 8px 18px;line-height:1.6">
-            <li>Open <a href="https://script.google.com/" target="_blank" style="color:var(--blue)">script.google.com</a> → New project → paste the script below → replace <code>YOUR_API_KEY</code>.</li>
-            <li>Deploy → New deployment → type <b>Web app</b> → Execute as: <b>Me</b> · Who has access: <b>Anyone</b> → Deploy.</li>
-            <li>Copy the <code>…/exec</code> URL into the proxy field above.</li>
+            <li>Open <a href="https://script.google.com/" target="_blank" style="color:var(--blue)">script.google.com</a> → New project → paste below → set <code>YOUR_API_KEY</code>.</li>
+            <li>Deploy → New deployment → <b>Web app</b> → Execute as: <b>Me</b> · Who has access: <b>Anyone</b>.</li>
+            <li>Paste the <code>…/exec</code> URL into the proxy field (or reuse the same URL as cloud sync).</li>
           </ol>
           <pre style="background:#0f1419;border:1px solid var(--border);border-radius:8px;padding:10px;overflow-x:auto;white-space:pre-wrap">function doPost(e) {
   var body = JSON.parse(e.postData.contents);
@@ -2659,7 +2659,25 @@ const REPORT={totalCustomers:1669,totalRevenue:1250341,totalTxns:5519,masked:623
 
 /* ══════════ STATE ══════════ */
 let DB;
+function seedFromSavedBaseline(){
+  try {
+    const raw = localStorage.getItem(BASELINE_KEY);
+    if (!raw) return null;
+    const saved = JSON.parse(raw);
+    if (!saved || !saved.customers || !saved.customers.length) return null;
+    if (!saved.seen) saved.seen = {};
+    if (!saved.transactions) saved.transactions = [];
+    if (!saved.customerTx) saved.customerTx = {};
+    if (!saved.dailyLedgers) saved.dailyLedgers = [];
+    if (!saved.dailyExpenses) saved.dailyExpenses = [];
+    if (!saved.overheads) saved.overheads = [];
+    if (!saved.itemCosts) saved.itemCosts = {};
+    return saved;
+  } catch (e) { return null; }
+}
 function seedDB(){
+  const fromBaseline = seedFromSavedBaseline();
+  if (fromBaseline) return JSON.parse(JSON.stringify(fromBaseline));
   const today = new Date(getTodayEAT());
   return{
     customers:SEED_CUSTOMERS.map(c=>{
@@ -5439,7 +5457,13 @@ $('exportBtn').onclick = () => {
   a.download = 'spax_customers.csv'; a.click();
 };
 
-$('resetBtn').onclick = () => { if (confirm('Reset ALL data (imports, dedup history, resolved contacts)?')) { DB = seedDB(); save(); toast('↺ Reset complete'); } };
+$('resetBtn').onclick = () => {
+  const hasCustom = !!(localStorage.getItem(BASELINE_KEY));
+  const msg = hasCustom
+    ? 'Reset to your saved baseline (the last “Save Current as Local Baseline”)? Imports after that save will be dropped.'
+    : 'Reset ALL data to the original report seed (imports, dedup history, resolved contacts)?';
+  if (confirm(msg)) { DB = seedDB(); save(); toast(hasCustom ? '↺ Restored your saved baseline' : '↺ Reset complete'); }
+};
 
 /* ══════════ SAVE CURRENT AS LOCAL BASELINE / EXPORT JS SEED CODE ══════════ */
 const BASELINE_KEY = 'spaxBaseline_v23';
@@ -6623,13 +6647,8 @@ function closeImportModal(){
 }
 
 /* ══════════ KIMI VISION AI — HANDWRITTEN OCR ══════════ */
-// Kimi (Moonshot AI) has superior vision capabilities for reading handwriting.
-// Two modes:
-// 1. AUTO (API key in Google Apps Script): Sends image to Moonshot API via proxy,
-//    gets structured text back automatically.
-// 2. MANUAL (no API key): Copies image to clipboard, opens Kimi.com with a
-//    context-aware prompt. User pastes the image, gets Kimi's response, then
-//    pastes it back into the app.
+// Preferred path: Google Apps Script proxy (UrlFetchApp) — no browser CORS.
+// Fallback: direct Moonshot from this device, then clipboard / Kimi.com.
 
 // Persistent last-uploaded image (so Kimi button can use it after Tesseract finishes)
 let _kimiLastImage = null; // { file, dataUrl, context }
@@ -6678,9 +6697,25 @@ function dataUrlToBase64(dataUrl) {
 
 // Settings accessors (localStorage — device only, never in DB/cloud sync)
 function getKimiApiKey(){ return (localStorage.getItem('kimiApiKey')||'').trim(); }
-function getKimiApiBase(){ return (localStorage.getItem('kimiApiBase')||'').trim() || 'https://api.moonshot.cn/v1'; }
+function getKimiApiBase(){ return (localStorage.getItem('kimiApiBase')||'').trim() || 'https://api.moonshot.ai/v1'; }
 function getKimiModel(){ return (localStorage.getItem('kimiModel')||'').trim() || 'kimi-k3'; }
-function getKimiProxyUrl(){ return (localStorage.getItem('kimiProxyUrl')||'').trim(); }
+function getKimiProxyUrl(){
+  const explicit = (localStorage.getItem('kimiProxyUrl')||'').trim();
+  if (explicit) return explicit;
+  if (typeof GAS_URL === 'string' && GAS_URL && !GAS_URL.includes('YOUR_SCRIPT')) return GAS_URL;
+  return '';
+}
+function getKimiBases(){
+  const preferred = getKimiApiBase().replace(/\/+$/, '');
+  const remembered = (localStorage.getItem('kimiWorkingBase')||'').trim();
+  const all = ['https://api.moonshot.ai/v1', 'https://api.moonshot.cn/v1'];
+  const ordered = [];
+  [remembered, preferred].concat(all).forEach(b => {
+    const n = (b||'').replace(/\/+$/, '');
+    if (n && ordered.indexOf(n) < 0) ordered.push(n);
+  });
+  return ordered;
+}
 
 // Last error from kimiVisionAPI — shown by Test Connection & status messages.
 let _kimiLastError = '';
@@ -6718,44 +6753,46 @@ function prepareKimiImage(dataUrl) {
 }
 
 async function _kimiDirectCall(base, key, model, imageDataUrl, prompt) {
-  const res = await fetch(base.replace(/\/+$/, '') + '/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
-    body: JSON.stringify({
-      model: model,
-      temperature: 0.1,
-      messages: [{ role: 'user', content: [
-        { type: 'image_url', image_url: { url: imageDataUrl } },
-        { type: 'text', text: prompt || 'Extract all text from this image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.' }
-      ] }]
-    })
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error((data.error && (data.error.message || data.error.msg)) || ('HTTP ' + res.status));
-    err.status = res.status;
-    throw err;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 90000);
+  try {
+    const res = await fetch(base.replace(/\/+$/, '') + '/chat/completions', {
+      method: 'POST',
+      mode: 'cors',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({
+        model: model,
+        temperature: 0.1,
+        messages: [{ role: 'user', content: [
+          { type: 'image_url', image_url: { url: imageDataUrl } },
+          { type: 'text', text: prompt || 'Extract all text from this image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.' }
+        ] }]
+      }),
+      signal: controller.signal
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error((data.error && (data.error.message || data.error.msg)) || ('HTTP ' + res.status));
+      err.status = res.status;
+      throw err;
+    }
+    const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    if (!text) throw new Error('No text in API response');
+    return String(text).trim();
+  } finally {
+    clearTimeout(timer);
   }
-  const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-  if (!text) throw new Error('No text in API response');
-  return String(text).trim();
 }
 
-/**
- * Kimi Vision OCR — direct Moonshot API (user key) or user's own proxy.
- * Returns extracted text, or null on failure (see _kimiLastError).
- */
+/** Kimi Vision: Apps Script proxy first (CORS-safe), then direct Moonshot. */
 async function kimiVisionAPI(imageDataUrl, prompt) {
   _kimiLastError = '';
   const proxy = getKimiProxyUrl();
   const key = getKimiApiKey();
-  const base = getKimiApiBase();
   const cfgModel = getKimiModel();
-
   const prepared = await prepareKimiImage(imageDataUrl);
   const fallbackPrompt = 'Extract all text from this handwritten image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.';
 
-  // 1) User's own proxy (Google Apps Script or any relay)
   if (proxy) {
     try {
       const response = await fetch(proxy, {
@@ -6765,62 +6802,59 @@ async function kimiVisionAPI(imageDataUrl, prompt) {
       });
       const data = await response.json().catch(() => null);
       if (data && data.success && data.text) return String(data.text).trim();
-      // Accept OpenAI-compatible relays too (choices[0].message.content)
       const openAiText = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
       if (openAiText) return String(openAiText).trim();
       let errInfo = data && (data.error || data.message);
       if (errInfo && typeof errInfo !== 'string') errInfo = errInfo.message || JSON.stringify(errInfo);
       _kimiLastError = 'Proxy: ' + (errInfo || ('HTTP ' + response.status));
       console.warn('Kimi proxy error:', _kimiLastError);
-      return null;
     } catch (err) {
       _kimiLastError = 'Proxy unreachable: ' + (err && err.message || err);
       console.warn('Kimi proxy call failed:', err);
-      return null;
     }
   }
 
-  // 2) Direct Moonshot API with the user's key
   if (!key) {
-    _kimiLastError = 'No API key or proxy configured — open Settings → Kimi Vision AI.';
+    if (!_kimiLastError) _kimiLastError = 'No Moonshot key and no working Apps Script proxy.';
     return null;
   }
 
-  // Try the configured model, then fall back through known-good vision models
-  // (the moonshot-v1 series is sunset for new accounts; kimi-k3 is current).
-  const models = [...new Set([cfgModel, 'kimi-k3', 'moonshot-v1-128k-vision-preview', 'moonshot-v1-32k-vision-preview'])];
-  for (const model of models) {
-    try {
-      return await _kimiDirectCall(base, key, model, prepared, prompt || fallbackPrompt);
-    } catch (err) {
-      const status = err && err.status;
-      const msg = (err && err.message) || String(err);
-      if (status === 401 || status === 403) {
-        _kimiLastError = '❌ API key rejected (HTTP ' + status + '). Check the key and that the platform matches it (api.moonshot.cn vs api.moonshot.ai).';
-        console.warn(_kimiLastError);
-        return null;
-      }
-      const modelIssue = status === 404 || /model|not found|invalid|does not exist|no such/i.test(msg);
-      if (!modelIssue) {
-        if (/fetch|network|failed to load|load failed/i.test(msg)) {
-          _kimiLastError = 'Browser could not reach the Moonshot API (CORS/network). Add a proxy URL in Settings → Kimi Vision AI, or use Manual mode. Detail: ' + msg;
+  const models = [...new Set([cfgModel, 'kimi-k3', 'kimi-k2.5', 'moonshot-v1-128k-vision-preview', 'moonshot-v1-32k-vision-preview'])];
+  const bases = getKimiBases();
+  for (const base of bases) {
+    for (const model of models) {
+      try {
+        const text = await _kimiDirectCall(base, key, model, prepared, prompt || fallbackPrompt);
+        try { localStorage.setItem('kimiWorkingBase', base); localStorage.setItem('kimiApiBase', base); } catch(e){}
+        return text;
+      } catch (err) {
+        const status = err && err.status;
+        const msg = (err && err.message) || String(err);
+        if (status === 401 || status === 403) {
+          _kimiLastError = 'HTTP ' + status + ' on ' + base.replace('https://','') + ' — trying the other Moonshot region (a .cn key will not work on .ai and vice versa).';
+          break;
+        }
+        const modelIssue = status === 404 || /model|not found|invalid|does not exist|no such/i.test(msg);
+        if (modelIssue) {
+          _kimiLastError = 'Model "' + model + '" unavailable on ' + base + ': ' + msg;
+          continue;
+        }
+        if (err && err.name === 'AbortError') {
+          _kimiLastError = 'Request timed out talking to ' + base;
+        } else if (/fetch|network|failed to load|load failed|Failed to fetch|CORS|abort/i.test(msg)) {
+          _kimiLastError = 'Browser blocked ' + base + ' (CORS/network). Use the Apps Script proxy. ' + msg;
         } else {
           _kimiLastError = 'Kimi API error: ' + msg;
+          return null;
         }
-        console.warn(_kimiLastError);
-        return null;
+        break;
       }
-      console.warn('Kimi model "' + model + '" rejected (' + msg + ') — trying next fallback');
-      _kimiLastError = 'Model "' + model + '" unavailable: ' + msg;
     }
   }
+  if (!_kimiLastError) _kimiLastError = 'Kimi Vision failed. Set the Apps Script proxy URL.';
   return null;
 }
 
-/**
- * Clipboard fallback: copies the image and opens Kimi with instructions.
- * Shows a dialog where the user can paste Kimi's response.
- */
 function kimiVisionClipboard(file, context, onResult) {
   const prompt = buildKimiPrompt(context);
   
@@ -6980,7 +7014,7 @@ async function kimiVisionOCR(file, context, onResult, onProgress) {
     }
     
     if (mode === 'api') {
-      statusFn('❌ Kimi Vision API not available. ' + (_kimiLastError || 'Add your Moonshot API key or proxy URL in Settings → Kimi Vision AI, then test the connection.'));
+      statusFn('❌ Kimi Vision API not available. ' + (_kimiLastError || 'Add the Apps Script proxy URL or a Moonshot key in Settings → Kimi Vision AI.'));
       toast('❌ Kimi Vision API not configured');
       return;
     }
@@ -7042,7 +7076,7 @@ window.kimiLedgerVision = kimiLedgerVision;
 async function testKimiVision() {
   setKimiVisionStatus('<span class="spinner"></span> Testing connection…');
   if (!getKimiApiKey() && !getKimiProxyUrl()) {
-    setKimiVisionStatus('⚠️ Nothing configured yet. Paste your Moonshot API key above (or set a proxy URL), then test again.', true);
+    setKimiVisionStatus('⚠️ Paste an Apps Script …/exec URL (recommended) or a Moonshot key, then test again.', true);
     return;
   }
   // Create a tiny test image (10x10 with "Hi")
@@ -7085,18 +7119,26 @@ document.addEventListener('DOMContentLoaded', () => {
   kvBind('kimiApiKey', 'kimiApiKey', true);
   kvBind('kimiApiBase', 'kimiApiBase', true);
   kvBind('kimiModel', 'kimiModel', true);
-  kvBind('kimiProxyUrl', 'kimiProxyUrl', true);
 
   // Show the current Kimi config in the status line
+  kvBind('kimiProxyUrl', 'kimiProxyUrl', true);
+  const proxyEl = $('kimiProxyUrl');
+  if (proxyEl && !(proxyEl.value || '').trim() && typeof GAS_URL === 'string' && GAS_URL && !GAS_URL.includes('YOUR_SCRIPT')) {
+    proxyEl.value = GAS_URL;
+    proxyEl.placeholder = 'Using cloud-sync Apps Script URL (edit to override)';
+  }
   const st = $('kimiVisionStatus');
   if (st) {
     const key = getKimiApiKey(), proxy = getKimiProxyUrl();
-    if (proxy) st.innerHTML = '🔄 Using your proxy. Direct key: ' + (key ? 'set ✓' : 'not set');
-    else if (key) st.innerHTML = '🔑 Key set (…' + key.slice(-4) + ') → ' + getKimiApiBase().replace('https://', '') + ' · model <code>' + getKimiModel() + '</code>';
-    else st.innerHTML = '📋 Manual (clipboard) mode — paste a key above to enable Auto.';
+    if (proxy && key) st.innerHTML = '🔄 Proxy set · browser key …' + key.slice(-4) + ' (proxy used first to dodge CORS)';
+    else if (proxy) st.innerHTML = '🔄 Apps Script proxy ready (CORS-safe). Moonshot key lives in the script.';
+    else if (key) st.innerHTML = '🔑 Direct key …' + key.slice(-4) + ' — may fail on CORS. Add a proxy URL.';
+    else st.innerHTML = '📋 No proxy or key — Manual clipboard mode only.';
   }
 });
 
 </script>
 <script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a258da75cd208739',t:'MTc4NTc5NzEzMw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a261091cdc45af03',t:'MTc4NTg4MjkzMA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>ment.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>

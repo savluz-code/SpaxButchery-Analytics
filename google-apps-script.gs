@@ -10,9 +10,10 @@
  *   Who has access: Anyone
  * Paste the /exec URL into index.html as GAS_URL.
  *
- * Vision OCR proxy (kimiVision action) works with any OpenAI-compatible provider.
+ * Vision OCR proxy (kimiVision action) works with any provider.
  *   FREE option: set GEMINI_API_KEY below (aistudio.google.com/apikey — no card
- *   needed). The app sends base=https://generativelanguage.googleapis.com/v1beta/openai.
+ *   needed). The app sends base=https://generativelanguage.googleapis.com/v1beta
+ *   and this script calls Gemini's NATIVE :generateContent endpoint.
  *   PAID option (optional): set MOONSHOT_API_KEY for Kimi (Moonshot).
  */
 
@@ -185,20 +186,52 @@ function saveAll_(body) {
 /* ══════════ KIMI VISION PROXY ══════════ */
 
 function kimiVision_(body) {
-  var base = String(body.base || '').replace(/\/+$/, '');
+  var base = String(body.base || '').replace(/\/+$/, '').replace(/\/openai$/, '');
   var isGemini = base.indexOf('generativelanguage.googleapis.com') !== -1;
   var key = isGemini ? GEMINI_API_KEY : MOONSHOT_API_KEY;
   if (!key || key === 'YOUR_API_KEY' || key === 'YOUR_GEMINI_API_KEY') {
     return { success: false, error: 'Set ' + (isGemini ? 'GEMINI_API_KEY (free from aistudio.google.com/apikey)' : 'MOONSHOT_API_KEY') + ' in the Apps Script' };
   }
+  var model = body.model || (isGemini ? 'gemini-2.5-flash' : DEFAULT_KIMI_MODEL);
+  var prompt = body.prompt || 'Extract all text from this image. Return ONLY the text.';
+
+  // Gemini uses its NATIVE generateContent API — the old /v1beta/openai
+  // OpenAI-compat path now returns 404.
+  if (isGemini) {
+    var durl = String(body.image || '');
+    var comma = durl.indexOf(',');
+    var img = comma >= 0 ? durl.slice(comma + 1) : durl;
+    var mm = /^data:(image\/[a-z+.-]+);/i.exec(durl);
+    var res = UrlFetchApp.fetch(base + '/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({
+        contents: [{
+          parts: [
+            { inline_data: { mime_type: mm ? mm[1] : 'image/jpeg', data: img } },
+            { text: prompt }
+          ]
+        }]
+      }),
+      muteHttpExceptions: true
+    });
+    var gdata = JSON.parse(res.getContentText());
+    if (gdata.candidates && gdata.candidates[0] && gdata.candidates[0].content) {
+      var parts = gdata.candidates[0].content.parts || [];
+      var gtext = parts.map(function (p) { return p.text || ''; }).join('');
+      if (gtext) return { success: true, text: gtext };
+    }
+    return { success: false, error: gdata.error || gdata };
+  }
+
   var payload = {
-    model: body.model || (isGemini ? 'gemini-2.5-flash' : DEFAULT_KIMI_MODEL),
+    model: model,
     temperature: 0.1,
     messages: [{
       role: 'user',
       content: [
         { type: 'image_url', image_url: { url: body.image } },
-        { type: 'text', text: body.prompt || 'Extract all text from this image. Return ONLY the text.' }
+        { type: 'text', text: prompt }
       ]
     }]
   };
@@ -211,20 +244,20 @@ function kimiVision_(body) {
     var b = String(bases[i] || '').replace(/\/+$/, '');
     if (!b || seen[b]) continue;
     seen[b] = 1;
-    var res = UrlFetchApp.fetch(b + '/chat/completions', {
+    var res2 = UrlFetchApp.fetch(b + '/chat/completions', {
       method: 'post',
       contentType: 'application/json',
       headers: { Authorization: 'Bearer ' + key },
       payload: JSON.stringify(payload),
       muteHttpExceptions: true
     });
-    var data = JSON.parse(res.getContentText());
+    var data = JSON.parse(res2.getContentText());
     if (data.choices && data.choices[0] && data.choices[0].message) {
       return { success: true, text: data.choices[0].message.content };
     }
     lastErr = data.error || data;
-    var code = (data.error && data.error.code) || res.getResponseCode();
-    if (code !== 401 && code !== 403 && res.getResponseCode() !== 401 && res.getResponseCode() !== 403) {
+    var code = (data.error && data.error.code) || res2.getResponseCode();
+    if (code !== 401 && code !== 403 && res2.getResponseCode() !== 401 && res2.getResponseCode() !== 403) {
       return { success: false, error: lastErr };
     }
   }

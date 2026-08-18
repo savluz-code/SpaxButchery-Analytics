@@ -480,7 +480,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
           <select id="kimiApiBase" style="width:auto">
             <option value="https://api.moonshot.ai/v1">🌍 Moonshot api.moonshot.ai</option>
             <option value="https://api.moonshot.cn/v1">🇨🇳 Moonshot api.moonshot.cn</option>
-            <option value="https://generativelanguage.googleapis.com/v1beta/openai">🟢 Google Gemini — free tier</option>
+            <option value="https://generativelanguage.googleapis.com/v1beta">🟢 Google Gemini — free tier</option>
             <option value="https://openrouter.ai/api/v1">🔗 OpenRouter — free models</option>
           </select>
           <input id="kimiModel" placeholder="Model: auto (optional)" style="width:200px">
@@ -515,15 +515,39 @@ function doPost(e) {
   if (body.action !== 'kimiVision') {
     return ContentService.createTextOutput(JSON.stringify({success:false,error:'unknown action'})).setMimeType(ContentService.MimeType.JSON);
   }
-  var base = String(body.base || 'https://generativelanguage.googleapis.com/v1beta/openai').replace(/\/+$/, '');
+  var base = String(body.base || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '').replace(/\/openai$/, '');
   var isGemini = base.indexOf('generativelanguage.googleapis.com') !== -1;
   var key = isGemini ? GEMINI_API_KEY : MOONSHOT_API_KEY;
+  var model = body.model || (isGemini ? 'gemini-2.5-flash' : 'kimi-k3');
+  var prompt = body.prompt || 'Extract all text from this image. Return ONLY the text.';
+  if (isGemini) {
+    var durl = String(body.image || '');
+    var comma = durl.indexOf(',');
+    var img = comma >= 0 ? durl.slice(comma + 1) : durl;
+    var mm = /^data:(image\/[a-z+.-]+);/i.exec(durl);
+    var res = UrlFetchApp.fetch(base + '/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ contents: [{ parts: [
+        { inline_data: { mime_type: mm ? mm[1] : 'image/jpeg', data: img } },
+        { text: prompt }
+      ] }] }),
+      muteHttpExceptions: true
+    });
+    var gdata = JSON.parse(res.getContentText());
+    if (gdata.candidates && gdata.candidates[0] && gdata.candidates[0].content) {
+      var parts = gdata.candidates[0].content.parts || [];
+      var gtext = parts.map(function (p) { return p.text || ''; }).join('');
+      if (gtext) return ContentService.createTextOutput(JSON.stringify({success:true,text:gtext})).setMimeType(ContentService.MimeType.JSON);
+    }
+    return ContentService.createTextOutput(JSON.stringify({success:false,error:gdata.error||gdata})).setMimeType(ContentService.MimeType.JSON);
+  }
   var payload = {
-    model: body.model || (isGemini ? 'gemini-2.5-flash' : 'kimi-k3'),
+    model: model,
     temperature: 0.1,
     messages: [{ role: 'user', content: [
       { type: 'image_url', image_url: { url: body.image } },
-      { type: 'text', text: body.prompt }
+      { type: 'text', text: prompt }
     ]}]
   };
   var res = UrlFetchApp.fetch(base + '/chat/completions', {
@@ -6712,10 +6736,19 @@ function dataUrlToBase64(dataUrl) {
 
 // Settings accessors (localStorage — device only, never in DB/cloud sync)
 function getKimiApiKey(){ return (localStorage.getItem('kimiApiKey')||'').trim(); }
+function normalizeVisionBase(url){
+  let base = String(url || '').trim().replace(/\/+$/, '');
+  // Old Gemini OpenAI-compat path now 404s — use native v1beta.
+  if (/generativelanguage\.googleapis\.com/.test(base)) {
+    base = base.replace(/\/openai$/, '');
+    if (!/\/v1beta$/.test(base)) base = 'https://generativelanguage.googleapis.com/v1beta';
+  }
+  return base;
+}
 function getKimiApiBase(){
   const custom = (localStorage.getItem('kimiCustomBase')||'').trim();
-  if (custom) return custom;
-  return (localStorage.getItem('kimiApiBase')||'').trim() || 'https://api.moonshot.ai/v1';
+  if (custom) return normalizeVisionBase(custom);
+  return normalizeVisionBase((localStorage.getItem('kimiApiBase')||'').trim() || 'https://api.moonshot.ai/v1');
 }
 function getKimiModel(){ return (localStorage.getItem('kimiModel')||'').trim(); }
 function getKimiProxyUrl(){
@@ -6792,8 +6825,37 @@ function prepareKimiImage(dataUrl) {
 async function _kimiDirectCall(base, key, model, imageDataUrl, prompt) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 90000);
+  const fallbackPrompt = prompt || 'Extract all text from this image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.';
   try {
-    const res = await fetch(base.replace(/\/+$/, '') + '/chat/completions', {
+    const clean = normalizeVisionBase(base);
+    if (/generativelanguage\.googleapis\.com/.test(clean)) {
+      const comma = String(imageDataUrl || '').indexOf(',');
+      const img = comma >= 0 ? imageDataUrl.slice(comma + 1) : imageDataUrl;
+      const mm = /^data:(image\/[a-z+.-]+);/i.exec(imageDataUrl);
+      const res = await fetch(clean + '/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [
+            { inline_data: { mime_type: mm ? mm[1] : 'image/jpeg', data: img } },
+            { text: fallbackPrompt }
+          ] }]
+        }),
+        signal: controller.signal
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = new Error((data.error && (data.error.message || data.error.status)) || ('HTTP ' + res.status));
+        err.status = res.status;
+        throw err;
+      }
+      const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts || [];
+      const text = parts.map(p => p.text || '').join('');
+      if (!text) throw new Error('No text in API response');
+      return String(text).trim();
+    }
+    const res = await fetch(clean + '/chat/completions', {
       method: 'POST',
       mode: 'cors',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
@@ -6802,7 +6864,7 @@ async function _kimiDirectCall(base, key, model, imageDataUrl, prompt) {
         temperature: 0.1,
         messages: [{ role: 'user', content: [
           { type: 'image_url', image_url: { url: imageDataUrl } },
-          { type: 'text', text: prompt || 'Extract all text from this image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.' }
+          { type: 'text', text: fallbackPrompt }
         ] }]
       }),
       signal: controller.signal
@@ -7154,6 +7216,14 @@ document.addEventListener('DOMContentLoaded', () => {
     el.onchange = () => localStorage.setItem(storeKey, trim ? (el.value || '').trim() : el.value);
   };
   kvBind('kimiApiKey', 'kimiApiKey', true);
+  try {
+    const oldBase = localStorage.getItem('kimiApiBase') || '';
+    const fixed = normalizeVisionBase(oldBase);
+    if (oldBase && fixed !== oldBase) localStorage.setItem('kimiApiBase', fixed);
+    const oldWork = localStorage.getItem('kimiWorkingBase') || '';
+    const fixedWork = normalizeVisionBase(oldWork);
+    if (oldWork && fixedWork !== oldWork) localStorage.setItem('kimiWorkingBase', fixedWork);
+  } catch (e) {}
   kvBind('kimiApiBase', 'kimiApiBase', true);
   kvBind('kimiModel', 'kimiModel', true);
   kvBind('kimiCustomBase', 'kimiCustomBase', true);

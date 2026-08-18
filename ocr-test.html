@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OCR Shootout — Gemini · OpenRouter · Kimi · Tesseract | SpaxButchery</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract.min.js"></script>
+<style>
+:root{--bg:#0f1419;--card:#1a2129;--card2:#212b35;--border:#2c3945;--red:#e63946;--red2:#ff6b6b;
+--amber:#f4a261;--green:#2ec4b6;--blue:#4cc9f0;--purple:#b298dc;--text:#e8edf2;--muted:#8b9aa7}
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',system-ui,sans-serif}
+body{background:var(--bg);color:var(--text);min-height:100vh}
+header{background:linear-gradient(135deg,#7f1d1d,#450a0a);padding:20px 28px;border-bottom:3px solid var(--red)}
+header h1{font-size:1.3rem}header p{color:#fca5a5;font-size:.85rem;margin-top:4px}
+header a{color:var(--blue)}
+main{padding:24px;max-width:1200px;margin:0 auto;display:grid;gap:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px}
+.card h2{font-size:1rem;margin-bottom:10px;color:var(--blue)}
+label{display:block;font-size:.78rem;color:var(--muted);margin:8px 0 3px}
+input[type=text],input[type=password],textarea{width:100%;background:#0f1419;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:9px 10px;font-size:.85rem}
+textarea{min-height:70px;resize:vertical}
+input[type=file]{color:var(--muted);font-size:.85rem;padding:6px 0}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.btn{background:var(--red);color:#fff;border:none;border-radius:8px;padding:12px 22px;font-size:.95rem;cursor:pointer;font-weight:600}
+.btn:hover{background:var(--red2)}
+.btn.ghost{background:none;border:1px solid var(--border);color:var(--text)}
+.hint{font-size:.75rem;color:var(--muted);margin-top:6px;line-height:1.5}
+#photoPreview{max-width:300px;border-radius:8px;border:1px solid var(--border);margin-top:10px}
+#globalStatus{margin-top:10px;font-size:.85rem;color:var(--amber)}
+.providers{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+.pcard{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:8px}
+.pcard .pname{font-weight:600;font-size:.95rem}
+.pcard .pmeta{font-size:.75rem;color:var(--muted);min-height:16px}
+.pcard pre{background:#0f1419;border:1px solid var(--border);border-radius:8px;padding:10px;font-size:.8rem;white-space:pre-wrap;word-break:break-word;min-height:120px;max-height:340px;overflow:auto;color:#d9e2ea}
+.pcard .copy{font-size:.72rem;color:var(--blue);cursor:pointer;background:none;border:none;text-align:left;padding:0}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--muted);border-top-color:var(--blue);border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.state-idle{color:var(--muted)}.state-running{color:var(--amber)}.state-done{color:var(--green)}.state-error{color:var(--red2)}
+@media(max-width:640px){.row{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>🖼️ OCR Provider Shootout</h1>
+  <p>Run the <b>same photo</b> through every provider and compare the raw extracted text — nothing is uploaded anywhere except to the API provider you configured. <a href="index.html">← back to the app</a></p>
+</header>
+<main>
+  <section class="card">
+    <h2>1 · Photo to test</h2>
+    <input type="file" id="photoInput" accept="image/*">
+    <div id="photoStats" class="hint"></div>
+    <img id="photoPreview" alt="preview" style="display:none">
+  </section>
+
+  <section class="card">
+    <h2>2 · Keys &amp; settings <span style="font-size:.72rem;color:var(--muted)">(saved in this browser only, never in the sheet/DB)</span></h2>
+    <div class="row">
+      <div>
+        <label>🟢 Gemini key — free, no card (aistudio.google.com/apikey) — starts with AIza…</label>
+        <input type="password" id="geminiKey" placeholder="AIza…" autocomplete="off">
+      </div>
+      <div>
+        <label>🔗 OpenRouter key — free, no card (openrouter.ai → API Keys) — starts with sk-or-…</label>
+        <input type="password" id="openrouterKey" placeholder="sk-or-…" autocomplete="off">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>🇨🇳 Moonshot/Kimi key (paid — optional; direct browser calls may hit CORS)</label>
+        <input type="password" id="kimiKey" placeholder="sk-…" autocomplete="off">
+      </div>
+      <div>
+        <label>🔁 Apps Script proxy …/exec URL (optional — needed for Kimi to dodge CORS)</label>
+        <input type="text" id="kimiProxy" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off">
+      </div>
+    </div>
+    <label>Prompt sent to each provider</label>
+    <textarea id="prompt">Extract all text from this handwritten image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.</textarea>
+  </section>
+
+  <section class="card">
+    <h2>3 · Run the shootout</h2>
+    <button class="btn" id="runBtn">🚀 OCR with all configured providers</button>
+    <div id="globalStatus"></div>
+    <div class="hint">
+      Free-tier limits (per day): Gemini ~250–1,500 requests · OpenRouter :free models ~50 requests · Tesseract.js unlimited but weaker on handwriting.
+      Each test photo = 1 request per configured provider.
+    </div>
+  </section>
+
+  <section class="providers" id="results">
+    <div class="pcard" id="card-gemini">
+      <div class="pname">🟢 Google Gemini <span style="font-weight:400;font-size:.75rem;color:var(--muted)">free tier</span></div>
+      <div class="pmeta state-idle" id="meta-gemini">waiting for a key…</div>
+      <pre id="out-gemini"></pre>
+      <button class="copy" data-out="out-gemini" style="display:none">📋 Copy</button>
+    </div>
+    <div class="pcard" id="card-openrouter">
+      <div class="pname">🔗 OpenRouter <span style="font-weight:400;font-size:.75rem;color:var(--muted)">:free models</span></div>
+      <div class="pmeta state-idle" id="meta-openrouter">waiting for a key…</div>
+      <pre id="out-openrouter"></pre>
+      <button class="copy" data-out="out-openrouter" style="display:none">📋 Copy</button>
+    </div>
+    <div class="pcard" id="card-kimi">
+      <div class="pname">🇨🇳 Moonshot Kimi <span style="font-weight:400;font-size:.75rem;color:var(--muted)">paid</span></div>
+      <div class="pmeta state-idle" id="meta-kimi">waiting for a key or proxy…</div>
+      <pre id="out-kimi"></pre>
+      <button class="copy" data-out="out-kimi" style="display:none">📋 Copy</button>
+    </div>
+    <div class="pcard" id="card-tesseract">
+      <div class="pname">⚙️ Tesseract.js <span style="font-weight:400;font-size:.75rem;color:var(--muted)">offline · no key · baseline</span></div>
+      <div class="pmeta state-idle" id="meta-tesseract">runs locally in this browser</div>
+      <pre id="out-tesseract"></pre>
+      <button class="copy" data-out="out-tesseract" style="display:none">📋 Copy</button>
+    </div>
+  </section>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const get = k => (localStorage.getItem('ocrTest_' + k) || '').trim();
+const set = (k, v) => { try { localStorage.setItem('ocrTest_' + k, v); } catch(e){} };
+
+const PROMPT_FALLBACK = 'Extract all text from this handwritten image. Return ONLY the text content, preserving the structure (lines, columns, numbers). Do not add commentary.';
+
+const PROVIDERS = {
+  gemini: {
+    base: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    models: ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'],
+    keyEl: 'geminiKey'
+  },
+  openrouter: {
+    base: 'https://openrouter.ai/api/v1',
+    models: ['google/gemini-2.0-flash-exp:free', 'google/gemma-4-31b-it:free', 'qwen/qwen-2.5-vl-72b-instruct:free', 'nvidia/nemotron-nano-12b-v2-vl:free'],
+    keyEl: 'openrouterKey'
+  },
+  kimi: {
+    base: 'https://api.moonshot.ai/v1',
+    models: ['kimi-k3', 'kimi-k2.5', 'moonshot-v1-128k-vision-preview', 'moonshot-v1-32k-vision-preview'],
+    keyEl: 'kimiKey'
+  }
+};
+
+// ── restore persisted values ──
+['geminiKey', 'openrouterKey', 'kimiKey', 'kimiProxy'].forEach(id => { $(id).value = get(id); });
+$('prompt').value = get('prompt') || PROMPT_FALLBACK;
+['geminiKey', 'openrouterKey', 'kimiKey', 'kimiProxy', 'prompt'].forEach(id => {
+  $(id).addEventListener('change', () => set(id, $(id).value));
+});
+
+// ── photo handling ──
+let preparedImage = null;
+$('photoInput').addEventListener('change', ev => {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const raw = reader.result;
+    prepareImage(raw).then(dataUrl => {
+      preparedImage = dataUrl;
+      const rawKB = Math.round(raw.length / 1024);
+      const sentKB = Math.round(dataUrl.length / 1024);
+      $('photoStats').innerHTML = '✅ Ready — original ≈ ' + rawKB + ' KB, will send ≈ ' + sentKB + ' KB (downscaled to ≤1568px JPEG).';
+      const img = $('photoPreview');
+      img.src = dataUrl; img.style.display = 'block';
+    });
+  };
+  reader.readAsDataURL(file);
+});
+
+function prepareImage(dataUrl) {
+  return new Promise(resolve => {
+    let done = false;
+    const fallback = () => { if (!done) { done = true; resolve(dataUrl); } };
+    const t = setTimeout(fallback, 1500);
+    try {
+      const img = new Image();
+      img.onload = () => {
+        clearTimeout(t);
+        if (done) return;
+        try {
+          const MAX = 1568;
+          let w = img.naturalWidth || img.width || 1000;
+          let h = img.naturalHeight || img.height || 1000;
+          if (w > MAX || h > MAX) { const s = MAX / Math.max(w, h); w = Math.round(w * s); h = Math.round(h * s); }
+          const c = document.createElement('canvas');
+          c.width = w; c.height = h;
+          const ctx = c.getContext('2d');
+          if (!ctx) { fallback(); return; }
+          ctx.drawImage(img, 0, 0, w, h);
+          done = true;
+          resolve(c.toDataURL('image/jpeg', 0.85));
+        } catch (e) { fallback(); }
+      };
+      img.onerror = fallback;
+      img.src = dataUrl;
+    } catch (e) { fallback(); }
+  });
+}
+
+// ── generic OpenAI-compatible vision call ──
+function openaiCall(base, key, models, image, prompt) {
+  return new Promise((resolve, reject) => {
+    const tryModel = i => {
+      if (i >= models.length) return reject(new Error('All models failed (see console)'));
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 90000);
+      fetch(base.replace(/\/+$/, '') + '/chat/completions', {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify({
+          model: models[i],
+          temperature: 0.1,
+          messages: [{ role: 'user', content: [
+            { type: 'image_url', image_url: { url: image } },
+            { type: 'text', text: prompt }
+          ] }]
+        }),
+        signal: controller.signal
+      }).then(async res => {
+        clearTimeout(timer);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const err = new Error((data.error && (data.error.message || data.error.msg)) || ('HTTP ' + res.status));
+          err.status = res.status;
+          if ((res.status === 401 || res.status === 403) || /model/i.test(err.message)) return tryModel(i + 1);
+          return reject(err);
+        }
+        const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+        if (!text) return reject(new Error('Empty response'));
+        resolve({ text: String(text).trim(), model: models[i], provider: data.provider || '' });
+      }).catch(err => {
+        clearTimeout(timer);
+        if (err && err.name === 'AbortError') return reject(new Error('Timed out after 90s'));
+        if (/model/i.test(String(err && err.message))) return tryModel(i + 1);
+        reject(err);
+      });
+    };
+    tryModel(0);
+  });
+}
+
+function kimiViaProxy(proxy, image, prompt) {
+  return fetch(proxy, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action: 'kimiVision', image: image, prompt: prompt, base: 'https://api.moonshot.ai/v1' })
+  }).then(async res => {
+    const data = await res.json().catch(() => null);
+    if (data && data.success && data.text) return { text: String(data.text).trim(), model: 'kimi (via Apps Script proxy)' };
+    const err = data && data.error;
+    throw new Error((err && (err.message || err.msg)) || JSON.stringify(err || {}) || ('HTTP ' + res.status));
+  });
+}
+
+// ── per-provider runner ──
+function setState(provider, cls, html) {
+  const meta = $('meta-' + provider);
+  meta.className = 'pmeta ' + cls;
+  meta.innerHTML = html;
+}
+function setOut(provider, text) {
+  const pre = $('out-' + provider);
+  pre.textContent = text || '';
+  const btn = document.querySelector('[data-out="out-' + provider + '"]');
+  if (btn) btn.style.display = text ? 'block' : 'none';
+}
+
+async function runProvider(provider) {
+  const cfg = PROVIDERS[provider];
+  const key = $(cfg.keyEl).value.trim();
+  if (!key) { setState(provider, 'state-idle', 'no key — skipped'); return; }
+  const prompt = $('prompt').value.trim() || PROMPT_FALLBACK;
+  setState(provider, 'state-running', '<span class="spinner"></span> calling ' + cfg.base.replace('https://', '') + '…');
+  const t0 = performance.now();
+  try {
+    let res;
+    if (provider === 'kimi') {
+      const proxy = $('kimiProxy').value.trim();
+      res = proxy
+        ? await kimiViaProxy(proxy, preparedImage, prompt)
+        : await openaiCall(cfg.base, key, cfg.models, preparedImage, prompt);
+    } else {
+      res = await openaiCall(cfg.base, key, cfg.models, preparedImage, prompt);
+    }
+    const ms = Math.round(performance.now() - t0);
+    setOut(provider, res.text);
+    setState(provider, 'state-done', '✅ ' + res.text.length + ' chars · ' + (ms / 1000).toFixed(1) + 's · model: ' + res.model + (res.provider ? ' · via ' + res.provider : ''));
+  } catch (err) {
+    const msg = String(err && err.message || err);
+    setState(provider, 'state-error', '❌ ' + msg + (provider === 'kimi' && !$('kimiProxy').value.trim() && /CORS|Failed to fetch|NetworkError/i.test(msg)
+      ? ' — Moonshot blocks browser calls. Add the Apps Script proxy URL (or paste the Gemini/OpenRouter keys and compare those).'
+      : ''));
+  }
+}
+
+async function runTesseract() {
+  if (typeof Tesseract === 'undefined') { setState('tesseract', 'state-error', '❌ Tesseract.js failed to load (no internet?)'); return; }
+  setState('tesseract', 'state-running', '<span class="spinner"></span> running locally…');
+  const t0 = performance.now();
+  try {
+    const worker = await Tesseract.createWorker('eng');
+    const { data } = await worker.recognize(preparedImage);
+    await worker.terminate();
+    const ms = Math.round(performance.now() - t0);
+    const text = (data && data.text || '').trim();
+    setOut('tesseract', text);
+    setState('tesseract', 'state-done', '✅ ' + text.length + ' chars · ' + (ms / 1000).toFixed(1) + 's · eng, offline');
+  } catch (err) {
+    setState('tesseract', 'state-error', '❌ ' + (err && err.message || err));
+  }
+}
+
+$('runBtn').addEventListener('click', async () => {
+  if (!preparedImage) { $('globalStatus').innerHTML = '⚠️ Choose the photo first (step 1).'; return; }
+  const anyKey = ['geminiKey', 'openrouterKey', 'kimiKey'].some(id => $(id).value.trim());
+  if (!anyKey) { $('globalStatus').innerHTML = '⚠️ Paste at least one API key (Gemini or OpenRouter are free) — or just run Tesseract below.'; return; }
+  $('globalStatus').innerHTML = '<span class="spinner"></span> Running…';
+  ['gemini', 'openrouter', 'kimi'].forEach(p => setOut(p, ''));
+  const jobs = ['gemini', 'openrouter', 'kimi'].filter(p => PROVIDERS[p].keyEl && $(PROVIDERS[p].keyEl).value.trim()).map(runProvider);
+  await Promise.all(jobs);
+  await runTesseract();
+  $('globalStatus').innerHTML = 'Done. Compare the columns — look for correct names, phone numbers (07xx), amounts (KES), and clean line structure.';
+});
+
+document.querySelectorAll('.copy').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const pre = $(btn.dataset.out);
+    navigator.clipboard.writeText(pre.textContent).then(() => {
+      const old = btn.textContent; btn.textContent = '✅ copied';
+      setTimeout(() => { btn.textContent = old; }, 1200);
+    });
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Copy Code.gs — SpaxButchery</title>
+<meta name="theme-color" content="#0f1419">
+<style>
+:root{--bg:#0f1419;--card:#1a2129;--card2:#212b35;--border:#2c3945;--red:#e63946;--red2:#ff6b6b;--green:#2ec4b6;--blue:#4cc9f0;--text:#e8edf2;--muted:#8b9aa7}
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',system-ui,-apple-system,sans-serif}
+body{background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:80px}
+header{background:linear-gradient(135deg,#7f1d1d,#450a0a);padding:18px 16px;border-bottom:3px solid var(--red);position:sticky;top:0;z-index:10}
+header h1{font-size:1.15rem;line-height:1.3}
+header p{color:#fca5a5;font-size:.8rem;margin-top:6px;line-height:1.4}
+.wrap{max-width:900px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:14px}
+.steps{font-size:.85rem;line-height:1.6;color:var(--text)}
+.steps ol{margin:8px 0 0 18px}
+.steps li{margin-bottom:6px}
+.steps code{background:var(--card2);border:1px solid var(--border);padding:1px 6px;border-radius:4px;font-size:.8rem;word-break:break-all}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:16px 18px;border-radius:12px;border:none;font-size:1rem;font-weight:700;cursor:pointer;transition:.15s}
+.btn:active{transform:scale(.98)}
+.btn.primary{background:var(--green);color:#04292a}
+.btn.secondary{background:var(--card2);color:var(--text);border:1px solid var(--border);margin-top:10px}
+.btn.blue{background:var(--blue);color:#04202a}
+.hint{font-size:.78rem;color:var(--muted);margin-top:8px;text-align:center;line-height:1.4}
+pre{background:#0c1116;border:1px solid var(--border);border-radius:10px;padding:12px;font-size:.75rem;line-height:1.5;overflow:auto;max-height:50vh;white-space:pre;word-wrap:normal;-webkit-overflow-scrolling:touch}
+pre code{font-family:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;color:#d9e2ea}
+.toast{position:fixed;left:16px;right:16px;bottom:16px;background:var(--green);color:#04292a;padding:14px 16px;border-radius:10px;font-weight:700;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,.4);transform:translateY(120px);transition:.3s;z-index:99}
+.toast.show{transform:none}
+.badge{display:inline-block;background:rgba(46,196,182,.15);color:var(--green);padding:2px 8px;border-radius:20px;font-size:.7rem;font-weight:700;vertical-align:middle}
+.meta{font-size:.75rem;color:var(--muted);margin-top:8px}
+a{color:var(--blue)}
+</style>
+</head>
+<body>
+<header>
+  <h1>📋 SpaxButchery — <code>Code.gs</code> <span class="badge">v2.5 • 2026-08-18</span></h1>
+  <p>Mobile-friendly copy page. Tap <b>Copy All</b> → open <a href="https://script.google.com" target="_blank">script.google.com</a> (use <b>⋮ → Desktop site</b> on phone) → paste → Save.</p>
+</header>
+
+<div class="wrap">
+
+  <div class="card steps">
+    <b style="color:var(--green)">How to replace on mobile (30 seconds):</b>
+    <ol>
+      <li>Tap <b>📋 Copy Entire Code.gs</b> below — it copies automatically.</li>
+      <li>Open <a href="https://script.google.com" target="_blank">script.google.com</a> in Chrome. Tap <b>⋮ → Desktop site</b> (required — mobile editor is read-only otherwise).</li>
+      <li>Open your SpaxButchery project → click <code>Code.gs</code> on the left → <b>Select All</b> → <b>Paste</b> → <b>💾 Save</b> (Ctrl+S).</li>
+      <li>If you changed keys, set <code>GEMINI_API_KEY</code> / <code>MOONSHOT_API_KEY</code> at the top, then <b>Deploy → Manage deployments → ✏️ Edit → Deploy</b> (or New deployment).</li>
+    </ol>
+    <div class="meta">Same file as <code>google-apps-script.gs</code> in the repo · Updated 2026-08-18 · Works with <code>index.html</code> GAS_URL</div>
+  </div>
+
+  <button class="btn primary" id="copyBtn">📋 Copy Entire Code.gs</button>
+  <button class="btn secondary" id="selectBtn">🔍 Select All (then long-press → Copy)</button>
+  <a href="google-apps-script.gs" target="_blank" class="btn blue" style="margin-top:10px;text-decoration:none">⬇️ Open raw file (google-apps-script.gs)</a>
+  <div class="hint" id="hint">Tip: If copy fails, use “Select All” then long-press → Copy. iOS may ask to allow paste.</div>
+
+  <div class="card" style="margin-top:14px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <b style="font-size:.85rem">Code.gs — full content</b>
+      <span style="font-size:.7rem;color:var(--muted)" id="chars">loading…</span>
+    </div>
+    <pre id="pre"><code id="codeEl">Loading…</code></pre>
+  </div>
+
+  <div class="card">
+    <b style="font-size:.9rem">Why this page exists</b>
+    <p style="font-size:.8rem;color:var(--muted);margin-top:6px;line-height:1.5">
+      Google’s Apps Script editor (<code>script.google.com</code>) is not editable on mobile — the code area is read-only unless you request Desktop site, and even then selecting/pasting is awkward.
+      This page gives you a single large <b>Copy</b> button so you don’t have to pinch-zoom or drag-select. The file is also kept in the repo as <code>google-apps-script.gs</code> so any future update can be re-copied the same way.
+    </p>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+function toast(msg, ok=true){
+  const t=$('toast'); t.textContent=msg; t.style.background = ok ? 'var(--green)' : '#e63946'; t.style.color = ok ? '#04292a' : '#fff';
+  t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), 2800);
+}
+async function loadCode(){
+  try{
+    const res = await fetch('google-apps-script.gs?_=' + Date.now());
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const txt = await res.text();
+    $('codeEl').textContent = txt;
+    $('chars').textContent = txt.length.toLocaleString() + ' chars • ' + txt.split('\n').length + ' lines';
+    return txt;
+  }catch(e){
+    $('codeEl').textContent = 'Failed to load google-apps-script.gs: ' + e.message + '\nTry the raw link above.';
+    $('chars').textContent = 'error';
+    return '';
+  }
+}
+let cached = '';
+loadCode().then(t=> cached=t);
+
+$('copyBtn').onclick = async () => {
+  if(!cached) cached = $('codeEl').textContent;
+  if(!cached || cached.startsWith('Loading') || cached.startsWith('Failed')){ toast('Still loading — try again in a second', false); return; }
+  try{
+    await navigator.clipboard.writeText(cached);
+    toast('✅ Copied! Now paste into script.google.com → Code.gs → Save');
+  }catch(e){
+    // Fallback: select
+    const range = document.createRange();
+    range.selectNodeContents($('codeEl'));
+    const sel = window.getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+    // Try execCommand
+    try{ document.execCommand('copy'); toast('✅ Copied (fallback)! Paste into Code.gs'); }
+    catch(_){ toast('Selected — now long-press → Copy', true); }
+  }
+};
+$('selectBtn').onclick = () => {
+  const range = document.createRange();
+  range.selectNodeContents($('codeEl'));
+  const sel = window.getSelection();
+  sel.removeAllRanges(); sel.addRange(range);
+  $('pre').scrollTop = 0;
+  toast('📖 Selected — long-press → Copy, then paste into Code.gs');
+  // Also scroll to code
+  $('pre').scrollIntoView({behavior:'smooth', block:'start'});
+};
+</script>
+</body>
+</html>

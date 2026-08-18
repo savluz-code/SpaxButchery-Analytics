@@ -125,7 +125,7 @@ const PROMPT_FALLBACK = 'Extract all text from this handwritten image. Return ON
 
 const PROVIDERS = {
   gemini: {
-    base: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    base: 'https://generativelanguage.googleapis.com/v1beta',
     models: ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'],
     keyEl: 'geminiKey'
   },
@@ -195,6 +195,51 @@ function prepareImage(dataUrl) {
       img.onerror = fallback;
       img.src = dataUrl;
     } catch (e) { fallback(); }
+  });
+}
+
+// Gemini native generateContent — /v1beta/openai now 404s.
+function geminiCall(base, key, models, image, prompt) {
+  return new Promise((resolve, reject) => {
+    const tryModel = i => {
+      if (i >= models.length) return reject(new Error('All models failed (see console)'));
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 90000);
+      const comma = String(image || '').indexOf(',');
+      const img = comma >= 0 ? image.slice(comma + 1) : image;
+      const mm = /^data:(image\/[a-z+.-]+);/i.exec(image);
+      fetch(base.replace(/\/+$/, '').replace(/\/openai$/, '') + '/models/' + encodeURIComponent(models[i]) + ':generateContent?key=' + encodeURIComponent(key), {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [
+            { inline_data: { mime_type: mm ? mm[1] : 'image/jpeg', data: img } },
+            { text: prompt }
+          ] }]
+        }),
+        signal: controller.signal
+      }).then(async res => {
+        clearTimeout(timer);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const err = new Error((data.error && (data.error.message || data.error.status)) || ('HTTP ' + res.status));
+          err.status = res.status;
+          if ((res.status === 401 || res.status === 403 || res.status === 404) || /model/i.test(err.message)) return tryModel(i + 1);
+          return reject(err);
+        }
+        const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts || [];
+        const text = parts.map(p => p.text || '').join('');
+        if (!text) return reject(new Error('Empty response'));
+        resolve({ text: String(text).trim(), model: models[i], provider: 'gemini' });
+      }).catch(err => {
+        clearTimeout(timer);
+        if (err && err.name === 'AbortError') return reject(new Error('Timed out after 90s'));
+        if (/model/i.test(String(err && err.message))) return tryModel(i + 1);
+        reject(err);
+      });
+    };
+    tryModel(0);
   });
 }
 

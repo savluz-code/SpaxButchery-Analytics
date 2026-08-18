@@ -470,54 +470,66 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     </div>
     <div style="display:grid;gap:10px;margin-top:10px;">
       <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:14px;">
-        <div style="font-weight:600;margin-bottom:6px;">⚙️ Kimi Vision settings</div>
+        <div style="font-weight:600;margin-bottom:6px;">⚙️ Vision OCR settings (Kimi · Gemini · OpenRouter)</div>
         <div style="font-size:.8rem;color:var(--muted);margin-bottom:10px;">
-          🔐 Browser key stays on this device. Proxy key stays in Apps Script. Neither is written to the customer database.
+          🔐 Browser key stays on this device. Proxy key stays in Apps Script. Neither is written to the customer database.<br>
+          🆓 <b>No money? Use Google Gemini</b> — free tier, no card needed: get a key at <a href="https://aistudio.google.com/apikey" target="_blank" style="color:var(--blue)">aistudio.google.com/apikey</a>, then pick <b>🟢 Gemini</b> below.
         </div>
         <div class="flex" style="gap:8px;flex-wrap:wrap;margin-bottom:8px;">
-          <input type="password" id="kimiApiKey" placeholder="Optional Moonshot key (sk-…) for a direct try" autocomplete="off" style="flex:1;min-width:220px">
+          <input type="password" id="kimiApiKey" placeholder="API key — Gemini 'AIza…' (free) or Moonshot/OpenRouter 'sk-…'" autocomplete="off" style="flex:1;min-width:220px">
           <select id="kimiApiBase" style="width:auto">
-            <option value="https://api.moonshot.ai/v1">🌍 api.moonshot.ai</option>
-            <option value="https://api.moonshot.cn/v1">🇨🇳 api.moonshot.cn</option>
+            <option value="https://api.moonshot.ai/v1">🌍 Moonshot api.moonshot.ai</option>
+            <option value="https://api.moonshot.cn/v1">🇨🇳 Moonshot api.moonshot.cn</option>
+            <option value="https://generativelanguage.googleapis.com/v1beta/openai">🟢 Google Gemini — free tier</option>
+            <option value="https://openrouter.ai/api/v1">🔗 OpenRouter — free models</option>
           </select>
-          <input id="kimiModel" placeholder="Model: kimi-k3" style="width:200px">
+          <input id="kimiModel" placeholder="Model: auto (optional)" style="width:200px">
         </div>
         <div style="margin-bottom:10px;">
-          <input id="kimiProxyUrl" placeholder="Apps Script proxy URL (…/exec) — CORS bypass" style="width:100%;box-sizing:border-box">
+          <input id="kimiCustomBase" placeholder="Or any OpenAI-compatible base URL (Groq, Together, DeepSeek…)" style="width:100%;box-sizing:border-box">
+        </div>
+        <div style="margin-bottom:10px;">
+          <input id="kimiProxyUrl" placeholder="Apps Script proxy URL (…/exec) — optional; Gemini works straight from the browser" style="width:100%;box-sizing:border-box">
         </div>
         <div class="flex" style="gap:8px;flex-wrap:wrap;">
           <select id="kimiVisionMode" style="flex:1;min-width:200px;">
             <option value="auto">⚡ Auto — proxy / direct API, then clipboard</option>
-            <option value="manual">📋 Manual — clipboard + open Kimi.com</option>
+            <option value="manual">📋 Manual — clipboard + open Kimi.com (no key needed)</option>
             <option value="api">🔑 API / proxy only</option>
           </select>
           <button class="btn ghost sm" onclick="testKimiVision()">🧪 Test Connection</button>
         </div>
         <div id="kimiVisionStatus" style="margin-top:8px;font-size:.8rem;color:var(--muted);min-height:20px;"></div>
         <details style="margin-top:10px;font-size:.78rem;color:var(--muted)">
-          <summary style="cursor:pointer;color:var(--blue)">📋 Kimi-only Apps Script (or use the full google-apps-script.gs)</summary>
+          <summary style="cursor:pointer;color:var(--blue)">📋 Provider-agnostic Apps Script proxy (Gemini by default — or use the full google-apps-script.gs)</summary>
           <ol style="margin:8px 0 8px 18px;line-height:1.6">
-            <li>Open <a href="https://script.google.com/" target="_blank" style="color:var(--blue)">script.google.com</a> → New project → paste below → set <code>YOUR_API_KEY</code>.</li>
+            <li>Open <a href="https://script.google.com/" target="_blank" style="color:var(--blue)">script.google.com</a> → New project → paste below → set <code>GEMINI_API_KEY</code> (free from <a href="https://aistudio.google.com/apikey" target="_blank" style="color:var(--blue)">AI Studio</a>) — or <code>MOONSHOT_API_KEY</code> for Kimi.</li>
             <li>Deploy → New deployment → <b>Web app</b> → Execute as: <b>Me</b> · Who has access: <b>Anyone</b>.</li>
             <li>Paste the <code>…/exec</code> URL into the proxy field (or reuse the same URL as cloud sync).</li>
           </ol>
-          <pre style="background:#0f1419;border:1px solid var(--border);border-radius:8px;padding:10px;overflow-x:auto;white-space:pre-wrap">function doPost(e) {
+          <pre style="background:#0f1419;border:1px solid var(--border);border-radius:8px;padding:10px;overflow-x:auto;white-space:pre-wrap">var GEMINI_API_KEY = 'YOUR_GEMINI_KEY';   // free: aistudio.google.com/apikey
+var MOONSHOT_API_KEY = 'YOUR_API_KEY';    // optional, paid
+
+function doPost(e) {
   var body = JSON.parse(e.postData.contents);
   if (body.action !== 'kimiVision') {
     return ContentService.createTextOutput(JSON.stringify({success:false,error:'unknown action'})).setMimeType(ContentService.MimeType.JSON);
   }
+  var base = String(body.base || 'https://generativelanguage.googleapis.com/v1beta/openai').replace(/\/+$/, '');
+  var isGemini = base.indexOf('generativelanguage.googleapis.com') !== -1;
+  var key = isGemini ? GEMINI_API_KEY : MOONSHOT_API_KEY;
   var payload = {
-    model: body.model || 'kimi-k3',
+    model: body.model || (isGemini ? 'gemini-2.5-flash' : 'kimi-k3'),
     temperature: 0.1,
     messages: [{ role: 'user', content: [
       { type: 'image_url', image_url: { url: body.image } },
       { type: 'text', text: body.prompt }
     ]}]
   };
-  var res = UrlFetchApp.fetch('https://api.moonshot.cn/v1/chat/completions', {
+  var res = UrlFetchApp.fetch(base + '/chat/completions', {
     method: 'post',
     contentType: 'application/json',
-    headers: { Authorization: 'Bearer YOUR_API_KEY' },
+    headers: { Authorization: 'Bearer ' + key },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   });
@@ -528,6 +540,9 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
   return ContentService.createTextOutput(JSON.stringify({success:false,error:data.error||data})).setMimeType(ContentService.MimeType.JSON);
 }</pre>
         </details>
+        <div style="margin-top:10px;font-size:.85rem;border-top:1px solid var(--border);padding-top:8px">
+          🧪 <a href="ocr-test.html" style="color:var(--blue)">Open the OCR shootout page</a> — run one photo through Gemini · OpenRouter · Kimi · Tesseract side-by-side and compare the raw text.
+        </div>
       </div>
     </div>
   </div>
@@ -6697,8 +6712,12 @@ function dataUrlToBase64(dataUrl) {
 
 // Settings accessors (localStorage — device only, never in DB/cloud sync)
 function getKimiApiKey(){ return (localStorage.getItem('kimiApiKey')||'').trim(); }
-function getKimiApiBase(){ return (localStorage.getItem('kimiApiBase')||'').trim() || 'https://api.moonshot.ai/v1'; }
-function getKimiModel(){ return (localStorage.getItem('kimiModel')||'').trim() || 'kimi-k3'; }
+function getKimiApiBase(){
+  const custom = (localStorage.getItem('kimiCustomBase')||'').trim();
+  if (custom) return custom;
+  return (localStorage.getItem('kimiApiBase')||'').trim() || 'https://api.moonshot.ai/v1';
+}
+function getKimiModel(){ return (localStorage.getItem('kimiModel')||'').trim(); }
 function getKimiProxyUrl(){
   const explicit = (localStorage.getItem('kimiProxyUrl')||'').trim();
   if (explicit) return explicit;
@@ -6708,13 +6727,31 @@ function getKimiProxyUrl(){
 function getKimiBases(){
   const preferred = getKimiApiBase().replace(/\/+$/, '');
   const remembered = (localStorage.getItem('kimiWorkingBase')||'').trim();
-  const all = ['https://api.moonshot.ai/v1', 'https://api.moonshot.cn/v1'];
+  // Moonshot keys are region-locked (.ai vs .cn), so try both regions there.
+  // Other providers (Gemini, OpenRouter, custom) are tried on their own base only.
+  const isMoonshot = /moonshot\.(ai|cn)/.test(preferred);
+  const all = isMoonshot
+    ? ['https://api.moonshot.ai/v1', 'https://api.moonshot.cn/v1']
+    : [preferred];
   const ordered = [];
   [remembered, preferred].concat(all).forEach(b => {
     const n = (b||'').replace(/\/+$/, '');
     if (n && ordered.indexOf(n) < 0) ordered.push(n);
   });
   return ordered;
+}
+
+// Default vision models per provider (tried in order; a stale ID just falls through).
+function getModelsForBase(base, cfgModel){
+  const clean = (base||'').replace(/\/+$/, '');
+  let defaults = ['kimi-k3','kimi-k2.5','moonshot-v1-128k-vision-preview','moonshot-v1-32k-vision-preview'];
+  if (/generativelanguage\.googleapis\.com/.test(clean)) {
+    defaults = ['gemini-2.5-flash','gemini-2.5-flash-lite','gemini-2.0-flash'];
+  } else if (/openrouter\.ai/.test(clean)) {
+    defaults = ['google/gemini-2.0-flash-exp:free','google/gemma-4-31b-it:free','nvidia/nemotron-nano-12b-v2-vl:free','qwen/qwen-2.5-vl-72b-instruct:free'];
+  }
+  const all = [cfgModel].concat(defaults).filter(m => m && String(m).trim());
+  return [...new Set(all)];
 }
 
 // Last error from kimiVisionAPI — shown by Test Connection & status messages.
@@ -6798,7 +6835,7 @@ async function kimiVisionAPI(imageDataUrl, prompt) {
       const response = await fetch(proxy, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ action: 'kimiVision', image: prepared, prompt: prompt || fallbackPrompt, model: cfgModel })
+        body: JSON.stringify({ action: 'kimiVision', image: prepared, prompt: prompt || fallbackPrompt, model: cfgModel, base: getKimiApiBase() })
       });
       const data = await response.json().catch(() => null);
       if (data && data.success && data.text) return String(data.text).trim();
@@ -6819,9 +6856,9 @@ async function kimiVisionAPI(imageDataUrl, prompt) {
     return null;
   }
 
-  const models = [...new Set([cfgModel, 'kimi-k3', 'kimi-k2.5', 'moonshot-v1-128k-vision-preview', 'moonshot-v1-32k-vision-preview'])];
   const bases = getKimiBases();
   for (const base of bases) {
+    const models = getModelsForBase(base, cfgModel);
     for (const model of models) {
       try {
         const text = await _kimiDirectCall(base, key, model, prepared, prompt || fallbackPrompt);
@@ -6831,7 +6868,7 @@ async function kimiVisionAPI(imageDataUrl, prompt) {
         const status = err && err.status;
         const msg = (err && err.message) || String(err);
         if (status === 401 || status === 403) {
-          _kimiLastError = 'HTTP ' + status + ' on ' + base.replace('https://','') + ' — trying the other Moonshot region (a .cn key will not work on .ai and vice versa).';
+          _kimiLastError = 'HTTP ' + status + ' on ' + base.replace('https://','') + ' — key rejected on this platform; trying the next endpoint.';
           break;
         }
         const modelIssue = status === 404 || /model|not found|invalid|does not exist|no such/i.test(msg);
@@ -7076,7 +7113,7 @@ window.kimiLedgerVision = kimiLedgerVision;
 async function testKimiVision() {
   setKimiVisionStatus('<span class="spinner"></span> Testing connection…');
   if (!getKimiApiKey() && !getKimiProxyUrl()) {
-    setKimiVisionStatus('⚠️ Paste an Apps Script …/exec URL (recommended) or a Moonshot key, then test again.', true);
+    setKimiVisionStatus('⚠️ Paste an API key (free Gemini key: aistudio.google.com/apikey) or an Apps Script …/exec URL, then test again.', true);
     return;
   }
   // Create a tiny test image (10x10 with "Hi")
@@ -7119,6 +7156,7 @@ document.addEventListener('DOMContentLoaded', () => {
   kvBind('kimiApiKey', 'kimiApiKey', true);
   kvBind('kimiApiBase', 'kimiApiBase', true);
   kvBind('kimiModel', 'kimiModel', true);
+  kvBind('kimiCustomBase', 'kimiCustomBase', true);
 
   // Show the current Kimi config in the status line
   kvBind('kimiProxyUrl', 'kimiProxyUrl', true);
@@ -7131,14 +7169,12 @@ document.addEventListener('DOMContentLoaded', () => {
   if (st) {
     const key = getKimiApiKey(), proxy = getKimiProxyUrl();
     if (proxy && key) st.innerHTML = '🔄 Proxy set · browser key …' + key.slice(-4) + ' (proxy used first to dodge CORS)';
-    else if (proxy) st.innerHTML = '🔄 Apps Script proxy ready (CORS-safe). Moonshot key lives in the script.';
-    else if (key) st.innerHTML = '🔑 Direct key …' + key.slice(-4) + ' — may fail on CORS. Add a proxy URL.';
-    else st.innerHTML = '📋 No proxy or key — Manual clipboard mode only.';
+    else if (proxy) st.innerHTML = '🔄 Apps Script proxy ready (CORS-safe). Provider key lives in the script.';
+    else if (key) st.innerHTML = '🔑 Direct key …' + key.slice(-4) + ' — Gemini/OpenRouter allow direct browser calls; Moonshot may hit CORS.';
+    else st.innerHTML = '📋 No proxy or key — Manual clipboard mode only (or add a free Gemini key 🆓).';
   }
 });
 
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a258da75cd208739',t:'MTc4NTc5NzEzMw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a261091cdc45af03',t:'MTc4NTg4MjkzMA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
-</html>ment.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
-</html>){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>

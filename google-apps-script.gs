@@ -10,11 +10,15 @@
  *   Who has access: Anyone
  * Paste the /exec URL into index.html as GAS_URL.
  *
- * Optional: set MOONSHOT_API_KEY below so the same web app can proxy Kimi Vision.
+ * Vision OCR proxy (kimiVision action) works with any OpenAI-compatible provider.
+ *   FREE option: set GEMINI_API_KEY below (aistudio.google.com/apikey — no card
+ *   needed). The app sends base=https://generativelanguage.googleapis.com/v1beta/openai.
+ *   PAID option (optional): set MOONSHOT_API_KEY for Kimi (Moonshot).
  */
 
-var MOONSHOT_API_KEY = 'YOUR_API_KEY'; // sk-…  (leave as-is if you only need sync)
-var MOONSHOT_BASE = 'https://api.moonshot.cn/v1';
+var MOONSHOT_API_KEY = 'YOUR_API_KEY'; // sk-…  (optional paid; only needed for Kimi)
+var GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY'; // AIza…  (FREE — aistudio.google.com/apikey)
+var MOONSHOT_BASE = 'https://api.moonshot.ai/v1';
 var DEFAULT_KIMI_MODEL = 'kimi-k3';
 
 var SHEETS = {
@@ -181,11 +185,14 @@ function saveAll_(body) {
 /* ══════════ KIMI VISION PROXY ══════════ */
 
 function kimiVision_(body) {
-  if (!MOONSHOT_API_KEY || MOONSHOT_API_KEY === 'YOUR_API_KEY') {
-    return { success: false, error: 'Set MOONSHOT_API_KEY in the Apps Script' };
+  var base = String(body.base || '').replace(/\/+$/, '');
+  var isGemini = base.indexOf('generativelanguage.googleapis.com') !== -1;
+  var key = isGemini ? GEMINI_API_KEY : MOONSHOT_API_KEY;
+  if (!key || key === 'YOUR_API_KEY' || key === 'YOUR_GEMINI_API_KEY') {
+    return { success: false, error: 'Set ' + (isGemini ? 'GEMINI_API_KEY (free from aistudio.google.com/apikey)' : 'MOONSHOT_API_KEY') + ' in the Apps Script' };
   }
   var payload = {
-    model: body.model || DEFAULT_KIMI_MODEL,
+    model: body.model || (isGemini ? 'gemini-2.5-flash' : DEFAULT_KIMI_MODEL),
     temperature: 0.1,
     messages: [{
       role: 'user',
@@ -195,17 +202,19 @@ function kimiVision_(body) {
       ]
     }]
   };
-  var bases = [MOONSHOT_BASE, 'https://api.moonshot.ai/v1', 'https://api.moonshot.cn/v1'];
+  // If the client chose a base, use it as-is. Otherwise fall back to Moonshot
+  // (and try both regions, since .ai / .cn keys are not interchangeable).
+  var bases = base ? [base] : [MOONSHOT_BASE, 'https://api.moonshot.ai/v1', 'https://api.moonshot.cn/v1'];
   var seen = {};
   var lastErr = null;
   for (var i = 0; i < bases.length; i++) {
-    var base = String(bases[i] || '').replace(/\/+$/, '');
-    if (!base || seen[base]) continue;
-    seen[base] = 1;
-    var res = UrlFetchApp.fetch(base + '/chat/completions', {
+    var b = String(bases[i] || '').replace(/\/+$/, '');
+    if (!b || seen[b]) continue;
+    seen[b] = 1;
+    var res = UrlFetchApp.fetch(b + '/chat/completions', {
       method: 'post',
       contentType: 'application/json',
-      headers: { Authorization: 'Bearer ' + MOONSHOT_API_KEY },
+      headers: { Authorization: 'Bearer ' + key },
       payload: JSON.stringify(payload),
       muteHttpExceptions: true
     });

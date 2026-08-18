@@ -1,4 +1,4 @@
-const CACHE_NAME = 'spax-v2';
+const CACHE_NAME = 'spax-v3';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'
@@ -30,19 +30,24 @@ self.addEventListener('activate', function(event) {
   self.clients.claim();
 });
 
-// Fetch: serve from cache when offline
+// Fetch: network-first for navigations so installed apps receive updates.
 self.addEventListener('fetch', function(event) {
+  if (event.request.mode === 'navigate') {
+    event.respondWith(
+      fetch(event.request).catch(function() {
+        // Offline fallback: return the cached app shell.
+        return caches.match('/SpaxButchery-Analytics/');
+      })
+    );
+    return;
+  }
+
   event.respondWith(
     caches.match(event.request).then(function(response) {
       if (response) {
         return response;
       }
-      return fetch(event.request).catch(function() {
-        // Offline fallback
-        if (event.request.destination === 'document') {
-          return caches.match('/SpaxButchery-Analytics/');
-        }
-      });
+      return fetch(event.request);
     })
   );
 });

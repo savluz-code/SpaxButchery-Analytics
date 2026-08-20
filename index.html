@@ -4271,9 +4271,11 @@ function extractPerson(details) {
     name = fromMatch[1].replace(phoneMatch ? phoneMatch[1] : "", "").trim();
   }
 
-  // Pattern 2: "- NAME" prefix
+  // Pattern 2: "- NAME" prefix ("…by 488519 - NCBA Bank Mpesa via API REF B2B…").
+  // "\s+via" terminates B2B/business rows at the service descriptor ("via API…"),
+  // which also keeps the capture clear of digits like the "2" in "B2B".
   if (!name) {
-    const dash = raw.match(/-\s*([A-Za-z][A-Za-z\s.'’\-]+?)(?:\s+Customer|\s+Merchant|\s+Payment|\s+OD|\s+Transfer|$)/i);
+    const dash = raw.match(/-\s*([A-Za-z][A-Za-z\s.'’\-]+?)(?:\s+Customer|\s+Merchant|\s+Payment|\s+OD|\s+Transfer|\s+via|$)/i);
     if (dash) name = dash[1];
   }
 
@@ -4292,6 +4294,10 @@ function extractPerson(details) {
   }
 
   name = name.replace(/[^A-Za-z\s.'’\-]/g, " ").replace(/\s+/g, " ").trim();
+  // Newer statements print the payer as "from - <phone> <NAME>" (dash BEFORE the
+  // phone): once the phone is stripped a stray "- " is left on the name. Also cut
+  // "via …" service tails (e.g. "Pay Merchant with OD via STK" descriptors).
+  name = name.replace(/\s+\bvia\b[\s\S]*$/i, " ").replace(/^[-–—\s]+|[-–—\s]+$/g, "").replace(/\s+/g, " ").trim();
   if (!name) name = contact || "M-Pesa Customer";
   return { name: toTitleCase(name), contact };
 }
@@ -4397,6 +4403,16 @@ function purgeMerchantData(quiet) {
   }
 }
 
+/* Incoming-money wording check. Tighter than the old /from|received|pay bill|buy goods/
+   filter: outflow rows such as "Pay Bill Kenya Power Paybill 888880" also contain
+   "pay bill", and "Withdraw ... from Till" contains "from". When a statement prints
+   "-" or nothing in the unused amount column (so a paid-in row shows only TWO amounts:
+   "Completed 1,500.00 - 21,605.00"), direction can't be read from the amount layout —
+   it has to come from the details text, so only unambiguous IN wording is accepted. */
+function isIncomingMpesaDetails(details) {
+  return /merchant\s+payment|pay\s+merchant|buy\s+goods|received\s+from|payment\s+received|funds\s+received|pay\s+bill[\s\S]*?\bfrom\b/i.test(String(details || ''));
+}
+
 function parseMpesaText(raw, sourceLabel) {
   sourceLabel = sourceLabel || "M-Pesa PDF/OCR";
   const text = normalizeMpesaText(raw).replace(/\n/g, " ").replace(/\s+/g, " ").trim();
@@ -4412,7 +4428,7 @@ function parseMpesaText(raw, sourceLabel) {
     const date = parseDate(m[2]);
     const time = m[3];
     let details = m[4].trim();
-    
+
     // We only take the FIRST amount (Paid In column)
     const amount = parseAmount(m[5]);
 
@@ -4422,7 +4438,7 @@ function parseMpesaText(raw, sourceLabel) {
     if (!/from|received|pay\s+bill|buy\s+goods/i.test(details)) continue;
 
     const person = extractPerson(details);
-    
+
     // EXCLUDE MERCHANT: Simon Musyoka's transactions (internal transfers/withdrawals)
     // must never be counted as revenue or added to the customer list.
     if (isMerchant(person.name) || isMerchant(details)) continue;
@@ -4430,7 +4446,46 @@ function parseMpesaText(raw, sourceLabel) {
     const key = receipt + '|' + date + '|' + time; // Key without amount to prevent double-dipping Balance
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
-    
+
+    txs.push({
+      receipt, date, time,
+      name: person.name,
+      contact: person.contact,
+      amount,
+      details,
+      source: sourceLabel
+    });
+  }
+
+  // Second pass — dash / blank-column statements. Newer Safaricom statements print
+  // "-" (or nothing) in the unused Withdrawn cell, so a paid-in row reads
+  // "…Completed 1,500.00 - 21,605.00" and never satisfies the strict 3-consecutive-
+  // amounts regex above — every paid-in transaction was silently dropped. The receipt
+  // may also come glued to the date in the text layer ("QGH7XTRN7Y2026-08-12"), so
+  // allow optional whitespace there (no \b between them: both sides are [A-Z0-9]).
+  // Rows already captured above are deduped by key.
+  const regex2 = /\b([A-Z0-9]{8,11})\s*(\d{4}[-\/]\d{2}[-\/]\d{2})\s+(\d{2}:\d{2}:\d{2})\s+([\s\S]*?)\bCompleted\s+((?:[-–—]\s*|[\d,]+\.\d{2}\s*){2,4})/gi;
+  while ((m = regex2.exec(text)) !== null) {
+    const cells = m[5].trim().split(/\s+/).filter(Boolean);
+    if (cells[0] === '-' || cells[0] === '–' || cells[0] === '—') continue; // Withdrawn-first row → money OUT
+    const amounts = cells.filter(c => /\d/.test(c));
+    if (amounts.length < 2) continue; // need Paid In AND Balance columns (guards against lone Balance pickup)
+    const amount = parseAmount(amounts[0]);
+    if (!amount || amount <= 0) continue;
+
+    const details = m[4].trim();
+    if (!isIncomingMpesaDetails(details)) continue; // strict wording — see isIncomingMpesaDetails
+
+    const person = extractPerson(details);
+    if (isMerchant(person.name) || isMerchant(details)) continue;
+
+    const receipt = cleanReceipt(m[1]);
+    const date = parseDate(m[2]);
+    const time = m[3];
+    const key = receipt + '|' + date + '|' + time;
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+
     txs.push({
       receipt, date, time,
       name: person.name,
@@ -4445,7 +4500,14 @@ function parseMpesaText(raw, sourceLabel) {
   const lines = raw.split(/\n/);
   for (const line of lines) {
     const cleanLine = line.replace(/\s+/g, ' ').trim();
-    const fallback = /\b([A-Z0-9]{8,11})\b.*?(\d{4}[-\/]\d{2}[-\/]\d{2}).*?(\d{2}:\d{2}:\d{2})/i;
+    // This fallback is for OCR text, where each row is its own short line. A PDF
+    // text layer arrives as one long line PER PAGE (many rows glued together) —
+    // those are already handled by the passes above; parsing them here would
+    // anchor a phantom row on a header token like "STATEMENT … UHGRO3BUSK 2026-…".
+    if (cleanLine.length > 500) continue;
+    // Receipt must sit directly before the date (whitespace/glued both OK) so a
+    // distant header word can never serve as the "receipt".
+    const fallback = /\b([A-Z0-9]{8,11})\s*(\d{4}[-\/]\d{2}[-\/]\d{2})\s+(\d{2}:\d{2}:\d{2})/i;
     const fm = cleanLine.match(fallback);
     if (!fm) continue;
     
@@ -4456,20 +4518,26 @@ function parseMpesaText(raw, sourceLabel) {
     // Find all decimal amounts after 'Completed'
     const afterStatus = cleanLine.split(/Completed/i)[1];
     if (!afterStatus) continue;
-    
+
+    // Dash-first row ("Completed - 2,000.00 19,605.00") → Withdrawn column → money OUT
+    if (/^\s*[-–—]/.test(afterStatus)) continue;
+
     const amountMatches = afterStatus.match(/[\d,]+\.\d{2}/g);
-    // REQUIRE all 3 columns (Paid In, Withdrawn, Balance)
-    if (!amountMatches || amountMatches.length < 3) continue;
-    
+    // Need at least Paid In + Balance. With all 3 columns present (older statements
+    // print 0.00 placeholders) keep the original loose wording filter; with only 2
+    // amounts visible the shape is ambiguous, so require strict IN wording.
+    if (!amountMatches || amountMatches.length < 2) continue;
+    const strictWording = amountMatches.length < 3;
+
     const amount = parseAmount(amountMatches[0]);
     if (!(amount > 0)) continue;
-    
+
     const key = receipt + '|' + date + '|' + time;
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
-    
+
     const details = cleanLine.split(/Completed/i)[0].replace(fm[1], '').replace(fm[2], '').replace(fm[3], '').replace(/\s+/g, ' ').trim();
-    if (!/from|received|pay\s+bill|buy\s+goods/i.test(details)) continue;
+    if (!(strictWording ? isIncomingMpesaDetails(details) : /from|received|pay\s+bill|buy\s+goods/i.test(details))) continue;
     
     const person = extractPerson(details || cleanLine);
     

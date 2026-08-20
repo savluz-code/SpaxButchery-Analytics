@@ -4271,9 +4271,11 @@ function extractPerson(details) {
     name = fromMatch[1].replace(phoneMatch ? phoneMatch[1] : "", "").trim();
   }
 
-  // Pattern 2: "- NAME" prefix
+  // Pattern 2: "- NAME" prefix ("…by 488519 - NCBA Bank Mpesa via API REF B2B…").
+  // "\s+via" terminates B2B/business rows at the service descriptor ("via API…"),
+  // which also keeps the capture clear of digits like the "2" in "B2B".
   if (!name) {
-    const dash = raw.match(/-\s*([A-Za-z][A-Za-z\s.'’\-]+?)(?:\s+Customer|\s+Merchant|\s+Payment|\s+OD|\s+Transfer|$)/i);
+    const dash = raw.match(/-\s*([A-Za-z][A-Za-z\s.'’\-]+?)(?:\s+Customer|\s+Merchant|\s+Payment|\s+OD|\s+Transfer|\s+via|$)/i);
     if (dash) name = dash[1];
   }
 
@@ -4292,6 +4294,10 @@ function extractPerson(details) {
   }
 
   name = name.replace(/[^A-Za-z\s.'’\-]/g, " ").replace(/\s+/g, " ").trim();
+  // Newer statements print the payer as "from - <phone> <NAME>" (dash BEFORE the
+  // phone): once the phone is stripped a stray "- " is left on the name. Also cut
+  // "via …" service tails (e.g. "Pay Merchant with OD via STK" descriptors).
+  name = name.replace(/\s+\bvia\b[\s\S]*$/i, " ").replace(/^[-–—\s]+|[-–—\s]+$/g, "").replace(/\s+/g, " ").trim();
   if (!name) name = contact || "M-Pesa Customer";
   return { name: toTitleCase(name), contact };
 }
@@ -4494,7 +4500,14 @@ function parseMpesaText(raw, sourceLabel) {
   const lines = raw.split(/\n/);
   for (const line of lines) {
     const cleanLine = line.replace(/\s+/g, ' ').trim();
-    const fallback = /\b([A-Z0-9]{8,11})\b.*?(\d{4}[-\/]\d{2}[-\/]\d{2}).*?(\d{2}:\d{2}:\d{2})/i;
+    // This fallback is for OCR text, where each row is its own short line. A PDF
+    // text layer arrives as one long line PER PAGE (many rows glued together) —
+    // those are already handled by the passes above; parsing them here would
+    // anchor a phantom row on a header token like "STATEMENT … UHGRO3BUSK 2026-…".
+    if (cleanLine.length > 500) continue;
+    // Receipt must sit directly before the date (whitespace/glued both OK) so a
+    // distant header word can never serve as the "receipt".
+    const fallback = /\b([A-Z0-9]{8,11})\s*(\d{4}[-\/]\d{2}[-\/]\d{2})\s+(\d{2}:\d{2}:\d{2})/i;
     const fm = cleanLine.match(fallback);
     if (!fm) continue;
     

@@ -11,7 +11,7 @@
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract.min.js"></script>
 <style>
 :root{--bg:#0f1419;--card:#1a2129;--card2:#212b35;--border:#2c3945;--red:#e63946;--red2:#ff6b6b;
---amber:#f4a261;--green:#2ec4b6;--blue:#4cc9f0;--purple:#b298dc;--text:#e8edf2;--muted:#8b9aa7;--wa:#25d366}
+--amber:#f4a261;--gold:#ffd166;--green:#2ec4b6;--blue:#4cc9f0;--purple:#b298dc;--text:#e8edf2;--muted:#8b9aa7;--wa:#25d366}
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',system-ui,sans-serif}
 body{background:var(--bg);color:var(--text);min-height:100vh}
 header{background:linear-gradient(135deg,#7f1d1d,#450a0a);padding:20px 28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;border-bottom:3px solid var(--red)}
@@ -46,7 +46,10 @@ tr:hover td{background:rgba(255,255,255,.03)}
 .b-vip{background:rgba(180,120,255,.15);color:var(--purple)}.b-active{background:rgba(46,196,182,.15);color:var(--green)}
 .b-risk{background:rgba(244,162,97,.15);color:var(--amber)}.b-lost{background:rgba(230,57,70,.15);color:var(--red2)}
 .b-valid{background:rgba(76,201,240,.12);color:var(--blue)}.b-masked{background:rgba(139,154,167,.15);color:var(--muted)}
-.b-new{background:rgba(46,196,182,.25);color:var(--green)}.b-dup{background:rgba(230,57,70,.25);color:var(--red2)}
+.b-new{background:rgba(46,196,182,.25);color:var(--green)}
+/* 🌱 first-ever purchase falls in the current calendar month — acquisition,
+   distinct from the teal NEW badge which means 'found in the latest import' */
+.b-month{background:rgba(255,209,102,.18);color:var(--gold);border:1px solid rgba(255,209,102,.35)}.b-dup{background:rgba(230,57,70,.25);color:var(--red2)}
 input,select,textarea{background:var(--card2);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-size:.9rem;font-family:inherit}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--red)}
 textarea{width:100%;resize:vertical}
@@ -142,6 +145,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
         <option value="active">Active (≤30d)</option><option value="risk">At Risk (61–90d)</option>
         <option value="lost">Lost (90+d)</option><option value="overdue">⚡ Overdue (Personal Cadence)</option><option value="masked">Masked contacts</option>
         <option value="new" title="Customers first seen in the most recent import — not on the baseline and not already added by an earlier statement">🆕 New (latest import)</option>
+        <option value="firstmonth" title="Customers whose first-ever purchase falls in the current calendar month">🌱 New this month (first purchase)</option>
       </select>
       <input type="date" id="lastVisitFrom" title="Last visit from" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
       <input type="date" id="lastVisitTo" title="Last visit to" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
@@ -3758,6 +3762,7 @@ $('kpiGrid').innerHTML=`
   <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">Gross Sales</div></div>
   <div class="kpi" style="--accent:var(--amber)"><div class="label">Cadence Overdue</div><div class="value">${ipiOverdueCount}</div><div class="detail">⚡ 1.8x personal IPI delay</div></div>
   <div class="kpi" style="--accent:var(--blue)"><div class="label">Customers</div><div class="value">${totCust.toLocaleString()}</div><div class="detail">${cs.filter(c=>c.isNew).length} new in latest import</div></div>
+  <div class="kpi" style="--accent:var(--gold)"><div class="label">New This Month</div><div class="value">${newThisMonthCustomers().length.toLocaleString()}</div><div class="detail">🌱 first purchase in ${monthLabelEAT()}</div></div>
   <div class="kpi" style="--accent:var(--purple)"><div class="label">Tracked VIPs</div><div class="value">${cs.filter(c=>c.spent>=10000).length}</div><div class="detail">KES 10K+ lifetime</div></div>
 `;
   if(revChart)revChart.destroy();if(segChart)segChart.destroy();
@@ -3779,7 +3784,8 @@ function renderCustTable(){
   rows=rows.filter(c=>{if(f==='vip')return c.spent>=10000;if(f==='active')return c.days<=30;
     if(f==='risk')return c.days>60&&c.days<=90;if(f==='lost')return c.days>90;
     if(f==='overdue')return customerIPI(c).status==='overdue';
-    if(f==='masked')return c.masked;if(f==='new')return c.isNew;return true;});
+    if(f==='masked')return c.masked;if(f==='new')return c.isNew;
+    if(f==='firstmonth')return isNewThisMonth(c);return true;});
   if(lvFrom)rows=rows.filter(c=>c.lastVisit&&c.lastVisit>=lvFrom);
   if(lvTo)rows=rows.filter(c=>c.lastVisit&&c.lastVisit<=lvTo);
   if(pf && pf !== 'all') rows = rows.filter(c => customerProduct(c) === pf);
@@ -3817,7 +3823,7 @@ function renderCustTable(){
     const reach=c.masked||c.contact==='—'?'—':`<button class="btn wa sm" onclick="quickWA('${normPhone(c.contact)}','${c.name.replace(/'/g,"\\'")}')">WA</button>
       <button class="btn blue sm" onclick="quickSMS('${normPhone(c.contact)}','${c.name.replace(/'/g,"\\'")}')">SMS</button>`;
     return `<tr style="cursor:pointer" onclick="showCustomerDetail('${c.name.replace(/'/g,"\'")}')">
-    <td>${c.name}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${c.isNew?' <span class="badge b-new">NEW</span>':''}</td>
+    <td>${c.name}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${c.isNew?' <span class="badge b-new">NEW</span>':''}${isNewThisMonth(c)?' <span class="badge b-month" title="First-ever purchase this month">🌱 NEW THIS MONTH</span>':''}</td>
     <td><span class="badge ${c.masked?'b-masked':'b-valid'}">${c.contact}</span></td>
     <td>${kes(c.spent)}</td><td>${c.visits}</td><td>KES ${Math.round(c.spent/Math.max(c.visits,1))}</td>
     <td>${c.days}</td><td>${first}</td><td>${last}</td><td><span class="badge ${cls}">${st}</span>${customerIPI(c).status==='overdue'?' <span class="badge b-risk" title="Personal purchase interval overdue">⚡ Overdue</span>':''}</td>
@@ -4625,6 +4631,33 @@ function reconcileNewFlags() {
     c.isNew = should;
   });
   return changed;
+}
+
+/* ══════════ NEW THIS MONTH (isNewThisMonth) ══════════
+   A SECOND, independent notion of "new" — a business/acquisition signal rather
+   than a data-provenance one:
+
+     isNew          (teal  NEW)            = discovered by the latest import batch
+     isNewThisMonth (gold  NEW THIS MONTH) = firstVisit falls in the current
+                                             calendar month (EAT)
+
+   It is derived, never stored, so it expires by itself on the 1st of each month
+   and can never go stale in localStorage or the cloud sheet. A customer can
+   carry both badges (imported this month, first ever purchase this month) or
+   just one (e.g. imported today but first bought in March = teal only). */
+function currentMonthEAT(){ return getTodayEAT().slice(0, 7); }
+function isNewThisMonth(c, month){
+  const m = month || currentMonthEAT();
+  return !!(c && c.firstVisit && String(c.firstVisit).slice(0, 7) === m);
+}
+function newThisMonthCustomers(month){
+  const m = month || currentMonthEAT();
+  return (DB.customers || []).filter(c => isNewThisMonth(c, m));
+}
+function monthLabelEAT(month){
+  const m = month || currentMonthEAT();
+  const d = new Date(m + '-01T00:00:00');
+  return isNaN(d) ? m : d.toLocaleString('en-GB', { month: 'long', year: 'numeric' });
 }
 
 /* Opens a new import batch: everything flagged NEW by a previous import stops
@@ -5741,6 +5774,7 @@ function dataSnapshot(){
   const act=cs.filter(c=>c.days<=30).length,rk=cs.filter(c=>c.days>60&&c.days<=90).length,lo=cs.filter(c=>c.days>90).length;
   let s=`BUSINESS DATA — SpaxButchery (Kenyan butchery, M-Pesa payments)\n`;
   s+=`Totals: revenue KES ${(REPORT.totalRevenue+DB.importedRev).toLocaleString()}, ${REPORT.totalCustomers+cs.filter(c=>c.isNew).length} customers, ${REPORT.totalTxns+DB.importedTx} transactions, avg KES 749/customer, KES 227/txn.\n`;
+  s+=`New this month (first-ever purchase in ${monthLabelEAT()}): ${newThisMonthCustomers().length}.\n`;
   s+=`Segments (report-wide): Active≤30d:336, AtRisk 61-90d:147, Lost90+d:1186. Reachable contacts: ${(((REPORT.valid+DB.resolved)/REPORT.totalCustomers)*100).toFixed(0)}%.\n`;
   s+=`Tracked list: Active:${act} AtRisk:${rk} Lost:${lo}.\n`;
   s+=`Monthly revenue: `+DB.monthly.labels.map((l,i)=>`${l}:${DB.monthly.revenue[i]}`).join(', ')+'.\n';
@@ -6531,6 +6565,7 @@ function showCustomerDetail(name){
     <span class="badge ${statusOf(c.days)[1]}">${statusOf(c.days)[0]}</span>
     ${c.spent>=10000?'<span class="badge b-vip">VIP</span>':''}
     ${c.isNew?'<span class="badge b-new">NEW</span>':''}
+    ${isNewThisMonth(c)?`<span class="badge b-month" title="First-ever purchase in ${monthLabelEAT()}">🌱 NEW THIS MONTH</span>`:''}
   `;
   $('modalTotal').textContent = kes(c.spent);
   $('modalVisits').textContent = c.visits;

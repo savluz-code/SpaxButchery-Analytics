@@ -84,6 +84,7 @@ function loadAll_() {
     c.masked = toBool_(c.masked);
     c.isNew = toBool_(c.isNew);
     c.isSeed = toBool_(c.isSeed);
+    c.newBatch = Number(c.newBatch) || 0;
     c.seedSpent = Number(c.seedSpent) || 0;
     c.seedVisits = Number(c.seedVisits) || 0;
   });
@@ -145,7 +146,11 @@ function saveAll_(body) {
 
   writeObjects_(ss.getSheetByName(SHEETS.customers), body.customers || [], [
     'name', 'contact', 'spent', 'visits', 'days',
-    'firstVisit', 'lastVisit', 'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits'
+    'firstVisit', 'lastVisit', 'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits',
+    // newBatch = the import batch that first created this customer. isNew is
+    // derived from it (newBatch === settings.importBatch), so it must survive
+    // the cloud round-trip or NEW badges would be lost/stuck after a sync.
+    'newBatch'
   ]);
 
   var monthly = body.monthly || { labels: [], revenue: [] };

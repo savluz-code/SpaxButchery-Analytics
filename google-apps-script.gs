@@ -74,9 +74,11 @@ function doPost(e) {
 
 function loadAll_() {
   ensureSheets_();
-  var ss = SpreadsheetApp.getActive();
+  var ss = getSpreadsheet_();
 
-  var customers = rowsToObjects_(ss.getSheetByName(SHEETS.customers));
+  var customers = rowsToObjects_(ss.getSheetByName(SHEETS.customers)).filter(function (c) {
+    return String(c.name || '').trim() !== '';
+  });
   customers.forEach(function (c) {
     c.spent = Number(c.spent) || 0;
     c.visits = Number(c.visits) || 0;
@@ -141,10 +143,15 @@ function loadAll_() {
 /* ══════════ SAVE ══════════ */
 
 function saveAll_(body) {
-  ensureSheets_();
-  var ss = SpreadsheetApp.getActive();
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    ensureSheets_();
+    var ss = getSpreadsheet_();
 
-  writeObjects_(ss.getSheetByName(SHEETS.customers), body.customers || [], [
+  writeObjects_(ss.getSheetByName(SHEETS.customers), (body.customers || []).filter(function (c) {
+    return c && String(c.name || '').trim() !== '';
+  }), [
     'name', 'contact', 'spent', 'visits', 'days',
     'firstVisit', 'lastVisit', 'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits',
     // newBatch = the import batch that first created this customer. isNew is
@@ -192,6 +199,9 @@ function saveAll_(body) {
     return { key: k, value: 1 };
   });
   writeObjects_(ss.getSheetByName(SHEETS.seen), seenRows, ['key', 'value']);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /* ══════════ KIMI VISION PROXY ══════════ */
@@ -277,8 +287,33 @@ function kimiVision_(body) {
 
 /* ══════════ SHEET HELPERS ══════════ */
 
+// Works both when this project is bound to a Google Sheet and when it is a
+// standalone web-app project (the setup instructions use a standalone project).
+// A standalone project has no active spreadsheet, which used to make every
+// load/save fail with "Cannot read properties of null". Keep the created
+// spreadsheet ID in Script Properties so every web-app request uses the same
+// cloud database.
+function getSpreadsheet_() {
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty('SPAX_SPREADSHEET_ID');
+  if (id) {
+    try { return SpreadsheetApp.openById(id); }
+    catch (err) { props.deleteProperty('SPAX_SPREADSHEET_ID'); }
+  }
+
+  var active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active) {
+    props.setProperty('SPAX_SPREADSHEET_ID', active.getId());
+    return active;
+  }
+
+  var created = SpreadsheetApp.create('SpaxButchery Cloud Data');
+  props.setProperty('SPAX_SPREADSHEET_ID', created.getId());
+  return created;
+}
+
 function ensureSheets_() {
-  var ss = SpreadsheetApp.getActive();
+  var ss = getSpreadsheet_();
   Object.keys(SHEETS).forEach(function (k) {
     if (!ss.getSheetByName(SHEETS[k])) ss.insertSheet(SHEETS[k]);
   });

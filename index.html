@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpaxButchery | Analytics v2.5</title>
+<title>SpaxButchery | Analytics v2.5.1</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
@@ -98,7 +98,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
 
 <header>
   <div class="logo"><div class="logo-badge">🥩</div>
-    <div><h1>SpaxButchery Analytics <span style="color:var(--amber);font-size:.85rem">v2.5</span></h1>
+    <div><h1>SpaxButchery Analytics <span style="color:var(--amber);font-size:.85rem">v2.5.1</span></h1>
     <div class="sub">Ledger Photo Capture · Kimi Vision AI · PDF + OCR Statements · Dedup Guard · AI Accounts · Bulk SMS</div></div></div>
   <div class="hdr-stats">
     <div class="hdr-stat">👥 <span id="hCust">—</span> customers</div>
@@ -822,7 +822,7 @@ function doPost(e) {
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.5 · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.5.1 · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -6521,8 +6521,26 @@ $('rebuildModal').addEventListener('click', e => { if(e.target === $('rebuildMod
 
 // Register Service Worker for PWA
 if('serviceWorker' in navigator){
+  // Auto-update: when a NEW service worker takes control (skipWaiting +
+  // clients.claim in sw.js), reload exactly once so the app immediately runs
+  // the freshly deployed code instead of a stale copy. The `refreshing` guard
+  // prevents a reload loop — after the reload the same SW is in control, so
+  // no further controllerchange fires.
+  let swRefreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', function(){
+    if(swRefreshing) return;
+    swRefreshing = true;
+    console.log('New version deployed — reloading…');
+    location.reload();
+  });
   navigator.serviceWorker.register('sw.js').then(function(reg){
     console.log('SW registered');
+    // Check for a newer sw.js proactively: GitHub Pages serves files with a
+    // ~10 min HTTP cache, so without these hints a phone can sit on a stale
+    // build long after a deploy. Check on tab focus and every 5 minutes.
+    function checkForUpdate(){ reg.update().catch(function(){}); }
+    document.addEventListener('visibilitychange', function(){ if(!document.hidden) checkForUpdate(); });
+    setInterval(checkForUpdate, 5*60*1000);
     // Request push notification permission
     if('PushManager' in window){
       reg.pushManager.getSubscription().then(function(sub){

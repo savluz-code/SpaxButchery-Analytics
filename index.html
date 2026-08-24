@@ -906,6 +906,63 @@ function cloudCustomerKey(customer) {
   return String(customer && customer.name || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+// Customers discovered by ANY statement import since the report baseline.
+// `isNew` is strictly a LATEST-batch flag (reconcileNewFlags clears it as soon
+// as a newer statement is imported), so counting isNew made customers silently
+// drop out of the Customers KPI after every new import. newBatch is stamped
+// permanently and round-trips the Customers sheet, so it is the stable signal.
+function importedCustomerCount(customers) {
+  return (customers || (DB && DB.customers) || []).filter(c =>
+    c && !c.isSeed && (Number(c.newBatch) || 0) > 0
+  ).length;
+}
+
+// Rebuild the revenue/transaction counters from the synced DATA sheets when the
+// Settings sheet is missing, stale or was zeroed (an older Apps Script
+// deployment, a merge pushed from a fresh/reset device, a hand-edited sheet).
+// Customers, Transactions and Monthly keep flowing during sync, so the app
+// LOOKS synced while the headline KPIs stay pinned to the frozen report
+// baseline (the "1250K" bug). The reconstruction mirrors exactly what
+// importTransactions accumulates: statement rows of non-seed customers count
+// in full, seed customers only count the share of their history beyond the
+// seed baseline (seedSpent/seedVisits), backfillOnly rows never count, and
+// merchant rows never count. max() against the stored counter means healing
+// can only ever RAISE a counter that real data proves is too low.
+function healImportedAggregates() {
+  const merchantRow = (typeof isMerchant === 'function')
+    ? isMerchant
+    : function () { return false; };
+  const txs = (DB.transactions || []).filter(t => t && !t.backfillOnly && !merchantRow(t.name));
+
+  const seedByKey = new Map();
+  (DB.customers || []).forEach(c => {
+    if (c && c.isSeed) seedByKey.set(cloudCustomerKey(c), c);
+  });
+
+  let rev = 0, txCount = 0;
+  const seedSums = new Map(), seedCounts = new Map();
+  txs.forEach(t => {
+    const key = cloudCustomerKey(t);
+    if (seedByKey.has(key)) {
+      seedSums.set(key, (seedSums.get(key) || 0) + (Number(t.amount) || 0));
+      seedCounts.set(key, (seedCounts.get(key) || 0) + 1);
+    } else {
+      rev += Number(t.amount) || 0;
+      txCount++;
+    }
+  });
+  seedSums.forEach((sum, key) => {
+    const seed = seedByKey.get(key);
+    rev += Math.max(0, sum - (Number(seed.seedSpent) || 0));
+    txCount += Math.max(0, (seedCounts.get(key) || 0) - (Number(seed.seedVisits) || 0));
+  });
+
+  const healed = {};
+  if (rev > (Number(DB.importedRev) || 0)) { DB.importedRev = rev; healed.importedRev = true; }
+  if (txCount > (Number(DB.importedTx) || 0)) { DB.importedTx = txCount; healed.importedTx = true; }
+  return healed;
+}
+
 async function loadFromCloud() {
   if (GAS_URL.includes('YOUR_SCRIPT')) {
     console.warn('GAS_URL not configured');
@@ -990,14 +1047,25 @@ async function loadFromCloud() {
       lastSyncTime = new Date();
       showSyncStatus('✅ Synced ' + lastSyncTime.toLocaleTimeString());
       reconcileNewFlags();
-      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
       const cloudFixed = repairDates();
       if(cloudFixed > 0) console.log('Cloud sync repair: fixed', cloudFixed, 'customers');
       // Merchant exclusion is non-negotiable: if the cloud sheet still carries
       // Simon Musyoka (the Merchant), scrub him from the merged data now.
       purgeMerchantData();
+      // Heal the revenue/transaction counters from the synced data BEFORE the
+      // UI refresh. The Settings sheet is the only channel that carries them;
+      // when it is missing/stale/zeroed the customer list still updates while
+      // the Total Revenue KPI stays frozen at the report baseline (1250K).
+      const healed = healImportedAggregates();
+      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
       refreshAll();
       setCloudWriteHold(false);
+      if (healed.importedRev || healed.importedTx) {
+        // Push the corrected counters so the cloud Settings sheet self-repairs
+        // and every device converges on the real totals.
+        showSyncStatus('🔧 Synced + repaired revenue counters from cloud data');
+        saveToCloud(true, true);
+      }
       lastCloudError = '';
       return true;
     } else {
@@ -3828,6 +3896,17 @@ window.addEventListener('hashchange',()=>activateTab(location.hash.slice(1)));
 /* ══════════ OVERVIEW ══════════ */
 Chart.defaults.color='#8b9aa7';Chart.defaults.borderColor='rgba(255,255,255,.06)';
 let revChart,segChart;
+
+/* Headline totals — ALWAYS derived through these helpers so the header chips,
+   KPI grid, AI briefing and Spax-AI answers can never disagree.
+   Revenue = frozen report baseline + everything imported beyond it (the
+   counter is healed from the synced data after every cloud pull, so a stale
+   Settings sheet can no longer pin the total at the 1250K baseline).
+   Customers = report baseline + every customer an import discovered
+   (importedCustomerCount — stable across import batches, unlike isNew). */
+function totalRevenueAll(){ return REPORT.totalRevenue + (Number(DB.importedRev) || 0); }
+function totalCustomerCount(){ return REPORT.totalCustomers + importedCustomerCount(DB.customers); }
+
 function refreshAll(){
   const today = new Date(getTodayEAT());
 
@@ -3844,8 +3923,9 @@ function refreshAll(){
     }
   });
   const cs=DB.customers;
-  const totRev=REPORT.totalRevenue+DB.importedRev;
-  const totCust=REPORT.totalCustomers+cs.filter(c=>c.isNew).length;
+  const totRev=totalRevenueAll();
+  const newCount=cs.filter(c=>c.isNew).length;
+  const totCust=totalCustomerCount();
   const validPct=(((REPORT.valid+DB.resolved)/totCust)*100).toFixed(1);
   $('hCust').textContent=totCust.toLocaleString();
   $('hRev').textContent=(totRev/1000).toFixed(0)+'K';
@@ -3855,9 +3935,9 @@ function refreshAll(){
   const ipiOverdueCount = cs.filter(c => customerIPI(c).status === 'overdue').length;
 
 $('kpiGrid').innerHTML=`
-  <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">Gross Sales</div></div>
+  <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">Gross Sales${DB.importedRev ? ' · ' + kes(DB.importedRev) + ' imported' : ''}</div></div>
   <div class="kpi" style="--accent:var(--amber)"><div class="label">Cadence Overdue</div><div class="value">${ipiOverdueCount}</div><div class="detail">⚡ 1.8x personal IPI delay</div></div>
-  <div class="kpi" style="--accent:var(--blue)"><div class="label">Customers</div><div class="value">${totCust.toLocaleString()}</div><div class="detail">${cs.filter(c=>c.isNew).length} new in latest import</div></div>
+  <div class="kpi" style="--accent:var(--blue)"><div class="label">Customers</div><div class="value">${totCust.toLocaleString()}</div><div class="detail">${newCount} new in latest import · ${importedCustomerCount(cs)} since report</div></div>
   <div class="kpi" style="--accent:var(--gold)"><div class="label">New This Month</div><div class="value">${newThisMonthCustomers().length.toLocaleString()}</div><div class="detail">🌱 first purchase in ${monthLabelEAT()}</div></div>
   <div class="kpi" style="--accent:var(--purple)"><div class="label">Tracked VIPs</div><div class="value">${cs.filter(c=>c.spent>=10000).length}</div><div class="detail">KES 10K+ lifetime</div></div>
 `;
@@ -5875,7 +5955,7 @@ function dataSnapshot(){
   const cs=[...DB.customers].sort((a,b)=>b.spent-a.spent);
   const act=cs.filter(c=>c.days<=30).length,rk=cs.filter(c=>c.days>60&&c.days<=90).length,lo=cs.filter(c=>c.days>90).length;
   let s=`BUSINESS DATA — SpaxButchery (Kenyan butchery, M-Pesa payments)\n`;
-  s+=`Totals: revenue KES ${(REPORT.totalRevenue+DB.importedRev).toLocaleString()}, ${REPORT.totalCustomers+cs.filter(c=>c.isNew).length} customers, ${REPORT.totalTxns+DB.importedTx} transactions, avg KES 749/customer, KES 227/txn.\n`;
+  s+=`Totals: revenue KES ${totalRevenueAll().toLocaleString()}, ${totalCustomerCount().toLocaleString()} customers, ${REPORT.totalTxns+DB.importedTx} transactions, avg KES 749/customer, KES 227/txn.\n`;
   s+=`New this month (first-ever purchase in ${monthLabelEAT()}): ${newThisMonthCustomers().length}.\n`;
   s+=`Segments (report-wide): Active≤30d:336, AtRisk 61-90d:147, Lost90+d:1186. Reachable contacts: ${(((REPORT.valid+DB.resolved)/REPORT.totalCustomers)*100).toFixed(0)}%.\n`;
   s+=`Tracked list: Active:${act} AtRisk:${rk} Lost:${lo}.\n`;
@@ -5914,7 +5994,7 @@ function aiAnswer(q){
     return `🏆 <b>Top ${Math.min(n,l.length)}:</b>\n`+listC([...l].sort((a,b)=>b.spent-a.spent),n);}
   if(/revenue summary|total revenue|how much/.test(q)){
     const b=DB.monthly.revenue.indexOf(Math.max(...DB.monthly.revenue));
-    return `💰 Total: ${kes(REPORT.totalRevenue+DB.importedRev)} (${kes(DB.importedRev)} imported)\nBest month: <b>${DB.monthly.labels[b]}</b> — ${kes(DB.monthly.revenue[b])}\nAvg/customer KES 749 · Avg/txn KES 227`;}
+    return `💰 Total: ${kes(totalRevenueAll())} (${kes(DB.importedRev)} imported)\nBest month: <b>${DB.monthly.labels[b]}</b> — ${kes(DB.monthly.revenue[b])}\nAvg/customer KES 749 · Avg/txn KES 227`;}
   if(/at risk|risk/.test(q)){const r=cs.filter(c=>c.days>60&&c.days<=90).sort((a,b)=>b.spent-a.spent);
     return `🟠 <b>${r.length} at risk (61–90d):</b>\n`+listC(r,10)+`\n\n💡 Outreach → At Risk → ⚡ One-Click Bulk SMS.`;}
   if(/lost|churn/.test(q)){const l=cs.filter(c=>c.days>90).sort((a,b)=>b.spent-a.spent);
@@ -6506,6 +6586,7 @@ async function forcePullFromCloud(){
       DB.importedRev = Number(data.settings.importedRev) || 0;
       DB.importedTx = Number(data.settings.importedTx) || 0;
       DB.resolved = Number(data.settings.resolved) || 0;
+      DB.importBatch = Number(data.settings.importBatch) || 0;
     }
     if(data.transactions){
       DB.transactions = data.transactions.map(t => ({...t, amount: Number(t.amount) || 0}));
@@ -6521,14 +6602,27 @@ async function forcePullFromCloud(){
       data.transactions.forEach(tx => { markSeen(tx); });
     }
 
+    // The pulled Settings sheet may be stale or zeroed (old deployment, or a
+    // merge previously pushed from a fresh device). After the merchant purge
+    // (which rolls merchant revenue back out of the counters), rebuild the
+    // counters from the pulled transactions/customers, then re-derive NEW
+    // flags against the pulled batch counter so badges match the pulled data.
+    reconcileNewFlags();
+
     // Persist locally without echoing the just-pulled response back over the
     // cloud. Merchant cleanup below performs its own save only when needed.
     save(false);
     purgeMerchantData();
+    const healed = healImportedAggregates();
+    if (healed.importedRev || healed.importedTx) {
+      save(false);
+      // Repair the cloud Settings sheet too, so the corrected counters stick.
+      saveToCloud(true, true);
+    }
     refreshAll();
     setCloudWriteHold(false);
     lastCloudError = '';
-    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pulled ' + DB.customers.length + ' customers from cloud. Local data overwritten.</span>';
+    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pulled ' + DB.customers.length + ' customers from cloud. Local data overwritten.' + (healed.importedRev || healed.importedTx ? ' Repaired revenue counters from the pulled data.' : '') + '</span>';
     showSyncStatus('✅ Force pull complete');
   }catch(err){
     $('syncActionResult').innerHTML = '<span style="color:var(--red)">❌ Pull failed: ' + err.message + '</span>';
@@ -6585,6 +6679,30 @@ async function smartMergeCloud(){
     DB.customers = merged;
     if(data.monthly) DB.monthly = data.monthly;
 
+    // Settings must MERGE (max), never be skipped: this function ends by
+    // pushing local settings back to the cloud, so ignoring the cloud values
+    // previously overwrote the cloud revenue counters with whatever THIS
+    // device happened to have — a fresh/reset device zeroed them for every
+    // other device, pinning the Total Revenue KPI at the frozen report
+    // baseline (1250K) even though customer data kept syncing.
+    if (data.settings && typeof data.settings === 'object') {
+      DB.importedRev = Math.max(Number(data.settings.importedRev) || 0, Number(DB.importedRev) || 0);
+      DB.importedTx = Math.max(Number(data.settings.importedTx) || 0, Number(DB.importedTx) || 0);
+      DB.resolved = Math.max(Number(data.settings.resolved) || 0, Number(DB.resolved) || 0);
+      DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
+    }
+
+    // Merge cloud transactions too (dedup-guarded via the seen map) so a fresh
+    // device ends up with the full history — the healing step below rebuilds
+    // the revenue counters from exactly these rows.
+    (data.transactions || []).forEach(t => {
+      if (!t) return;
+      const row = { ...t, amount: Number(t.amount) || 0 };
+      if (isSeen(row)) return;
+      DB.transactions.push(row);
+      markSeen(row);
+    });
+
     // Merge customerTx: keep both local and cloud transactions
     const cloudTx = data.customerTx || {};
     Object.keys(cloudTx).forEach(name => {
@@ -6603,12 +6721,16 @@ async function smartMergeCloud(){
     // Merchant exclusion survives merges too — drop any Simon Musyoka records
     // pulled in from the cloud BEFORE persisting/pushing, so both copies are scrubbed.
     purgeMerchantData(true);
+    // Rebuild the counters from the merged data (cloud Settings may have been
+    // stale/zeroed) and re-derive NEW flags against the merged batch counter.
+    const healed = healImportedAggregates();
+    reconcileNewFlags();
     // Persist once locally, then perform one serialized cloud write below.
     save(false);
     if (!await saveToCloud(true, true)) throw new Error(lastCloudError || 'Cloud did not confirm the save');
     refreshAll();
 
-    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Merged: ' + merged.length + ' total (' + localOnly + ' local-only kept, ' + cloudOnly + ' cloud-only added, ' + mergedCount + ' merged)</span>';
+    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Merged: ' + merged.length + ' total (' + localOnly + ' local-only kept, ' + cloudOnly + ' cloud-only added, ' + mergedCount + ' merged)' + (healed.importedRev || healed.importedTx ? ' · repaired revenue counters from merged data' : '') + '</span>';
     showSyncStatus('✅ Smart merge complete');
   }catch(err){
     $('syncActionResult').innerHTML = '<span style="color:var(--red)">❌ Merge failed: ' + err.message + '</span>';
@@ -6642,9 +6764,9 @@ function updateSyncDetails(){
     <b>Sync Mode:</b> ${mode}<br>
     <b>Cloud Writes:</b> ${writeState}<br>
     <b>Last Sync:</b> ${lastSync}<br>
-    <b>Local Customers:</b> ${DB.customers.length.toLocaleString()}<br>
+    <b>Local Customers:</b> ${DB.customers.length.toLocaleString()} tracked (${totalCustomerCount().toLocaleString()} incl. report baseline)<br>
     <b>Local Transactions:</b> ${(DB.transactions || []).length.toLocaleString()}<br>
-    <b>Imported Revenue:</b> KSh ${(DB.importedRev || 0).toLocaleString()}<br>
+    <b>Total Revenue:</b> KSh ${totalRevenueAll().toLocaleString()} (baseline ${REPORT.totalRevenue.toLocaleString()} + imported ${(DB.importedRev || 0).toLocaleString()})<br>
     <b>Contacts Resolved:</b> ${DB.resolved || 0}<br>
     <b>GAS URL:</b> ${GAS_URL.includes('YOUR_SCRIPT') ? '<span style="color:var(--red)">Not configured</span>' : '<span style="color:var(--green)">Connected</span>'}
   `;

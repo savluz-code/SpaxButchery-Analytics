@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpaxButchery | Analytics v2.5</title>
+<title>SpaxButchery | Analytics v2.5.1</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
@@ -98,7 +98,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
 
 <header>
   <div class="logo"><div class="logo-badge">🥩</div>
-    <div><h1>SpaxButchery Analytics <span style="color:var(--amber);font-size:.85rem">v2.5</span></h1>
+    <div><h1>SpaxButchery Analytics <span style="color:var(--amber);font-size:.85rem">v2.5.1</span></h1>
     <div class="sub">Ledger Photo Capture · Kimi Vision AI · PDF + OCR Statements · Dedup Guard · AI Accounts · Bulk SMS</div></div></div>
   <div class="hdr-stats">
     <div class="hdr-stat">👥 <span id="hCust">—</span> customers</div>
@@ -822,7 +822,7 @@ function doPost(e) {
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.5 · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.5.1 · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -835,6 +835,133 @@ const GAS_URL = 'https://script.google.com/macros/s/AKfycbylY3y9P1eRH8QdH_d6_nG8
 let SYNC_MODE = 'auto';
 let isSyncing = false;
 let lastSyncTime = null;
+let lastCloudError = '';
+
+// A reset/restore is a local recovery operation. Keep automatic writes paused
+// until a successful pull/merge or an explicitly confirmed Force Push proves
+// which copy should win. Persist the hold so a reload during an outage cannot
+// later upload seed data over a recoverable cloud database.
+const CLOUD_WRITE_HOLD_KEY = 'spaxCloudWriteHold_v1';
+let cloudWritesSuspended = false;
+try { cloudWritesSuspended = localStorage.getItem(CLOUD_WRITE_HOLD_KEY) === '1'; }
+catch (_) { /* storage can be unavailable in private/restricted WebViews */ }
+function setCloudWriteHold(hold) {
+  cloudWritesSuspended = !!hold;
+  try {
+    if (cloudWritesSuspended) localStorage.setItem(CLOUD_WRITE_HOLD_KEY, '1');
+    else localStorage.removeItem(CLOUD_WRITE_HOLD_KEY);
+  } catch (_) { /* the in-memory guard still protects this session */ }
+}
+
+// Apps Script redirects requests and can return an HTML error page. Parsing it
+// directly as JSON hid the useful deployment/setup error behind "Unexpected <".
+async function cloudRequest(url, options = {}) {
+  // Older Android WebViews do not expose AbortController. Sync should still work
+  // there; only the timeout is unavailable in that compatibility fallback.
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), 30000) : null;
+  try {
+    const requestOptions = { ...options, redirect: 'follow' };
+    if (controller) requestOptions.signal = controller.signal;
+    const response = await fetch(url, requestOptions);
+    const text = await response.text();
+    if (!response.ok) throw new Error('Cloud returned HTTP ' + response.status);
+    let data;
+    try { data = JSON.parse(text); }
+    catch (_) { throw new Error('Cloud returned a non-JSON response. Check that the Apps Script web app is deployed as “Anyone” and use its /exec URL.'); }
+    if (!data || data.success !== true) {
+      const detail = data && data.error ? (typeof data.error === 'string' ? data.error : JSON.stringify(data.error)) : 'Unknown cloud error';
+      throw new Error(detail);
+    }
+    return data;
+  } catch (err) {
+    if (controller && controller.signal.aborted) {
+      throw new Error('Cloud request timed out after 30 seconds. Local data was kept; check the connection and try again.');
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function cloudLoad() {
+  if (!GAS_URL || GAS_URL.includes('YOUR_SCRIPT')) throw new Error('Cloud URL is not configured. Paste your Apps Script /exec URL into GAS_URL.');
+  return cloudRequest(GAS_URL + (GAS_URL.includes('?') ? '&' : '?') + 'action=load');
+}
+
+// A formatted but empty Sheet can produce object rows with blank values. Those
+// are not customers and must never be allowed to trigger a pull or overwrite.
+function validCloudCustomers(customers) {
+  return (Array.isArray(customers) ? customers : []).reduce((valid, customer) => {
+    if (!customer || typeof customer !== 'object') return valid;
+    const name = String(customer.name || '').trim().replace(/\s+/g, ' ');
+    if (name) valid.push({ ...customer, name });
+    return valid;
+  }, []);
+}
+
+// Customer names are identifiers during sync. Match harmless capitalization and
+// whitespace differences so "Jane Doe" and "JANE  DOE" do not become duplicates.
+function cloudCustomerKey(customer) {
+  return String(customer && customer.name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+// Customers discovered by ANY statement import since the report baseline.
+// `isNew` is strictly a LATEST-batch flag (reconcileNewFlags clears it as soon
+// as a newer statement is imported), so counting isNew made customers silently
+// drop out of the Customers KPI after every new import. newBatch is stamped
+// permanently and round-trips the Customers sheet, so it is the stable signal.
+function importedCustomerCount(customers) {
+  return (customers || (DB && DB.customers) || []).filter(c =>
+    c && !c.isSeed && (Number(c.newBatch) || 0) > 0
+  ).length;
+}
+
+// Rebuild the revenue/transaction counters from the synced DATA sheets when the
+// Settings sheet is missing, stale or was zeroed (an older Apps Script
+// deployment, a merge pushed from a fresh/reset device, a hand-edited sheet).
+// Customers, Transactions and Monthly keep flowing during sync, so the app
+// LOOKS synced while the headline KPIs stay pinned to the frozen report
+// baseline (the "1250K" bug). The reconstruction mirrors exactly what
+// importTransactions accumulates: statement rows of non-seed customers count
+// in full, seed customers only count the share of their history beyond the
+// seed baseline (seedSpent/seedVisits), backfillOnly rows never count, and
+// merchant rows never count. max() against the stored counter means healing
+// can only ever RAISE a counter that real data proves is too low.
+function healImportedAggregates() {
+  const merchantRow = (typeof isMerchant === 'function')
+    ? isMerchant
+    : function () { return false; };
+  const txs = (DB.transactions || []).filter(t => t && !t.backfillOnly && !merchantRow(t.name));
+
+  const seedByKey = new Map();
+  (DB.customers || []).forEach(c => {
+    if (c && c.isSeed) seedByKey.set(cloudCustomerKey(c), c);
+  });
+
+  let rev = 0, txCount = 0;
+  const seedSums = new Map(), seedCounts = new Map();
+  txs.forEach(t => {
+    const key = cloudCustomerKey(t);
+    if (seedByKey.has(key)) {
+      seedSums.set(key, (seedSums.get(key) || 0) + (Number(t.amount) || 0));
+      seedCounts.set(key, (seedCounts.get(key) || 0) + 1);
+    } else {
+      rev += Number(t.amount) || 0;
+      txCount++;
+    }
+  });
+  seedSums.forEach((sum, key) => {
+    const seed = seedByKey.get(key);
+    rev += Math.max(0, sum - (Number(seed.seedSpent) || 0));
+    txCount += Math.max(0, (seedCounts.get(key) || 0) - (Number(seed.seedVisits) || 0));
+  });
+
+  const healed = {};
+  if (rev > (Number(DB.importedRev) || 0)) { DB.importedRev = rev; healed.importedRev = true; }
+  if (txCount > (Number(DB.importedTx) || 0)) { DB.importedTx = txCount; healed.importedTx = true; }
+  return healed;
+}
 
 async function loadFromCloud() {
   if (GAS_URL.includes('YOUR_SCRIPT')) {
@@ -843,21 +970,21 @@ async function loadFromCloud() {
   }
   try {
     showSyncStatus('⏳ Loading from cloud...');
-    const response = await fetch(GAS_URL + '?action=load');
-    const data = await response.json();
+    const data = await cloudLoad();
 
-    // Check if cloud has actual data
-    const hasCloudData = data.customers && data.customers.length > 0;
+    // Ignore formatting/blank rows returned by a Sheet. They are not cloud data.
+    const cloudCustomers = validCloudCustomers(data.customers);
+    const hasCloudData = cloudCustomers.length > 0;
 
     if (hasCloudData) {
       // Cloud has data — MERGE with local (never lose imported customers)
-      const cloudMap = new Map(data.customers.map(c => [c.name, c]));
-      const localMap = new Map(DB.customers.map(c => [c.name, c]));
+      const cloudMap = new Map(cloudCustomers.map(c => [cloudCustomerKey(c), c]));
+      const localMap = new Map((DB.customers || []).map(c => [cloudCustomerKey(c), c]));
 
       // Start with all local customers
       const merged = [];
-      localMap.forEach((localCust, name) => {
-        const cloudCust = cloudMap.get(name);
+      localMap.forEach((localCust, key) => {
+        const cloudCust = cloudMap.get(key);
         if (cloudCust) {
           // Customer exists in both — use whichever has more visits/higher spent
           const useCloud = (cloudCust.visits || 0) > (localCust.visits || 0) || 
@@ -865,10 +992,12 @@ async function loadFromCloud() {
           merged.push({
             ...localCust,
             ...(useCloud ? cloudCust : {}),
+            // Preserve the local display spelling when only case/spacing differs.
+            name: localCust.name || cloudCust.name,
             firstVisit: stripTime(useCloud ? (cloudCust.firstVisit || localCust.firstVisit) : (localCust.firstVisit || cloudCust.firstVisit)),
             lastVisit: stripTime(useCloud ? (cloudCust.lastVisit || localCust.lastVisit) : (localCust.lastVisit || cloudCust.lastVisit))
           });
-          cloudMap.delete(name);
+          cloudMap.delete(key);
         } else {
           // Only in local — keep it (imported customer!)
           merged.push(localCust);
@@ -883,65 +1012,94 @@ async function loadFromCloud() {
       }));
 
       DB.customers = merged;
-      if (data.monthly && data.monthly.labels) {
+      // Treat empty/missing optional sheets as a partial cloud response during
+      // automatic sync. Keep the known-good local collection instead of erasing
+      // it; an intentional destructive replacement remains available via Pull.
+      if (data.monthly && Array.isArray(data.monthly.labels) && data.monthly.labels.length && Array.isArray(data.monthly.revenue)) {
         DB.monthly = data.monthly;
       }
-      if (data.settings) {
-        DB.importedRev = Number(data.settings.importedRev) || 0;
-        DB.importedTx = Number(data.settings.importedTx) || 0;
-        DB.resolved = Number(data.settings.resolved) || 0;
+      if (data.settings && typeof data.settings === 'object') {
+        // Automatic merge is monotonic for cumulative counters. A stale or
+        // title-mismatched Settings sheet must not reset live totals to zero.
+        DB.importedRev = Math.max(Number(data.settings.importedRev) || 0, Number(DB.importedRev) || 0);
+        DB.importedTx = Math.max(Number(data.settings.importedTx) || 0, Number(DB.importedTx) || 0);
+        DB.resolved = Math.max(Number(data.settings.resolved) || 0, Number(DB.resolved) || 0);
         // Keep the highest batch counter seen across devices so a stale cloud
         // value can't resurrect NEW badges that a newer local import retired.
         DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
       }
-      if (data.transactions) {
+      if (Array.isArray(data.transactions) && data.transactions.length) {
         DB.transactions = data.transactions.map(t => ({...t, amount: Number(t.amount) || 0}));
       }
-      if (data.customerTx) {
+      if (data.customerTx && typeof data.customerTx === 'object' && !Array.isArray(data.customerTx) && Object.keys(data.customerTx).length) {
         DB.customerTx = data.customerTx;
-      } else {
-        DB.transactions = []; }
+      }
       // Restore the dedup map in the SAME key format the import guard uses
       // (transactionKey / markSeen). The old 'R:'/'C:' scheme never matched those
       // keys, so after any sync re-importing an already-loaded statement slipped
       // past the guard and double-counted revenue & stats.
-      if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
+      if (data.seen && typeof data.seen === 'object' && !Array.isArray(data.seen) && Object.keys(data.seen).length) {
         DB.seen = data.seen;
-      } else if (data.transactions) {
+      } else if (Array.isArray(data.transactions) && data.transactions.length) {
         DB.seen = {};
         data.transactions.forEach(tx => { markSeen(tx); });
       }
       lastSyncTime = new Date();
       showSyncStatus('✅ Synced ' + lastSyncTime.toLocaleTimeString());
       reconcileNewFlags();
-      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
       const cloudFixed = repairDates();
       if(cloudFixed > 0) console.log('Cloud sync repair: fixed', cloudFixed, 'customers');
       // Merchant exclusion is non-negotiable: if the cloud sheet still carries
       // Simon Musyoka (the Merchant), scrub him from the merged data now.
       purgeMerchantData();
-      refreshAll();
-      return true;
-    } else {
-      // Cloud is empty — push local data to cloud (not just seed!)
-      showSyncStatus('☁️ Cloud empty — pushing local data...');
-      await saveToCloud(true);
-      lastSyncTime = new Date();
-      showSyncStatus('✅ Local data pushed to cloud ' + lastSyncTime.toLocaleTimeString());
+      // Heal the revenue/transaction counters from the synced data BEFORE the
+      // UI refresh. The Settings sheet is the only channel that carries them;
+      // when it is missing/stale/zeroed the customer list still updates while
+      // the Total Revenue KPI stays frozen at the report baseline (1250K).
+      const healed = healImportedAggregates();
       localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
       refreshAll();
+      setCloudWriteHold(false);
+      if (healed.importedRev || healed.importedTx) {
+        // Push the corrected counters so the cloud Settings sheet self-repairs
+        // and every device converges on the real totals.
+        showSyncStatus('🔧 Synced + repaired revenue counters from cloud data');
+        saveToCloud(true, true);
+      }
+      lastCloudError = '';
       return true;
+    } else {
+      // Never automatically seed/overwrite a cloud that looks empty. It may be
+      // a damaged sheet, a new deployment, or a temporary read issue.
+      showSyncStatus('⚠️ Cloud has no valid customers — not overwriting it');
+      return false;
     }
   } catch (err) {
+    lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud load failed:', err);
-    showSyncStatus('❌ Cloud failed — using local data');
+    showSyncStatus('❌ Cloud failed — using local data: ' + lastCloudError);
     return false;
   }
 }
 
-async function saveToCloud(force = false) {
-  if (SYNC_MODE === 'local') return;
-  if (isSyncing && !force) return;
+async function saveToCloud(force = false, allowHeldWrite = false) {
+  lastCloudError = '';
+  if (!GAS_URL || GAS_URL.includes('YOUR_SCRIPT')) {
+    lastCloudError = 'Cloud URL is not configured. Paste your Apps Script /exec URL into GAS_URL.';
+    return false;
+  }
+  if (SYNC_MODE === 'local' && !force) return false;
+  if (cloudWritesSuspended && !allowHeldWrite) {
+    lastCloudError = 'Automatic cloud writes are paused after a local reset/restore. Pull or merge the cloud copy, or use Force Push to replace it.';
+    showSyncStatus('⏸️ Cloud writes paused — local data is safe');
+    return false;
+  }
+  // Never overlap POSTs: a slower stale request could otherwise finish last and
+  // overwrite a newer explicit save.
+  if (isSyncing) {
+    lastCloudError = 'Another cloud save is already in progress. Wait a moment and try again.';
+    return false;
+  }
 
   isSyncing = true;
   showSyncStatus('⏳ Saving to cloud...');
@@ -971,22 +1129,25 @@ async function saveToCloud(force = false) {
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
 
-    const response = await fetch(GAS_URL, {
+    const result = await cloudRequest(GAS_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
+      // text/plain keeps this a CORS-simple request for Apps Script web apps.
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(payload)
     });
 
-    const result = await response.json();
     if (result.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
-    } else {
-      showSyncStatus('❌ Save failed: ' + (result.error || 'Unknown'));
+      lastCloudError = '';
+      if (allowHeldWrite) setCloudWriteHold(false);
+      return true;
     }
   } catch (err) {
+    lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);
-    showSyncStatus('❌ Save failed — saved locally');
+    showSyncStatus('❌ Save failed: ' + lastCloudError);
+    return false;
   } finally {
     isSyncing = false;
   }
@@ -2787,7 +2948,7 @@ function seedDB(){
 }
 function load(){
   try{
-    // Initialize DB with seed data FIRST (so saveToCloud has data to push if cloud is empty)
+    // Initialize local data first, then attempt a non-destructive cloud merge.
     const s=localStorage.getItem('spaxDB_v23');
     if(s){
       DB=JSON.parse(s);
@@ -2876,7 +3037,7 @@ function load(){
     // rows, history and revenue. Persists automatically if anything was removed.
     purgeMerchantData();
 
-    // Now try cloud sync (will push seed data if cloud is empty)
+    // Now try cloud sync. Empty/invalid cloud responses never trigger a push.
     return loadFromCloud().then(cloudLoaded => {
       if (!cloudLoaded) {
         // Cloud failed — keep local data and refresh
@@ -2891,15 +3052,18 @@ function load(){
       if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
     });
   }catch(e){
+    // Corrupt/unreadable local storage is not proof that the cloud is empty.
+    // Keep seed recovery local until the user successfully pulls or confirms a push.
+    setCloudWriteHold(true);
     DB=seedDB();
     refreshAll();
     const fixed = repairDates();
     if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
     return Promise.resolve();
   }
-}function save(){
+}function save(syncCloud = true){
   localStorage.setItem('spaxDB_v23',JSON.stringify(DB));
-  if (SYNC_MODE === 'auto') {
+  if (syncCloud && SYNC_MODE === 'auto') {
     saveToCloud();
   }
   refreshAll();
@@ -3732,6 +3896,17 @@ window.addEventListener('hashchange',()=>activateTab(location.hash.slice(1)));
 /* ══════════ OVERVIEW ══════════ */
 Chart.defaults.color='#8b9aa7';Chart.defaults.borderColor='rgba(255,255,255,.06)';
 let revChart,segChart;
+
+/* Headline totals — ALWAYS derived through these helpers so the header chips,
+   KPI grid, AI briefing and Spax-AI answers can never disagree.
+   Revenue = frozen report baseline + everything imported beyond it (the
+   counter is healed from the synced data after every cloud pull, so a stale
+   Settings sheet can no longer pin the total at the 1250K baseline).
+   Customers = report baseline + every customer an import discovered
+   (importedCustomerCount — stable across import batches, unlike isNew). */
+function totalRevenueAll(){ return REPORT.totalRevenue + (Number(DB.importedRev) || 0); }
+function totalCustomerCount(){ return REPORT.totalCustomers + importedCustomerCount(DB.customers); }
+
 function refreshAll(){
   const today = new Date(getTodayEAT());
 
@@ -3749,6 +3924,7 @@ function refreshAll(){
   });
   const cs=DB.customers;
   const totRev=getProductStats().totalRevenue;
+  const newCount=cs.filter(c=>c.isNew).length;
   const totCust=DB.customers.length;
   const validPct=(((REPORT.valid+DB.resolved)/totCust)*100).toFixed(1);
   $('hCust').textContent=totCust.toLocaleString();
@@ -3759,9 +3935,9 @@ function refreshAll(){
   const ipiOverdueCount = cs.filter(c => customerIPI(c).status === 'overdue').length;
 
 $('kpiGrid').innerHTML=`
-  <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">Gross Sales</div></div>
+  <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">Gross Sales${DB.importedRev ? ' · ' + kes(DB.importedRev) + ' imported' : ''}</div></div>
   <div class="kpi" style="--accent:var(--amber)"><div class="label">Cadence Overdue</div><div class="value">${ipiOverdueCount}</div><div class="detail">⚡ 1.8x personal IPI delay</div></div>
-  <div class="kpi" style="--accent:var(--blue)"><div class="label">Customers</div><div class="value">${totCust.toLocaleString()}</div><div class="detail">${cs.filter(c=>c.isNew).length} new in latest import</div></div>
+  <div class="kpi" style="--accent:var(--blue)"><div class="label">Customers</div><div class="value">${totCust.toLocaleString()}</div><div class="detail">${newCount} new in latest import · ${importedCustomerCount(cs)} since report</div></div>
   <div class="kpi" style="--accent:var(--gold)"><div class="label">New This Month</div><div class="value">${newThisMonthCustomers().length.toLocaleString()}</div><div class="detail">🌱 first purchase in ${monthLabelEAT()}</div></div>
   <div class="kpi" style="--accent:var(--purple)"><div class="label">Tracked VIPs</div><div class="value">${cs.filter(c=>c.spent>=10000).length}</div><div class="detail">KES 10K+ lifetime</div></div>
 `;
@@ -5679,7 +5855,12 @@ $('resetBtn').onclick = () => {
   const msg = hasCustom
     ? 'Reset to your saved baseline (the last “Save Current as Local Baseline”)? Imports after that save will be dropped.'
     : 'Reset ALL data to the original report seed (imports, dedup history, resolved contacts)?';
-  if (confirm(msg)) { DB = seedDB(); save(); toast(hasCustom ? '↺ Restored your saved baseline' : '↺ Reset complete'); }
+  if (confirm(msg)) {
+    setCloudWriteHold(true);
+    DB = seedDB();
+    save();
+    toast((hasCustom ? '↺ Restored your saved baseline' : '↺ Reset complete') + ' · cloud unchanged');
+  }
 };
 
 /* ══════════ SAVE CURRENT AS LOCAL BASELINE / EXPORT JS SEED CODE ══════════ */
@@ -5704,12 +5885,13 @@ function restoreLocalBaseline(){
     const saved = JSON.parse(raw);
     const n = saved.customers ? saved.customers.length : 0;
     if(!confirm(`Restore the saved local baseline (${n} customers)? This OVERWRITES current data.`)) return { ok: false };
+    setCloudWriteHold(true);
     DB = saved;
     if(!DB.seen) DB.seen = {};
     if(!DB.transactions) DB.transactions = [];
     if(!DB.customerTx) DB.customerTx = {};
     save();
-    toast('♻️ Local baseline restored');
+    toast('♻️ Local baseline restored · cloud unchanged');
     return { ok: true, customers: n };
   } catch(e) {
     toast('❌ Could not restore baseline: ' + e.message);
@@ -5773,7 +5955,7 @@ function dataSnapshot(){
   const cs=[...DB.customers].sort((a,b)=>b.spent-a.spent);
   const act=cs.filter(c=>c.days<=30).length,rk=cs.filter(c=>c.days>60&&c.days<=90).length,lo=cs.filter(c=>c.days>90).length;
   let s=`BUSINESS DATA — SpaxButchery (Kenyan butchery, M-Pesa payments)\n`;
-  s+=`Totals: revenue KES ${(REPORT.totalRevenue+DB.importedRev).toLocaleString()}, ${REPORT.totalCustomers+cs.filter(c=>c.isNew).length} customers, ${REPORT.totalTxns+DB.importedTx} transactions, avg KES 749/customer, KES 227/txn.\n`;
+  s+=`Totals: revenue KES ${totalRevenueAll().toLocaleString()}, ${totalCustomerCount().toLocaleString()} customers, ${REPORT.totalTxns+DB.importedTx} transactions, avg KES 749/customer, KES 227/txn.\n`;
   s+=`New this month (first-ever purchase in ${monthLabelEAT()}): ${newThisMonthCustomers().length}.\n`;
   s+=`Segments (report-wide): Active≤30d:336, AtRisk 61-90d:147, Lost90+d:1186. Reachable contacts: ${(((REPORT.valid+DB.resolved)/REPORT.totalCustomers)*100).toFixed(0)}%.\n`;
   s+=`Tracked list: Active:${act} AtRisk:${rk} Lost:${lo}.\n`;
@@ -5812,7 +5994,7 @@ function aiAnswer(q){
     return `🏆 <b>Top ${Math.min(n,l.length)}:</b>\n`+listC([...l].sort((a,b)=>b.spent-a.spent),n);}
   if(/revenue summary|total revenue|how much/.test(q)){
     const b=DB.monthly.revenue.indexOf(Math.max(...DB.monthly.revenue));
-    return `💰 Total: ${kes(REPORT.totalRevenue+DB.importedRev)} (${kes(DB.importedRev)} imported)\nBest month: <b>${DB.monthly.labels[b]}</b> — ${kes(DB.monthly.revenue[b])}\nAvg/customer KES 749 · Avg/txn KES 227`;}
+    return `💰 Total: ${kes(totalRevenueAll())} (${kes(DB.importedRev)} imported)\nBest month: <b>${DB.monthly.labels[b]}</b> — ${kes(DB.monthly.revenue[b])}\nAvg/customer KES 749 · Avg/txn KES 227`;}
   if(/at risk|risk/.test(q)){const r=cs.filter(c=>c.days>60&&c.days<=90).sort((a,b)=>b.spent-a.spent);
     return `🟠 <b>${r.length} at risk (61–90d):</b>\n`+listC(r,10)+`\n\n💡 Outreach → At Risk → ⚡ One-Click Bulk SMS.`;}
   if(/lost|churn/.test(q)){const l=cs.filter(c=>c.days>90).sort((a,b)=>b.spent-a.spent);
@@ -6339,8 +6521,26 @@ $('rebuildModal').addEventListener('click', e => { if(e.target === $('rebuildMod
 
 // Register Service Worker for PWA
 if('serviceWorker' in navigator){
+  // Auto-update: when a NEW service worker takes control (skipWaiting +
+  // clients.claim in sw.js), reload exactly once so the app immediately runs
+  // the freshly deployed code instead of a stale copy. The `refreshing` guard
+  // prevents a reload loop — after the reload the same SW is in control, so
+  // no further controllerchange fires.
+  let swRefreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', function(){
+    if(swRefreshing) return;
+    swRefreshing = true;
+    console.log('New version deployed — reloading…');
+    location.reload();
+  });
   navigator.serviceWorker.register('sw.js').then(function(reg){
     console.log('SW registered');
+    // Check for a newer sw.js proactively: GitHub Pages serves files with a
+    // ~10 min HTTP cache, so without these hints a phone can sit on a stale
+    // build long after a deploy. Check on tab focus and every 5 minutes.
+    function checkForUpdate(){ reg.update().catch(function(){}); }
+    document.addEventListener('visibilitychange', function(){ if(!document.hidden) checkForUpdate(); });
+    setInterval(checkForUpdate, 5*60*1000);
     // Request push notification permission
     if('PushManager' in window){
       reg.pushManager.getSubscription().then(function(sub){
@@ -6371,7 +6571,8 @@ async function forcePushToCloud(){
 
   showSyncStatus('🚀 Force pushing local data...');
   try{
-    await saveToCloud(true);
+    const saved = await saveToCloud(true, true);
+    if (!saved) throw new Error(lastCloudError || 'Cloud did not confirm the save');
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.</span>';
     showSyncStatus('✅ Force push complete');
   }catch(err){
@@ -6385,15 +6586,15 @@ async function forcePullFromCloud(){
 
   showSyncStatus('⬇️ Force pulling from cloud...');
   try{
-    const response = await fetch(GAS_URL + '?action=load');
-    const data = await response.json();
+    const data = await cloudLoad();
 
-    if(!data.customers || data.customers.length === 0){
+    const cloudCustomers = validCloudCustomers(data.customers);
+    if(cloudCustomers.length === 0){
       $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud is empty. Nothing to pull.</span>';
       return;
     }
 
-    DB.customers = data.customers.map(c => ({
+    DB.customers = cloudCustomers.map(c => ({
       ...c,
       firstVisit: stripTime(c.firstVisit),
       lastVisit: stripTime(c.lastVisit)
@@ -6403,6 +6604,7 @@ async function forcePullFromCloud(){
       DB.importedRev = Number(data.settings.importedRev) || 0;
       DB.importedTx = Number(data.settings.importedTx) || 0;
       DB.resolved = Number(data.settings.resolved) || 0;
+      DB.importBatch = Number(data.settings.importBatch) || 0;
     }
     if(data.transactions){
       DB.transactions = data.transactions.map(t => ({...t, amount: Number(t.amount) || 0}));
@@ -6418,10 +6620,27 @@ async function forcePullFromCloud(){
       data.transactions.forEach(tx => { markSeen(tx); });
     }
 
-    save();
+    // The pulled Settings sheet may be stale or zeroed (old deployment, or a
+    // merge previously pushed from a fresh device). After the merchant purge
+    // (which rolls merchant revenue back out of the counters), rebuild the
+    // counters from the pulled transactions/customers, then re-derive NEW
+    // flags against the pulled batch counter so badges match the pulled data.
+    reconcileNewFlags();
+
+    // Persist locally without echoing the just-pulled response back over the
+    // cloud. Merchant cleanup below performs its own save only when needed.
+    save(false);
     purgeMerchantData();
+    const healed = healImportedAggregates();
+    if (healed.importedRev || healed.importedTx) {
+      save(false);
+      // Repair the cloud Settings sheet too, so the corrected counters stick.
+      saveToCloud(true, true);
+    }
     refreshAll();
-    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pulled ' + DB.customers.length + ' customers from cloud. Local data overwritten.</span>';
+    setCloudWriteHold(false);
+    lastCloudError = '';
+    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pulled ' + DB.customers.length + ' customers from cloud. Local data overwritten.' + (healed.importedRev || healed.importedTx ? ' Repaired revenue counters from the pulled data.' : '') + '</span>';
     showSyncStatus('✅ Force pull complete');
   }catch(err){
     $('syncActionResult').innerHTML = '<span style="color:var(--red)">❌ Pull failed: ' + err.message + '</span>';
@@ -6432,32 +6651,32 @@ async function forcePullFromCloud(){
 async function smartMergeCloud(){
   showSyncStatus('🔀 Merging local + cloud...');
   try{
-    const response = await fetch(GAS_URL + '?action=load');
-    const data = await response.json();
+    const data = await cloudLoad();
 
-    if(!data.customers || data.customers.length === 0){
-      $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud is empty. Pushing local data instead...</span>';
-      await saveToCloud(true);
+    const cloudCustomers = validCloudCustomers(data.customers);
+    if(cloudCustomers.length === 0){
+      $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud has no valid customers. No data was changed — recover a known-good cloud copy before pushing.</span>';
       return;
     }
 
-    const cloudMap = new Map(data.customers.map(c => [c.name, c]));
-    const localMap = new Map(DB.customers.map(c => [c.name, c]));
+    const cloudMap = new Map(cloudCustomers.map(c => [cloudCustomerKey(c), c]));
+    const localMap = new Map((DB.customers || []).map(c => [cloudCustomerKey(c), c]));
     const merged = [];
     let localOnly = 0, cloudOnly = 0, mergedCount = 0;
 
     // Merge locals
-    localMap.forEach((localCust, name) => {
-      const cloudCust = cloudMap.get(name);
+    localMap.forEach((localCust, key) => {
+      const cloudCust = cloudMap.get(key);
       if(cloudCust){
         const useCloud = (cloudCust.visits||0) > (localCust.visits||0) || (cloudCust.spent||0) > (localCust.spent||0);
         merged.push({
           ...localCust,
           ...(useCloud ? cloudCust : {}),
+          name: localCust.name || cloudCust.name,
           firstVisit: (() => { const f1 = stripTime(cloudCust.firstVisit), f2 = stripTime(localCust.firstVisit); return (f1 && f2) ? (f1 < f2 ? f1 : f2) : (f1 || f2 || ""); })(),
           lastVisit: (() => { const l1 = stripTime(cloudCust.lastVisit), l2 = stripTime(localCust.lastVisit); return (l1 && l2) ? (l1 > l2 ? l1 : l2) : (l1 || l2 || ""); })()
         });
-        cloudMap.delete(name);
+        cloudMap.delete(key);
         mergedCount++;
       }else{
         merged.push(localCust);
@@ -6478,6 +6697,30 @@ async function smartMergeCloud(){
     DB.customers = merged;
     if(data.monthly) DB.monthly = data.monthly;
 
+    // Settings must MERGE (max), never be skipped: this function ends by
+    // pushing local settings back to the cloud, so ignoring the cloud values
+    // previously overwrote the cloud revenue counters with whatever THIS
+    // device happened to have — a fresh/reset device zeroed them for every
+    // other device, pinning the Total Revenue KPI at the frozen report
+    // baseline (1250K) even though customer data kept syncing.
+    if (data.settings && typeof data.settings === 'object') {
+      DB.importedRev = Math.max(Number(data.settings.importedRev) || 0, Number(DB.importedRev) || 0);
+      DB.importedTx = Math.max(Number(data.settings.importedTx) || 0, Number(DB.importedTx) || 0);
+      DB.resolved = Math.max(Number(data.settings.resolved) || 0, Number(DB.resolved) || 0);
+      DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
+    }
+
+    // Merge cloud transactions too (dedup-guarded via the seen map) so a fresh
+    // device ends up with the full history — the healing step below rebuilds
+    // the revenue counters from exactly these rows.
+    (data.transactions || []).forEach(t => {
+      if (!t) return;
+      const row = { ...t, amount: Number(t.amount) || 0 };
+      if (isSeen(row)) return;
+      DB.transactions.push(row);
+      markSeen(row);
+    });
+
     // Merge customerTx: keep both local and cloud transactions
     const cloudTx = data.customerTx || {};
     Object.keys(cloudTx).forEach(name => {
@@ -6493,14 +6736,19 @@ async function smartMergeCloud(){
       DB.customerTx[name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
     });
 
-    save();
     // Merchant exclusion survives merges too — drop any Simon Musyoka records
-    // pulled in from the cloud BEFORE pushing, so the sheet gets scrubbed too.
-    purgeMerchantData();
-    await saveToCloud(true);
+    // pulled in from the cloud BEFORE persisting/pushing, so both copies are scrubbed.
+    purgeMerchantData(true);
+    // Rebuild the counters from the merged data (cloud Settings may have been
+    // stale/zeroed) and re-derive NEW flags against the merged batch counter.
+    const healed = healImportedAggregates();
+    reconcileNewFlags();
+    // Persist once locally, then perform one serialized cloud write below.
+    save(false);
+    if (!await saveToCloud(true, true)) throw new Error(lastCloudError || 'Cloud did not confirm the save');
     refreshAll();
 
-    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Merged: ' + merged.length + ' total (' + localOnly + ' local-only kept, ' + cloudOnly + ' cloud-only added, ' + mergedCount + ' merged)</span>';
+    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Merged: ' + merged.length + ' total (' + localOnly + ' local-only kept, ' + cloudOnly + ' cloud-only added, ' + mergedCount + ' merged)' + (healed.importedRev || healed.importedTx ? ' · repaired revenue counters from merged data' : '') + '</span>';
     showSyncStatus('✅ Smart merge complete');
   }catch(err){
     $('syncActionResult').innerHTML = '<span style="color:var(--red)">❌ Merge failed: ' + err.message + '</span>';
@@ -6509,37 +6757,34 @@ async function smartMergeCloud(){
 }
 
 function resetLocalData(){
-  if(!confirm('🗑️ RESET LOCAL DATA\n\nThis will DELETE all local data AND overwrite the cloud with seed data.\n\nThis cannot be undone.\n\nAre you absolutely sure?')) return;
+  if(!confirm('🗑️ RESET LOCAL DATA\n\nThis will DELETE all local data on this device. The cloud copy will NOT be changed.\n\nThis cannot be undone locally.\n\nAre you absolutely sure?')) return;
 
+  setCloudWriteHold(true);
   localStorage.removeItem('spaxDB_v23');
   DB = seedDB();
   localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
   refreshAll();
 
-  // Also push seed to cloud so it stays clean
-  if(!GAS_URL.includes('YOUR_SCRIPT')){
-    saveToCloud(true).then(() => {
-      $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Reset complete. ' + DB.customers.length + ' seed customers. Cloud overwritten.</span>';
-    }).catch(err => {
-      $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Local reset done (' + DB.customers.length + ' customers). Cloud push failed: ' + err.message + '</span>';
-    });
-  } else {
-    $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Local reset done. ' + DB.customers.length + ' seed customers. Cloud not configured.</span>';
-  }
-  showSyncStatus('⚠️ Local data reset');
+  // A local reset must never silently overwrite a recoverable cloud copy.
+  $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Local reset complete. Cloud data was not changed.</span>';
+  showSyncStatus('⚠️ Local data reset — cloud untouched');
 }
 
 function updateSyncDetails(){
   const el = $('syncDetails');
   if(!el) return;
   const lastSync = lastSyncTime ? lastSyncTime.toLocaleString() : 'Never';
-  const mode = SYNC_MODE === 'auto' ? 'Auto (every 30s)' : 'Manual';
+  const mode = SYNC_MODE === 'auto' ? 'Auto' : (SYNC_MODE === 'local' ? 'Local only' : 'Manual');
+  const writeState = cloudWritesSuspended
+    ? '<span style="color:var(--amber)">Paused after local reset/restore</span>'
+    : '<span style="color:var(--green)">Ready</span>';
   el.innerHTML = `
     <b>Sync Mode:</b> ${mode}<br>
+    <b>Cloud Writes:</b> ${writeState}<br>
     <b>Last Sync:</b> ${lastSync}<br>
-    <b>Local Customers:</b> ${DB.customers.length.toLocaleString()}<br>
+    <b>Local Customers:</b> ${DB.customers.length.toLocaleString()} tracked (${totalCustomerCount().toLocaleString()} incl. report baseline)<br>
     <b>Local Transactions:</b> ${(DB.transactions || []).length.toLocaleString()}<br>
-    <b>Imported Revenue:</b> KSh ${(DB.importedRev || 0).toLocaleString()}<br>
+    <b>Total Revenue:</b> KSh ${totalRevenueAll().toLocaleString()} (baseline ${REPORT.totalRevenue.toLocaleString()} + imported ${(DB.importedRev || 0).toLocaleString()})<br>
     <b>Contacts Resolved:</b> ${DB.resolved || 0}<br>
     <b>GAS URL:</b> ${GAS_URL.includes('YOUR_SCRIPT') ? '<span style="color:var(--red)">Not configured</span>' : '<span style="color:var(--green)">Connected</span>'}
   `;
@@ -6721,7 +6966,7 @@ async function handleBackfill(input){
     }
     const dateFixes = repairDates();
     if(dateFixes > 0) console.log('Backfill date repair: fixed', dateFixes, 'customer date field(s)');
-    save();
+    save(false);
     if(SYNC_MODE === 'auto') await saveToCloud(true);
     toast('✅ Backfill complete! ' + totalImported + ' added, ' + totalDupes + ' duplicates skipped');
     showSyncStatus('✅ Backfill complete');
@@ -6780,7 +7025,7 @@ async function handleRebuild(input){
       totalUpdated += result.updated;
     }
     recalcFromHistory();
-    save();
+    save(false);
     if(SYNC_MODE === 'auto') await saveToCloud(true);
     finishImportModal(
       '<b>' + totalImported + '</b> transactions imported<br>' +

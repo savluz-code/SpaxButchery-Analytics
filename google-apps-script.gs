@@ -323,14 +323,7 @@ function rowsToObjects_(sheet) {
   if (!sheet) return [];
   var values = sheet.getDataRange().getValues();
   if (!values.length) return [];
-  // Sheets created manually often use title-case headers (for example, Name
-  // and FirstVisit). Normalize only the initial character so they map to the
-  // lower-camel-case fields expected by loadAll_ without changing existing
-  // canonical headers.
-  var headers = values[0].map(function (h) {
-    var header = String(h || '').trim();
-    return header ? header.charAt(0).toLowerCase() + header.slice(1) : '';
-  });
+  var headers = values[0].map(function (h) { return String(h || '').trim(); });
   var out = [];
   for (var i = 1; i < values.length; i++) {
     var row = values[i];

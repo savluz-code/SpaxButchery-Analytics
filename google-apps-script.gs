@@ -297,19 +297,8 @@ function getSpreadsheet_() {
   var props = PropertiesService.getScriptProperties();
   var id = props.getProperty('SPAX_SPREADSHEET_ID');
   if (id) {
-    try {
-      return SpreadsheetApp.openById(id);
-    } catch (err) {
-      // Do not delete the ID or silently create a second database. A temporary
-      // Google/permission failure must not split future requests across two
-      // spreadsheets or make an empty replacement look like the real cloud.
-      throw new Error(
-        'Cannot open the configured SpaxButchery spreadsheet (' + id + '). ' +
-        'The saved ID was kept so no fallback database was created. If the sheet was ' +
-        'intentionally deleted, remove SPAX_SPREADSHEET_ID in Project Settings > Script Properties and retry. ' +
-        String(err)
-      );
-    }
+    try { return SpreadsheetApp.openById(id); }
+    catch (err) { props.deleteProperty('SPAX_SPREADSHEET_ID'); }
   }
 
   var active = SpreadsheetApp.getActiveSpreadsheet();
@@ -330,33 +319,18 @@ function ensureSheets_() {
   });
 }
 
-// Map every header spelling used by the app to one canonical field. This keeps
-// existing lower-camel-case sheets working while also accepting human-friendly
-// title case ("First Visit"), PascalCase ("FirstVisit"), snake_case, and headers
-// exported in all caps. Unknown headers retain the old first-letter behaviour.
-var HEADER_FIELDS_ = [
-  'name', 'contact', 'spent', 'visits', 'days', 'firstVisit', 'lastVisit',
-  'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits', 'newBatch',
-  'label', 'revenue', 'key', 'value', 'date', 'time', 'amount', 'phone',
-  'product', 'receipt', 'source', 'importedAt', 'backfillOnly', 'customer'
-];
-var HEADER_ALIASES_ = HEADER_FIELDS_.reduce(function (aliases, field) {
-  aliases[field.replace(/[^a-z0-9]/gi, '').toLowerCase()] = field;
-  return aliases;
-}, {});
-
-function normalizeHeader_(value) {
-  var header = String(value || '').trim();
-  if (!header) return '';
-  var alias = header.replace(/[^a-z0-9]/gi, '').toLowerCase();
-  return HEADER_ALIASES_[alias] || (header.charAt(0).toLowerCase() + header.slice(1));
-}
-
 function rowsToObjects_(sheet) {
   if (!sheet) return [];
   var values = sheet.getDataRange().getValues();
   if (!values.length) return [];
-  var headers = values[0].map(normalizeHeader_);
+  // Sheets created manually often use title-case headers (for example, Name
+  // and FirstVisit). Normalize only the initial character so they map to the
+  // lower-camel-case fields expected by loadAll_ without changing existing
+  // canonical headers.
+  var headers = values[0].map(function (h) {
+    var header = String(h || '').trim();
+    return header ? header.charAt(0).toLowerCase() + header.slice(1) : '';
+  });
   var out = [];
   for (var i = 1; i < values.length; i++) {
     var row = values[i];

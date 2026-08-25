@@ -837,33 +837,13 @@ let isSyncing = false;
 let lastSyncTime = null;
 let lastCloudError = '';
 
-// A reset/restore is a local recovery operation. Keep automatic writes paused
-// until a successful pull/merge or an explicitly confirmed Force Push proves
-// which copy should win. Persist the hold so a reload during an outage cannot
-// later upload seed data over a recoverable cloud database.
-const CLOUD_WRITE_HOLD_KEY = 'spaxCloudWriteHold_v1';
-let cloudWritesSuspended = false;
-try { cloudWritesSuspended = localStorage.getItem(CLOUD_WRITE_HOLD_KEY) === '1'; }
-catch (_) { /* storage can be unavailable in private/restricted WebViews */ }
-function setCloudWriteHold(hold) {
-  cloudWritesSuspended = !!hold;
-  try {
-    if (cloudWritesSuspended) localStorage.setItem(CLOUD_WRITE_HOLD_KEY, '1');
-    else localStorage.removeItem(CLOUD_WRITE_HOLD_KEY);
-  } catch (_) { /* the in-memory guard still protects this session */ }
-}
-
 // Apps Script redirects requests and can return an HTML error page. Parsing it
 // directly as JSON hid the useful deployment/setup error behind "Unexpected <".
 async function cloudRequest(url, options = {}) {
-  // Older Android WebViews do not expose AbortController. Sync should still work
-  // there; only the timeout is unavailable in that compatibility fallback.
-  const controller = typeof AbortController === 'function' ? new AbortController() : null;
-  const timer = controller ? setTimeout(() => controller.abort(), 30000) : null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
   try {
-    const requestOptions = { ...options, redirect: 'follow' };
-    if (controller) requestOptions.signal = controller.signal;
-    const response = await fetch(url, requestOptions);
+    const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
     const text = await response.text();
     if (!response.ok) throw new Error('Cloud returned HTTP ' + response.status);
     let data;
@@ -874,13 +854,8 @@ async function cloudRequest(url, options = {}) {
       throw new Error(detail);
     }
     return data;
-  } catch (err) {
-    if (controller && controller.signal.aborted) {
-      throw new Error('Cloud request timed out after 30 seconds. Local data was kept; check the connection and try again.');
-    }
-    throw err;
   } finally {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
   }
 }
 
@@ -892,18 +867,9 @@ async function cloudLoad() {
 // A formatted but empty Sheet can produce object rows with blank values. Those
 // are not customers and must never be allowed to trigger a pull or overwrite.
 function validCloudCustomers(customers) {
-  return (Array.isArray(customers) ? customers : []).reduce((valid, customer) => {
-    if (!customer || typeof customer !== 'object') return valid;
-    const name = String(customer.name || '').trim().replace(/\s+/g, ' ');
-    if (name) valid.push({ ...customer, name });
-    return valid;
-  }, []);
-}
-
-// Customer names are identifiers during sync. Match harmless capitalization and
-// whitespace differences so "Jane Doe" and "JANE  DOE" do not become duplicates.
-function cloudCustomerKey(customer) {
-  return String(customer && customer.name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  return (Array.isArray(customers) ? customers : []).filter(c =>
+    c && String(c.name || '').trim().length > 0
+  );
 }
 
 async function loadFromCloud() {
@@ -921,13 +887,13 @@ async function loadFromCloud() {
 
     if (hasCloudData) {
       // Cloud has data — MERGE with local (never lose imported customers)
-      const cloudMap = new Map(cloudCustomers.map(c => [cloudCustomerKey(c), c]));
-      const localMap = new Map((DB.customers || []).map(c => [cloudCustomerKey(c), c]));
+      const cloudMap = new Map(cloudCustomers.map(c => [c.name, c]));
+      const localMap = new Map(DB.customers.map(c => [c.name, c]));
 
       // Start with all local customers
       const merged = [];
-      localMap.forEach((localCust, key) => {
-        const cloudCust = cloudMap.get(key);
+      localMap.forEach((localCust, name) => {
+        const cloudCust = cloudMap.get(name);
         if (cloudCust) {
           // Customer exists in both — use whichever has more visits/higher spent
           const useCloud = (cloudCust.visits || 0) > (localCust.visits || 0) || 
@@ -935,12 +901,10 @@ async function loadFromCloud() {
           merged.push({
             ...localCust,
             ...(useCloud ? cloudCust : {}),
-            // Preserve the local display spelling when only case/spacing differs.
-            name: localCust.name || cloudCust.name,
             firstVisit: stripTime(useCloud ? (cloudCust.firstVisit || localCust.firstVisit) : (localCust.firstVisit || cloudCust.firstVisit)),
             lastVisit: stripTime(useCloud ? (cloudCust.lastVisit || localCust.lastVisit) : (localCust.lastVisit || cloudCust.lastVisit))
           });
-          cloudMap.delete(key);
+          cloudMap.delete(name);
         } else {
           // Only in local — keep it (imported customer!)
           merged.push(localCust);
@@ -955,35 +919,31 @@ async function loadFromCloud() {
       }));
 
       DB.customers = merged;
-      // Treat empty/missing optional sheets as a partial cloud response during
-      // automatic sync. Keep the known-good local collection instead of erasing
-      // it; an intentional destructive replacement remains available via Pull.
-      if (data.monthly && Array.isArray(data.monthly.labels) && data.monthly.labels.length && Array.isArray(data.monthly.revenue)) {
+      if (data.monthly && data.monthly.labels) {
         DB.monthly = data.monthly;
       }
-      if (data.settings && typeof data.settings === 'object') {
-        // Automatic merge is monotonic for cumulative counters. A stale or
-        // title-mismatched Settings sheet must not reset live totals to zero.
-        DB.importedRev = Math.max(Number(data.settings.importedRev) || 0, Number(DB.importedRev) || 0);
-        DB.importedTx = Math.max(Number(data.settings.importedTx) || 0, Number(DB.importedTx) || 0);
-        DB.resolved = Math.max(Number(data.settings.resolved) || 0, Number(DB.resolved) || 0);
+      if (data.settings) {
+        DB.importedRev = Number(data.settings.importedRev) || 0;
+        DB.importedTx = Number(data.settings.importedTx) || 0;
+        DB.resolved = Number(data.settings.resolved) || 0;
         // Keep the highest batch counter seen across devices so a stale cloud
         // value can't resurrect NEW badges that a newer local import retired.
         DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
       }
-      if (Array.isArray(data.transactions) && data.transactions.length) {
+      if (data.transactions) {
         DB.transactions = data.transactions.map(t => ({...t, amount: Number(t.amount) || 0}));
       }
-      if (data.customerTx && typeof data.customerTx === 'object' && !Array.isArray(data.customerTx) && Object.keys(data.customerTx).length) {
+      if (data.customerTx) {
         DB.customerTx = data.customerTx;
-      }
+      } else {
+        DB.transactions = []; }
       // Restore the dedup map in the SAME key format the import guard uses
       // (transactionKey / markSeen). The old 'R:'/'C:' scheme never matched those
       // keys, so after any sync re-importing an already-loaded statement slipped
       // past the guard and double-counted revenue & stats.
-      if (data.seen && typeof data.seen === 'object' && !Array.isArray(data.seen) && Object.keys(data.seen).length) {
+      if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
         DB.seen = data.seen;
-      } else if (Array.isArray(data.transactions) && data.transactions.length) {
+      } else if (data.transactions) {
         DB.seen = {};
         data.transactions.forEach(tx => { markSeen(tx); });
       }
@@ -997,8 +957,6 @@ async function loadFromCloud() {
       // Simon Musyoka (the Merchant), scrub him from the merged data now.
       purgeMerchantData();
       refreshAll();
-      setCloudWriteHold(false);
-      lastCloudError = '';
       return true;
     } else {
       // Never automatically seed/overwrite a cloud that looks empty. It may be
@@ -1007,31 +965,15 @@ async function loadFromCloud() {
       return false;
     }
   } catch (err) {
-    lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud load failed:', err);
-    showSyncStatus('❌ Cloud failed — using local data: ' + lastCloudError);
+    showSyncStatus('❌ Cloud failed — using local data');
     return false;
   }
 }
 
-async function saveToCloud(force = false, allowHeldWrite = false) {
-  lastCloudError = '';
-  if (!GAS_URL || GAS_URL.includes('YOUR_SCRIPT')) {
-    lastCloudError = 'Cloud URL is not configured. Paste your Apps Script /exec URL into GAS_URL.';
-    return false;
-  }
-  if (SYNC_MODE === 'local' && !force) return false;
-  if (cloudWritesSuspended && !allowHeldWrite) {
-    lastCloudError = 'Automatic cloud writes are paused after a local reset/restore. Pull or merge the cloud copy, or use Force Push to replace it.';
-    showSyncStatus('⏸️ Cloud writes paused — local data is safe');
-    return false;
-  }
-  // Never overlap POSTs: a slower stale request could otherwise finish last and
-  // overwrite a newer explicit save.
-  if (isSyncing) {
-    lastCloudError = 'Another cloud save is already in progress. Wait a moment and try again.';
-    return false;
-  }
+async function saveToCloud(force = false) {
+  if (SYNC_MODE === 'local') return;
+  if (isSyncing && !force) return;
 
   isSyncing = true;
   showSyncStatus('⏳ Saving to cloud...');
@@ -1072,7 +1014,6 @@ async function saveToCloud(force = false, allowHeldWrite = false) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
       lastCloudError = '';
-      if (allowHeldWrite) setCloudWriteHold(false);
       return true;
     }
   } catch (err) {
@@ -2880,7 +2821,7 @@ function seedDB(){
 }
 function load(){
   try{
-    // Initialize local data first, then attempt a non-destructive cloud merge.
+    // Initialize DB with seed data FIRST (so saveToCloud has data to push if cloud is empty)
     const s=localStorage.getItem('spaxDB_v23');
     if(s){
       DB=JSON.parse(s);
@@ -2969,7 +2910,7 @@ function load(){
     // rows, history and revenue. Persists automatically if anything was removed.
     purgeMerchantData();
 
-    // Now try cloud sync. Empty/invalid cloud responses never trigger a push.
+    // Now try cloud sync (will push seed data if cloud is empty)
     return loadFromCloud().then(cloudLoaded => {
       if (!cloudLoaded) {
         // Cloud failed — keep local data and refresh
@@ -2984,18 +2925,15 @@ function load(){
       if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
     });
   }catch(e){
-    // Corrupt/unreadable local storage is not proof that the cloud is empty.
-    // Keep seed recovery local until the user successfully pulls or confirms a push.
-    setCloudWriteHold(true);
     DB=seedDB();
     refreshAll();
     const fixed = repairDates();
     if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
     return Promise.resolve();
   }
-}function save(syncCloud = true){
+}function save(){
   localStorage.setItem('spaxDB_v23',JSON.stringify(DB));
-  if (syncCloud && SYNC_MODE === 'auto') {
+  if (SYNC_MODE === 'auto') {
     saveToCloud();
   }
   refreshAll();
@@ -5775,12 +5713,7 @@ $('resetBtn').onclick = () => {
   const msg = hasCustom
     ? 'Reset to your saved baseline (the last “Save Current as Local Baseline”)? Imports after that save will be dropped.'
     : 'Reset ALL data to the original report seed (imports, dedup history, resolved contacts)?';
-  if (confirm(msg)) {
-    setCloudWriteHold(true);
-    DB = seedDB();
-    save();
-    toast((hasCustom ? '↺ Restored your saved baseline' : '↺ Reset complete') + ' · cloud unchanged');
-  }
+  if (confirm(msg)) { DB = seedDB(); save(); toast(hasCustom ? '↺ Restored your saved baseline' : '↺ Reset complete'); }
 };
 
 /* ══════════ SAVE CURRENT AS LOCAL BASELINE / EXPORT JS SEED CODE ══════════ */
@@ -5805,13 +5738,12 @@ function restoreLocalBaseline(){
     const saved = JSON.parse(raw);
     const n = saved.customers ? saved.customers.length : 0;
     if(!confirm(`Restore the saved local baseline (${n} customers)? This OVERWRITES current data.`)) return { ok: false };
-    setCloudWriteHold(true);
     DB = saved;
     if(!DB.seen) DB.seen = {};
     if(!DB.transactions) DB.transactions = [];
     if(!DB.customerTx) DB.customerTx = {};
     save();
-    toast('♻️ Local baseline restored · cloud unchanged');
+    toast('♻️ Local baseline restored');
     return { ok: true, customers: n };
   } catch(e) {
     toast('❌ Could not restore baseline: ' + e.message);
@@ -6473,7 +6405,7 @@ async function forcePushToCloud(){
 
   showSyncStatus('🚀 Force pushing local data...');
   try{
-    const saved = await saveToCloud(true, true);
+    const saved = await saveToCloud(true);
     if (!saved) throw new Error(lastCloudError || 'Cloud did not confirm the save');
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.</span>';
     showSyncStatus('✅ Force push complete');
@@ -6521,13 +6453,9 @@ async function forcePullFromCloud(){
       data.transactions.forEach(tx => { markSeen(tx); });
     }
 
-    // Persist locally without echoing the just-pulled response back over the
-    // cloud. Merchant cleanup below performs its own save only when needed.
-    save(false);
+    save();
     purgeMerchantData();
     refreshAll();
-    setCloudWriteHold(false);
-    lastCloudError = '';
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pulled ' + DB.customers.length + ' customers from cloud. Local data overwritten.</span>';
     showSyncStatus('✅ Force pull complete');
   }catch(err){
@@ -6547,24 +6475,23 @@ async function smartMergeCloud(){
       return;
     }
 
-    const cloudMap = new Map(cloudCustomers.map(c => [cloudCustomerKey(c), c]));
-    const localMap = new Map((DB.customers || []).map(c => [cloudCustomerKey(c), c]));
+    const cloudMap = new Map(cloudCustomers.map(c => [c.name, c]));
+    const localMap = new Map(DB.customers.map(c => [c.name, c]));
     const merged = [];
     let localOnly = 0, cloudOnly = 0, mergedCount = 0;
 
     // Merge locals
-    localMap.forEach((localCust, key) => {
-      const cloudCust = cloudMap.get(key);
+    localMap.forEach((localCust, name) => {
+      const cloudCust = cloudMap.get(name);
       if(cloudCust){
         const useCloud = (cloudCust.visits||0) > (localCust.visits||0) || (cloudCust.spent||0) > (localCust.spent||0);
         merged.push({
           ...localCust,
           ...(useCloud ? cloudCust : {}),
-          name: localCust.name || cloudCust.name,
           firstVisit: (() => { const f1 = stripTime(cloudCust.firstVisit), f2 = stripTime(localCust.firstVisit); return (f1 && f2) ? (f1 < f2 ? f1 : f2) : (f1 || f2 || ""); })(),
           lastVisit: (() => { const l1 = stripTime(cloudCust.lastVisit), l2 = stripTime(localCust.lastVisit); return (l1 && l2) ? (l1 > l2 ? l1 : l2) : (l1 || l2 || ""); })()
         });
-        cloudMap.delete(key);
+        cloudMap.delete(name);
         mergedCount++;
       }else{
         merged.push(localCust);
@@ -6600,12 +6527,11 @@ async function smartMergeCloud(){
       DB.customerTx[name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
     });
 
+    save();
     // Merchant exclusion survives merges too — drop any Simon Musyoka records
-    // pulled in from the cloud BEFORE persisting/pushing, so both copies are scrubbed.
-    purgeMerchantData(true);
-    // Persist once locally, then perform one serialized cloud write below.
-    save(false);
-    if (!await saveToCloud(true, true)) throw new Error(lastCloudError || 'Cloud did not confirm the save');
+    // pulled in from the cloud BEFORE pushing, so the sheet gets scrubbed too.
+    purgeMerchantData();
+    if (!await saveToCloud(true)) throw new Error(lastCloudError || 'Cloud did not confirm the save');
     refreshAll();
 
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Merged: ' + merged.length + ' total (' + localOnly + ' local-only kept, ' + cloudOnly + ' cloud-only added, ' + mergedCount + ' merged)</span>';
@@ -6617,9 +6543,8 @@ async function smartMergeCloud(){
 }
 
 function resetLocalData(){
-  if(!confirm('🗑️ RESET LOCAL DATA\n\nThis will DELETE all local data on this device. The cloud copy will NOT be changed.\n\nThis cannot be undone locally.\n\nAre you absolutely sure?')) return;
+  if(!confirm('🗑️ RESET LOCAL DATA\n\nThis will DELETE all local data AND overwrite the cloud with seed data.\n\nThis cannot be undone.\n\nAre you absolutely sure?')) return;
 
-  setCloudWriteHold(true);
   localStorage.removeItem('spaxDB_v23');
   DB = seedDB();
   localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
@@ -6634,13 +6559,9 @@ function updateSyncDetails(){
   const el = $('syncDetails');
   if(!el) return;
   const lastSync = lastSyncTime ? lastSyncTime.toLocaleString() : 'Never';
-  const mode = SYNC_MODE === 'auto' ? 'Auto' : (SYNC_MODE === 'local' ? 'Local only' : 'Manual');
-  const writeState = cloudWritesSuspended
-    ? '<span style="color:var(--amber)">Paused after local reset/restore</span>'
-    : '<span style="color:var(--green)">Ready</span>';
+  const mode = SYNC_MODE === 'auto' ? 'Auto (every 30s)' : 'Manual';
   el.innerHTML = `
     <b>Sync Mode:</b> ${mode}<br>
-    <b>Cloud Writes:</b> ${writeState}<br>
     <b>Last Sync:</b> ${lastSync}<br>
     <b>Local Customers:</b> ${DB.customers.length.toLocaleString()}<br>
     <b>Local Transactions:</b> ${(DB.transactions || []).length.toLocaleString()}<br>
@@ -6826,7 +6747,7 @@ async function handleBackfill(input){
     }
     const dateFixes = repairDates();
     if(dateFixes > 0) console.log('Backfill date repair: fixed', dateFixes, 'customer date field(s)');
-    save(false);
+    save();
     if(SYNC_MODE === 'auto') await saveToCloud(true);
     toast('✅ Backfill complete! ' + totalImported + ' added, ' + totalDupes + ' duplicates skipped');
     showSyncStatus('✅ Backfill complete');
@@ -6885,7 +6806,7 @@ async function handleRebuild(input){
       totalUpdated += result.updated;
     }
     recalcFromHistory();
-    save(false);
+    save();
     if(SYNC_MODE === 'auto') await saveToCloud(true);
     finishImportModal(
       '<b>' + totalImported + '</b> transactions imported<br>' +

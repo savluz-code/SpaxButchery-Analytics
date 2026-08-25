@@ -3748,8 +3748,8 @@ function refreshAll(){
     }
   });
   const cs=DB.customers;
-  const totRev=REPORT.totalRevenue+DB.importedRev;
-  const totCust=REPORT.totalCustomers+cs.filter(c=>c.isNew).length;
+  const totRev=getProductStats().totalRevenue;
+  const totCust=DB.customers.length;
   const validPct=(((REPORT.valid+DB.resolved)/totCust)*100).toFixed(1);
   $('hCust').textContent=totCust.toLocaleString();
   $('hRev').textContent=(totRev/1000).toFixed(0)+'K';

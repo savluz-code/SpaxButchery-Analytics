@@ -280,3 +280,17 @@ test('importedCustomerCount stays stable across import batches', () => {
 
   assert.equal(api.importedCustomerCount(), 3);
 });
+
+test('Overview KPIs source live product stats and customer list length', () => {
+  const start = htmlSource.indexOf('function refreshAll(){');
+  assert.notEqual(start, -1, 'refreshAll not found');
+  const end = htmlSource.indexOf('function renderCustTable', start);
+  assert.notEqual(end, -1, 'refreshAll end not found');
+  const refreshAll = htmlSource.slice(start, end);
+
+  assert.match(refreshAll, /const totRev=getProductStats\(\)\.totalRevenue;/);
+  assert.match(refreshAll, /const totCust=DB\.customers\.length;/);
+  assert.doesNotMatch(refreshAll, /const totRev=totalRevenueAll\(\);/);
+  assert.doesNotMatch(refreshAll, /const totCust=totalCustomerCount\(\);/);
+  assert.doesNotMatch(refreshAll, /const totRev=REPORT\.totalRevenue\+DB\.importedRev;/);
+});

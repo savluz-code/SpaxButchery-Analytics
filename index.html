@@ -835,42 +835,6 @@ const GAS_URL = 'https://script.google.com/macros/s/AKfycbylY3y9P1eRH8QdH_d6_nG8
 let SYNC_MODE = 'auto';
 let isSyncing = false;
 let lastSyncTime = null;
-let lastCloudError = '';
-
-// Apps Script redirects requests and can return an HTML error page. Parsing it
-// directly as JSON hid the useful deployment/setup error behind "Unexpected <".
-async function cloudRequest(url, options = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30000);
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
-    const text = await response.text();
-    if (!response.ok) throw new Error('Cloud returned HTTP ' + response.status);
-    let data;
-    try { data = JSON.parse(text); }
-    catch (_) { throw new Error('Cloud returned a non-JSON response. Check that the Apps Script web app is deployed as “Anyone” and use its /exec URL.'); }
-    if (!data || data.success !== true) {
-      const detail = data && data.error ? (typeof data.error === 'string' ? data.error : JSON.stringify(data.error)) : 'Unknown cloud error';
-      throw new Error(detail);
-    }
-    return data;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function cloudLoad() {
-  if (!GAS_URL || GAS_URL.includes('YOUR_SCRIPT')) throw new Error('Cloud URL is not configured. Paste your Apps Script /exec URL into GAS_URL.');
-  return cloudRequest(GAS_URL + (GAS_URL.includes('?') ? '&' : '?') + 'action=load');
-}
-
-// A formatted but empty Sheet can produce object rows with blank values. Those
-// are not customers and must never be allowed to trigger a pull or overwrite.
-function validCloudCustomers(customers) {
-  return (Array.isArray(customers) ? customers : []).filter(c =>
-    c && String(c.name || '').trim().length > 0
-  );
-}
 
 async function loadFromCloud() {
   if (GAS_URL.includes('YOUR_SCRIPT')) {
@@ -879,15 +843,15 @@ async function loadFromCloud() {
   }
   try {
     showSyncStatus('⏳ Loading from cloud...');
-    const data = await cloudLoad();
+    const response = await fetch(GAS_URL + '?action=load');
+    const data = await response.json();
 
-    // Ignore formatting/blank rows returned by a Sheet. They are not cloud data.
-    const cloudCustomers = validCloudCustomers(data.customers);
-    const hasCloudData = cloudCustomers.length > 0;
+    // Check if cloud has actual data
+    const hasCloudData = data.customers && data.customers.length > 0;
 
     if (hasCloudData) {
       // Cloud has data — MERGE with local (never lose imported customers)
-      const cloudMap = new Map(cloudCustomers.map(c => [c.name, c]));
+      const cloudMap = new Map(data.customers.map(c => [c.name, c]));
       const localMap = new Map(DB.customers.map(c => [c.name, c]));
 
       // Start with all local customers
@@ -959,10 +923,14 @@ async function loadFromCloud() {
       refreshAll();
       return true;
     } else {
-      // Never automatically seed/overwrite a cloud that looks empty. It may be
-      // a damaged sheet, a new deployment, or a temporary read issue.
-      showSyncStatus('⚠️ Cloud has no valid customers — not overwriting it');
-      return false;
+      // Cloud is empty — push local data to cloud (not just seed!)
+      showSyncStatus('☁️ Cloud empty — pushing local data...');
+      await saveToCloud(true);
+      lastSyncTime = new Date();
+      showSyncStatus('✅ Local data pushed to cloud ' + lastSyncTime.toLocaleTimeString());
+      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
+      refreshAll();
+      return true;
     }
   } catch (err) {
     console.error('Cloud load failed:', err);
@@ -1003,24 +971,22 @@ async function saveToCloud(force = false) {
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
 
-    const result = await cloudRequest(GAS_URL, {
+    const response = await fetch(GAS_URL, {
       method: 'POST',
-      // text/plain keeps this a CORS-simple request for Apps Script web apps.
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify(payload)
     });
 
+    const result = await response.json();
     if (result.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
-      lastCloudError = '';
-      return true;
+    } else {
+      showSyncStatus('❌ Save failed: ' + (result.error || 'Unknown'));
     }
   } catch (err) {
-    lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);
-    showSyncStatus('❌ Save failed: ' + lastCloudError);
-    return false;
+    showSyncStatus('❌ Save failed — saved locally');
   } finally {
     isSyncing = false;
   }
@@ -6405,8 +6371,7 @@ async function forcePushToCloud(){
 
   showSyncStatus('🚀 Force pushing local data...');
   try{
-    const saved = await saveToCloud(true);
-    if (!saved) throw new Error(lastCloudError || 'Cloud did not confirm the save');
+    await saveToCloud(true);
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.</span>';
     showSyncStatus('✅ Force push complete');
   }catch(err){
@@ -6420,15 +6385,15 @@ async function forcePullFromCloud(){
 
   showSyncStatus('⬇️ Force pulling from cloud...');
   try{
-    const data = await cloudLoad();
+    const response = await fetch(GAS_URL + '?action=load');
+    const data = await response.json();
 
-    const cloudCustomers = validCloudCustomers(data.customers);
-    if(cloudCustomers.length === 0){
+    if(!data.customers || data.customers.length === 0){
       $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud is empty. Nothing to pull.</span>';
       return;
     }
 
-    DB.customers = cloudCustomers.map(c => ({
+    DB.customers = data.customers.map(c => ({
       ...c,
       firstVisit: stripTime(c.firstVisit),
       lastVisit: stripTime(c.lastVisit)
@@ -6467,15 +6432,16 @@ async function forcePullFromCloud(){
 async function smartMergeCloud(){
   showSyncStatus('🔀 Merging local + cloud...');
   try{
-    const data = await cloudLoad();
+    const response = await fetch(GAS_URL + '?action=load');
+    const data = await response.json();
 
-    const cloudCustomers = validCloudCustomers(data.customers);
-    if(cloudCustomers.length === 0){
-      $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud has no valid customers. No data was changed — recover a known-good cloud copy before pushing.</span>';
+    if(!data.customers || data.customers.length === 0){
+      $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud is empty. Pushing local data instead...</span>';
+      await saveToCloud(true);
       return;
     }
 
-    const cloudMap = new Map(cloudCustomers.map(c => [c.name, c]));
+    const cloudMap = new Map(data.customers.map(c => [c.name, c]));
     const localMap = new Map(DB.customers.map(c => [c.name, c]));
     const merged = [];
     let localOnly = 0, cloudOnly = 0, mergedCount = 0;
@@ -6531,7 +6497,7 @@ async function smartMergeCloud(){
     // Merchant exclusion survives merges too — drop any Simon Musyoka records
     // pulled in from the cloud BEFORE pushing, so the sheet gets scrubbed too.
     purgeMerchantData();
-    if (!await saveToCloud(true)) throw new Error(lastCloudError || 'Cloud did not confirm the save');
+    await saveToCloud(true);
     refreshAll();
 
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Merged: ' + merged.length + ' total (' + localOnly + ' local-only kept, ' + cloudOnly + ' cloud-only added, ' + mergedCount + ' merged)</span>';
@@ -6550,9 +6516,17 @@ function resetLocalData(){
   localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
   refreshAll();
 
-  // A local reset must never silently overwrite a recoverable cloud copy.
-  $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Local reset complete. Cloud data was not changed.</span>';
-  showSyncStatus('⚠️ Local data reset — cloud untouched');
+  // Also push seed to cloud so it stays clean
+  if(!GAS_URL.includes('YOUR_SCRIPT')){
+    saveToCloud(true).then(() => {
+      $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Reset complete. ' + DB.customers.length + ' seed customers. Cloud overwritten.</span>';
+    }).catch(err => {
+      $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Local reset done (' + DB.customers.length + ' customers). Cloud push failed: ' + err.message + '</span>';
+    });
+  } else {
+    $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Local reset done. ' + DB.customers.length + ' seed customers. Cloud not configured.</span>';
+  }
+  showSyncStatus('⚠️ Local data reset');
 }
 
 function updateSyncDetails(){

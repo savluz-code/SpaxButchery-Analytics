@@ -911,6 +911,7 @@ async function loadFromCloud() {
         DB.seen = {};
         data.transactions.forEach(tx => { markSeen(tx); });
       }
+      sanitizeNegativeTotals();
       lastSyncTime = new Date();
       showSyncStatus('✅ Synced ' + lastSyncTime.toLocaleTimeString());
       reconcileNewFlags();
@@ -2826,7 +2827,11 @@ function load(){
     // Migrate: add lastVisit from seed data; recalc days from lastVisit; fix firstVisit
     const today = new Date(getTodayEAT());
     let needsSave = false;
-    
+
+    // Negative totals guard: existing localStorage may already carry a corrupt
+    // negative spent/amount row. Repair it now so it never reaches the UI.
+    if (sanitizeNegativeTotals() > 0) needsSave = true;
+
     // Migrate: add isSeed flag and seed baseline values for customers that
     // match seed data but don't have these fields yet (from older versions)
     DB.customers.forEach(c => {
@@ -3297,14 +3302,20 @@ function getProductStats(){
   // Also exclude transactions that match seed customers, since those are already
   // reflected in the seed baseline (c.spent/c.visits) and counting them again
   // would double-count.
+  // Negative totals guard: revenue is made up of non-negative amounts. A corrupt
+  // negative spent/transaction amount (usually a customer-export row whose
+  // Amount/Revenue column held a withdrawal) must never pull the headline total
+  // below zero.
+  const revAmt = x => Math.max(0, Number(x) || 0);
+  const countAmt = x => Math.max(0, Number(x) || 0);
   const seedCustomerNames = new Set(DB.customers.filter(c => c.isSeed).map(c => c.name));
   const countable = DB.transactions.filter(t => 
-    !t.backfillOnly && !seedCustomerNames.has(t.name)
+    !t.backfillOnly && !seedCustomerNames.has(t.name) && revAmt(t.amount) >= 0
   );
   const meatTx = countable.filter(t => t.product === 'meat');
   const soupTx = countable.filter(t => t.product === 'soup');
-  const meatTxRev = meatTx.reduce((s,t)=>s+t.amount,0);
-  const soupTxRev = soupTx.reduce((s,t)=>s+t.amount,0);
+  const meatTxRev = meatTx.reduce((s,t)=>s+revAmt(t.amount),0);
+  const soupTxRev = soupTx.reduce((s,t)=>s+revAmt(t.amount),0);
   const meatTxVisits = meatTx.length;
   const soupTxVisits = soupTx.length;
   const meatTxPhones = new Set(meatTx.map(t=>t.phone).filter(Boolean));
@@ -3313,12 +3324,14 @@ function getProductStats(){
   let seedMeatCust=0, seedSoupCust=0;
   DB.customers.forEach(c=>{
     if(c.isNew) return;
-    const avg = (c.spent||0) / Math.max(c.visits||1,1);
+    const cSpent = revAmt(c.spent);
+    const cVisits = countAmt(c.visits);
+    const avg = cSpent / Math.max(cVisits || 1,1);
     if(c.lastVisit && c.lastVisit < SOUP_START_DATE){
-      seedMeatRev += c.spent||0; seedMeatVisits += c.visits||0; seedMeatCust++;
+      seedMeatRev += cSpent; seedMeatVisits += cVisits; seedMeatCust++;
     } else {
-      if(avg <= 50){ seedSoupRev += c.spent||0; seedSoupVisits += c.visits||0; seedSoupCust++; }
-      else { seedMeatRev += c.spent||0; seedMeatVisits += c.visits||0; seedMeatCust++; }
+      if(avg <= 50){ seedSoupRev += cSpent; seedSoupVisits += cVisits; seedSoupCust++; }
+      else { seedMeatRev += cSpent; seedMeatVisits += cVisits; seedMeatCust++; }
     }
   });
   return {
@@ -4072,12 +4085,18 @@ function parseBaselinePastedCsv(text) {
 
 function mergeBaselineCustomer(c) {
   const existing = findCustomerMatch(c);
+  // Negative totals guard: a customer/baseline export with a negative
+  // "Amount"/"Revenue" column (e.g. a withdrawal or wrong column) must never
+  // create a negative lifetime spent — that value flows straight into
+  // getProductStats() and turns the Overview Total Revenue negative.
+  const totalSpent = Math.max(0, Number(c.totalSpent) || 0);
+  const totalVisits = Math.max(0, Number(c.visits) || 0);
   if (existing) {
     existing.name = existing.name || c.name;
     if (isValidKenyanContact(c.contact) && !isValidKenyanContact(existing.contact)) existing.contact = c.contact;
     else if (!existing.contact && c.contact) existing.contact = c.contact;
-    existing.spent = Math.max(Number(existing.spent || 0), Number(c.totalSpent || 0));
-    existing.visits = Math.max(Number(existing.visits || 0), Number(c.visits || 0));
+    existing.spent = Math.max(0, Number(existing.spent || 0), totalSpent);
+    existing.visits = Math.max(0, Number(existing.visits || 0), totalVisits);
     // Handle visit dates: firstVisit = earliest, lastVisit = latest
     if (c.lastVisit) {
       if (!existing.lastVisit || c.lastVisit > existing.lastVisit) {
@@ -4099,8 +4118,8 @@ function mergeBaselineCustomer(c) {
   DB.customers.push({
     name: c.name,
     contact: c.contact,
-    spent: c.totalSpent || 0,
-    visits: c.visits || 1,
+    spent: totalSpent,
+    visits: totalVisits || 1,
     days: c.lastVisit ? daysSince(c.lastVisit) : 999,
     firstVisit: c.firstVisit || c.lastVisit || "",
     lastVisit: c.lastVisit || c.firstVisit || "",
@@ -4633,6 +4652,49 @@ function reconcileNewFlags() {
   return changed;
 }
 
+/* Negative totals guard: clamp spent / visits / transaction amounts to zero so a
+   corrupt negative row (common with customer-export CSVs whose Amount/Revenue
+   column contains a withdrawal) can never make the Overview Total Revenue or a
+   customer/visit aggregate negative. Runs on load and after every cloud merge so
+   existing localStorage/cloud copies are repaired in place. */
+function sanitizeNegativeTotals() {
+  // Only change finite negative values; leave missing/undefined fields alone so
+  // sync rows that legitimately omit a counter are not zeroed to a wrong value.
+  const clamp = x => {
+    if (x === null || x === undefined || x === '') return x;
+    const n = Number(x);
+    return isFinite(n) ? Math.max(0, n) : x;
+  };
+  let fixed = 0;
+  const countFixed = (value, clean) => {
+    if (value !== clean) fixed++;
+    return clean;
+  };
+  (DB.customers || []).forEach(c => {
+    c.spent = countFixed(c.spent, clamp(c.spent));
+    c.visits = countFixed(c.visits, clamp(c.visits));
+    c.seedSpent = countFixed(c.seedSpent, clamp(c.seedSpent));
+    c.seedVisits = countFixed(c.seedVisits, clamp(c.seedVisits));
+  });
+  (DB.transactions || []).forEach(t => {
+    t.amount = countFixed(t.amount, clamp(t.amount));
+  });
+  Object.entries(DB.customerTx || {}).forEach(([, rows]) => {
+    (rows || []).forEach(t => {
+      t.amount = countFixed(t.amount, clamp(t.amount));
+    });
+  });
+  // Cumulative aggregate counters are also non-negative by definition.
+  DB.importedRev = countFixed(DB.importedRev, clamp(DB.importedRev));
+  DB.importedTx = countFixed(DB.importedTx, clamp(DB.importedTx));
+  DB.resolved = countFixed(DB.resolved, clamp(DB.resolved));
+  (DB.monthly && DB.monthly.revenue || []).forEach((rev, i) => {
+    DB.monthly.revenue[i] = countFixed(rev, clamp(rev));
+  });
+  if (fixed > 0) console.warn(`Negative totals guard: clamped ${fixed} disallowed negative amount(s)`);
+  return fixed;
+}
+
 /* ══════════ NEW THIS MONTH (isNewThisMonth) ══════════
    A SECOND, independent notion of "new" — a business/acquisition signal rather
    than a data-provenance one:
@@ -4724,10 +4786,11 @@ function importTransactions(txs, opts = {}) {
 
   txFresh.forEach(tx => {
     const product = classifyProduct(tx.date, tx.amount);
+    const txAmount = Math.max(0, Number(tx.amount || 0));
     DB.transactions.push({
       date: tx.date || '',
       time: tx.time || '',
-      amount: Number(tx.amount || 0),
+      amount: txAmount,
       name: tx.name || '',
       phone: normalizeContact(tx.phone || tx.contact || ''),
       product: product,
@@ -4757,7 +4820,7 @@ function importTransactions(txs, opts = {}) {
       } else {
         // NON-SEED CUSTOMER: add normally (these are genuinely new transactions
         // not already counted in any baseline).
-        match.spent = Number(match.spent || 0) + Number(tx.amount || 0);
+        match.spent = Math.max(0, Number(match.spent || 0) + txAmount);
         match.visits = Number(match.visits || 0) + 1;
         if (!match.lastVisit || date > match.lastVisit) match.lastVisit = date;
         if (!match.firstVisit || date < match.firstVisit) match.firstVisit = date;
@@ -4772,7 +4835,7 @@ function importTransactions(txs, opts = {}) {
         // Only non-seed transactions contribute to monthly revenue and importedRev
         const mk = /^\d{4}-\d{2}/.test(tx.date || "") ? tx.date.slice(0, 7) :
           (new Date()).getFullYear() + '-' + String((new Date()).getMonth() + 1).padStart(2, '0');
-        monthAdd[mk] = (monthAdd[mk] || 0) + tx.amount;
+        monthAdd[mk] = (monthAdd[mk] || 0) + txAmount;
       }
       updated++;
     } else {
@@ -4782,7 +4845,7 @@ function importTransactions(txs, opts = {}) {
       DB.customers.push({
         name: tx.name || "M-Pesa Customer",
         contact: normalizeContact(tx.contact),
-        spent: Number(tx.amount || 0),
+        spent: txAmount,
         visits: 1,
         days: daysSinceTx,
         lastVisit: txDate,
@@ -4795,7 +4858,7 @@ function importTransactions(txs, opts = {}) {
       // New customers are never seed — count their revenue normally
       const mk = /^\d{4}-\d{2}/.test(tx.date || "") ? tx.date.slice(0, 7) :
         (new Date()).getFullYear() + '-' + String((new Date()).getMonth() + 1).padStart(2, '0');
-      monthAdd[mk] = (monthAdd[mk] || 0) + tx.amount;
+      monthAdd[mk] = (monthAdd[mk] || 0) + txAmount;
     }
     imported++;
   });
@@ -4813,10 +4876,10 @@ function importTransactions(txs, opts = {}) {
     const history = DB.customerTx[customerName] || [];
     if (history.length === 0) return;
     
-    const historySum = history.reduce((s, t) => s + (t.amount || 0), 0);
+    const historySum = history.reduce((s, t) => s + Math.max(0, Number(t.amount || 0)), 0);
     const historyVisits = history.length;
     
-    // Use max of seed baseline vs imported history
+    // Use max of seed baseline vs imported history (zero-clamped)
     const newSpent = Math.max(cust.seedSpent || 0, historySum);
     const newVisits = Math.max(cust.seedVisits || 0, historyVisits);
     
@@ -4839,7 +4902,7 @@ function importTransactions(txs, opts = {}) {
         if (!tx.date) return;
         const mk = /^\d{4}-\d{2}/.test(tx.date) ? tx.date.slice(0, 7) : '';
         if (!mk) return;
-        monthlyDelta[mk] = (monthlyDelta[mk] || 0) + (tx.amount || 0);
+        monthlyDelta[mk] = (monthlyDelta[mk] || 0) + Math.max(0, Number(tx.amount || 0));
       });
       
       Object.entries(monthlyDelta).forEach(([month, amount]) => {
@@ -4869,7 +4932,7 @@ function importTransactions(txs, opts = {}) {
     const match = findCustomerMatch(tx);
     return !(match && match.isSeed);
   });
-  DB.importedRev += nonSeedFresh.reduce((s, tx) => s + Number(tx.amount || 0), 0);
+  DB.importedRev += nonSeedFresh.reduce((s, tx) => s + Math.max(0, Number(tx.amount || 0)), 0);
   DB.importedTx += nonSeedFresh.length;
 
   // Build per-customer transaction history (dedup-guarded like everything above)
@@ -6418,6 +6481,7 @@ async function forcePullFromCloud(){
       data.transactions.forEach(tx => { markSeen(tx); });
     }
 
+    sanitizeNegativeTotals();
     save();
     purgeMerchantData();
     refreshAll();
@@ -6493,6 +6557,7 @@ async function smartMergeCloud(){
       DB.customerTx[name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
     });
 
+    sanitizeNegativeTotals();
     save();
     // Merchant exclusion survives merges too — drop any Simon Musyoka records
     // pulled in from the cloud BEFORE pushing, so the sheet gets scrubbed too.
@@ -6820,8 +6885,8 @@ function recalcFromHistory(){
       c.visits = Math.max(c.seedVisits || 0, historyVisits);
     } else {
       // NON-SEED CUSTOMER: use transaction history directly
-      c.spent = historySum;
-      c.visits = historyVisits;
+      c.spent = Math.max(0, historySum);
+      c.visits = Math.max(0, historyVisits);
     }
     
     const dates = txs.map(t => t.date).filter(Boolean).sort();

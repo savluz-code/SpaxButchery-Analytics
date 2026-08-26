@@ -1,10 +1,12 @@
 'use strict';
 
-// Regression guard for the state of main after PRs #20-#24 were rolled back
-// (see "Revert PR #20..#24" commits). Two things must stay true:
+// Regression guard for the state of main after PR #20 was restored while
+// PRs #21-#24 remain rolled back. Three things must stay true:
 //
 //   1. Overview revenue / customer KPIs keep using live data (PR #26).
-//   2. The cloud-sync code introduced by PRs #20-#24 is fully gone, so that
+//   2. The PR #20 cloud-sync hardening (blank-record rejection, no destructive
+//      empty-cloud writes, Apps Script lock, actionable errors) is present.
+//   3. The cloud-sync code introduced by PRs #21-#24 is still gone, so that
 //      re-applying them one at a time is a clean, attributable change.
 
 const assert = require('node:assert/strict');
@@ -35,15 +37,31 @@ test('Overview KPIs source live product stats and customer list length', () => {
   assert.doesNotMatch(refreshAll, /const totRev=REPORT\.totalRevenue\+DB\.importedRev;/);
 });
 
-test('PR #20-#24 cloud-sync helpers are absent from the rolled-back app', () => {
-  // Each name was added by one of the reverted PRs; none of them may survive.
+test('PR #20 cloud-sync hardening helpers are present', () => {
+  // Each name was added by PR #20 (commit bdef619); they must survive.
+  const restoredSymbols = [
+    'cloudRequest',       // fetch wrapper: timeout, HTTP/JSON errors
+    'cloudLoad',          // config check + action=load via cloudRequest
+    'validCloudCustomers' // rejects blank rows before any pull/overwrite
+  ];
+
+  for (const symbol of restoredSymbols) {
+    assert.ok(
+      htmlSource.includes(symbol),
+      `${symbol} missing from index.html — PR #20 restoration is incomplete`
+    );
+  }
+});
+
+test('PR #21-#24 cloud-sync helpers are absent from the app', () => {
+  // Each name was added by one of the still-reverted PRs; none of them may
+  // survive alongside the #20 restoration.
   const revertedSymbols = [
-    'validCloudCustomers',   // #20 / #22
-    'cloudCustomerKey',      // #20 / #22
-    'cloudWritesSuspended',  // #20 / #22
-    'setCloudWriteHold',     // #20 / #22
-    'totalRevenueAll',       // #23
-    'totalCustomerCount',    // #23
+    'cloudCustomerKey',   // #22
+    'cloudWritesSuspended', // #22
+    'setCloudWriteHold',  // #22
+    'totalRevenueAll',    // #23
+    'totalCustomerCount', // #23
     'healImportedAggregates',// #23
     'importedCustomerCount'  // #23
   ];
@@ -51,7 +69,7 @@ test('PR #20-#24 cloud-sync helpers are absent from the rolled-back app', () => 
   for (const symbol of revertedSymbols) {
     assert.ok(
       !htmlSource.includes(symbol),
-      `${symbol} still present in index.html — PR #20-#24 rollback is incomplete`
+      `${symbol} still present in index.html — PR #20-only restoration is incomplete`
     );
   }
 });

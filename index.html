@@ -973,10 +973,13 @@ async function loadFromCloud() {
         DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
       }
       if (data.transactions) {
-        DB.transactions = data.transactions.map(t => ({...t, amount: Number(t.amount) || 0}));
+        DB.transactions = data.transactions.map(t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0}));
       }
       if (data.customerTx) {
-        DB.customerTx = data.customerTx;
+        DB.customerTx = {};
+        Object.keys(data.customerTx).forEach(name => {
+          DB.customerTx[name] = (data.customerTx[name] || []).map(t => ({...t, date: stripTime(t.date) || ''}));
+        });
       } else {
         DB.transactions = []; }
       // Restore the dedup map in the SAME key format the import guard uses
@@ -985,17 +988,17 @@ async function loadFromCloud() {
       // past the guard and double-counted revenue & stats.
       if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
         DB.seen = data.seen;
-      } else if (data.transactions) {
+      } else if (DB.transactions) {
         DB.seen = {};
-        data.transactions.forEach(tx => { markSeen(tx); });
+        DB.transactions.forEach(tx => { markSeen(tx); });
       }
       sanitizeNegativeTotals();
       lastSyncTime = new Date();
       showSyncStatus('✅ Synced ' + lastSyncTime.toLocaleTimeString());
       reconcileNewFlags();
-      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
       const cloudFixed = repairDates();
       if(cloudFixed > 0) console.log('Cloud sync repair: fixed', cloudFixed, 'customers');
+      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
       // Merchant exclusion is non-negotiable: if the cloud sheet still carries
       // Simon Musyoka (the Merchant), scrub him from the merged data now.
       purgeMerchantData();
@@ -1123,12 +1126,17 @@ function getTodayEAT(){
   return eatTime.toISOString().slice(0,10);
 }
 
-// Strip time component from any date string — always return YYYY-MM-DD only
+// Strip time component from any date value — always return YYYY-MM-DD only.
+// Handles "2026-08-12", "2026-08-12T14:25:30.000Z", "2026-08-12 14:25:30",
+// "12/08/2026 14:25:30" and Excel serial numbers (e.g. 46200.5), so no
+// stray digits are ever shown (or stored) after a date.
 function stripTime(dateStr){
-  if(!dateStr) return "";
+  if(dateStr === null || dateStr === undefined || dateStr === '') return "";
   const s = String(dateStr).trim();
-  const m = s.match(/(\d{4}-\d{2}-\d{2})/);
-  return m ? m[1] : "";
+  if(!s) return "";
+  const iso = s.match(/(\d{4}-\d{2}-\d{2})/);
+  if (iso) return iso[1];
+  return parseDate(s);
 }
 
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
@@ -3424,6 +3432,28 @@ function getProductStats(){
 }
 function repairDates(){
   let fixed = 0;
+  // Remove any digits after a date EVERYWHERE it is stored (customers below,
+  // plus transaction rows, per-customer history, ledgers, expenses and the
+  // dedup seen-map) so no timestamp can ever reach the UI.
+  (DB.transactions||[]).forEach(t => {
+    const d = stripTime(t.date);
+    if(d !== (t.date || '')){ t.date = d; fixed++; }
+  });
+  Object.keys(DB.customerTx||{}).forEach(name => {
+    (DB.customerTx[name]||[]).forEach(t => {
+      const d = stripTime(t.date);
+      if(d !== (t.date || '')){ t.date = d; fixed++; }
+    });
+  });
+  (DB.dailyLedgers||[]).forEach(l => {
+    const d = stripTime(l.date);
+    if(d !== (l.date || '')){ l.date = d; fixed++; }
+  });
+  (DB.dailyExpenses||[]).forEach(e => {
+    const d = stripTime(e.date);
+    if(d !== (e.date || '')){ e.date = d; fixed++; }
+  });
+  fixed += normalizeSeenDates();
   DB.customers.forEach(c => {
     if(c.firstVisit) c.firstVisit = stripTime(c.firstVisit);
     if(c.lastVisit) c.lastVisit = stripTime(c.lastVisit);
@@ -3773,7 +3803,7 @@ function renderAnalytics(){
 
   $('anExpSummary').innerHTML=`<b>${kes(ex.total)}</b> in 30 days · <b>${kes(ex.total/30)}/day</b> burn${pl.rev?` · <b>${(ex.total/pl.rev*100).toFixed(1)}%</b> of revenue`:''}${ex.cats.length?` · Top: ${ex.cats.slice(0,3).map(c=>`${c[0]} ${kes(c[1])}`).join(', ')}`:''}`;
   const expList=(DB.dailyExpenses||[]).map((e,i)=>({e,i})).sort((a,b)=>(b.e.date||'').localeCompare(a.e.date||'')).slice(0,14);
-  $('anExpTable').innerHTML=expList.length?expList.map(({e,i})=>`<tr><td>${e.date}</td><td>${e.category}</td><td style="font-weight:600">${kes(e.amount)}</td><td style="color:var(--muted)">${e.note||''}</td><td><button class="btn ghost sm" onclick="delDailyExpense(${i})">✕</button></td></tr>`).join(''):'<tr><td colspan="5" style="color:var(--muted)">No expenses recorded yet.</td></tr>';
+  $('anExpTable').innerHTML=expList.length?expList.map(({e,i})=>`<tr><td>${stripTime(e.date)||''}</td><td>${e.category}</td><td style="font-weight:600">${kes(e.amount)}</td><td style="color:var(--muted)">${e.note||''}</td><td><button class="btn ghost sm" onclick="delDailyExpense(${i})">✕</button></td></tr>`).join(''):'<tr><td colspan="5" style="color:var(--muted)">No expenses recorded yet.</td></tr>';
 
   $('anOvSummary').innerHTML=`<b>${kes(ovBurden)}</b> fixed-cost burden per 30 days${pl.rev?` · <b>${(ovBurden/pl.rev*100).toFixed(1)}%</b> of revenue`:''}`;
   $('anOvTable').innerHTML=(DB.overheads||[]).map((o,i)=>`<tr><td>${o.name}</td><td>${kes(o.amount)}</td><td>${o.cadence}</td><td>${kes(Math.round(overheadBurdenOf(o)))}</td><td><button class="btn ghost sm" onclick="delOverhead(${i})">✕</button></td></tr>`).join('')||'<tr><td colspan="5" style="color:var(--muted)">No overheads yet — add rent, licences, salaries…</td></tr>';
@@ -3933,7 +3963,7 @@ function renderCustTable(){
     return b.spent-a.spent;
   });
   $('custTable').querySelector('tbody').innerHTML=rows.map(c=>{
-    const[st,cls]=statusOf(c.days);const first=c.firstVisit||'—';const last=c.lastVisit||'—';
+    const[st,cls]=statusOf(c.days);const first=stripTime(c.firstVisit)||'—';const last=stripTime(c.lastVisit)||'—';
     const reach=c.masked||c.contact==='—'?'—':`<button class="btn wa sm" onclick="quickWA('${normPhone(c.contact)}','${c.name.replace(/'/g,"\\'")}')">WA</button>
       <button class="btn blue sm" onclick="quickSMS('${normPhone(c.contact)}','${c.name.replace(/'/g,"\\'")}')">SMS</button>`;
     const ntm = isNewThisMonth(c);
@@ -3977,7 +4007,7 @@ function renderTransactions(){
   $('txTable').querySelector('tbody').innerHTML = rows.length ? rows.map(t=>{
     const prod = t.product==='meat' ? '🥩 Meat' : t.product==='soup' ? '🍲 Soup' : '—';
     return `<tr>
-    <td>${t.date||'—'}</td>
+    <td>${stripTime(t.date)||'—'}</td>
     <td>${t.name||'—'}</td>
     <td>${t.phone?`<span class="badge b-valid">${t.phone}</span>`:'—'}</td>
     <td>${t.receipt||'—'}</td>
@@ -4042,8 +4072,9 @@ function parseAmount(value) {
 }
 
 function parseDate(value) {
-  if (!value) return "";
+  if (value === null || value === undefined || value === "") return "";
   if (typeof value === "number") {
+    if (!XLSX || !XLSX.SSF) return "";
     const d = XLSX.SSF.parse_date_code(value);
     if (!d) return "";
     return `${d.y}-${String(d.m).padStart(2, "0")}-${String(d.d).padStart(2, "0")}`;
@@ -4065,6 +4096,18 @@ function parseDate(value) {
       return `${year}-${month}-${day}`;
     }
   }
+  // Excel serial number stored as text (e.g. "46200.5") — convert it the same
+  // way numeric date cells are handled, so no floating digits leak into dates.
+  if (/^\d+(\.\d+)?$/.test(raw)) {
+    const n = Number(raw);
+    if (n >= 20000 && n <= 80000 && XLSX && XLSX.SSF) {
+      const d = XLSX.SSF.parse_date_code(n);
+      if (d) return `${d.y}-${String(d.m).padStart(2, "0")}-${String(d.d).padStart(2, "0")}`;
+    }
+    return "";
+  }
+  // A bare year ("2026") is not a calendar date — don't turn it into Jan 1st.
+  if (/^\d{4}$/.test(raw)) return "";
   const d = new Date(raw);
   if (!isNaN(d)) return d.toISOString().slice(0, 10);
   return "";
@@ -4193,6 +4236,11 @@ function mergeBaselineCustomer(c) {
   // getProductStats() and turns the Overview Total Revenue negative.
   const totalSpent = Math.max(0, Number(c.totalSpent) || 0);
   const totalVisits = Math.max(0, Number(c.visits) || 0);
+  // Keep date-only values — never store time digits after a visit date
+  // (callers already normalize, this just guards the last write anyway).
+  const dOnly = (f) => (f === null || f === undefined || f === '') ? '' : (String(f).match(/(\d{4}-\d{2}-\d{2})/) || [,''])[1];
+  const firstVisit = dOnly(c.firstVisit);
+  const lastVisit = dOnly(c.lastVisit);
   if (existing) {
     existing.name = existing.name || c.name;
     if (isValidKenyanContact(c.contact) && !isValidKenyanContact(existing.contact)) existing.contact = c.contact;
@@ -4200,14 +4248,16 @@ function mergeBaselineCustomer(c) {
     existing.spent = Math.max(0, Number(existing.spent || 0), totalSpent);
     existing.visits = Math.max(0, Number(existing.visits || 0), totalVisits);
     // Handle visit dates: firstVisit = earliest, lastVisit = latest
-    if (c.lastVisit) {
-      if (!existing.lastVisit || c.lastVisit > existing.lastVisit) {
-        existing.lastVisit = c.lastVisit;
+    if (lastVisit) {
+      const cur = dOnly(existing.lastVisit);
+      if (!cur || lastVisit > cur) {
+        existing.lastVisit = lastVisit;
       }
     }
-    if (c.firstVisit) {
-      if (!existing.firstVisit || c.firstVisit < existing.firstVisit) {
-        existing.firstVisit = c.firstVisit;
+    if (firstVisit) {
+      const cur = dOnly(existing.firstVisit);
+      if (!cur || firstVisit < cur) {
+        existing.firstVisit = firstVisit;
       }
     }
     // Recalculate days from lastVisit
@@ -4222,9 +4272,9 @@ function mergeBaselineCustomer(c) {
     contact: c.contact,
     spent: totalSpent,
     visits: totalVisits || 1,
-    days: c.lastVisit ? daysSince(c.lastVisit) : 999,
-    firstVisit: c.firstVisit || c.lastVisit || "",
-    lastVisit: c.lastVisit || c.firstVisit || "",
+    days: lastVisit ? daysSince(lastVisit) : 999,
+    firstVisit: firstVisit || lastVisit || "",
+    lastVisit: lastVisit || firstVisit || "",
     masked: contactStatus({ contact: c.contact }) === "Masked",
     // Baseline/aggregate rows are never "new" — they represent existing
     // history, not a customer discovered by the latest statement batch.
@@ -4703,8 +4753,9 @@ function parseMpesaText(raw, sourceLabel) {
 }
 function transactionKey(tx) {
   const receipt = cleanReceipt(tx.receipt);
-  if (receipt) return ["receipt", receipt, tx.date || "", tx.time || ""].join("|");
-  return ["composite", tx.date || "", tx.time || "", Number(tx.amount || 0).toFixed(2), normalizeName(tx.name), normalizeContact(tx.contact || tx.phone)].join("|");
+  const d = stripTime(tx.date) || tx.date || "";
+  if (receipt) return ["receipt", receipt, d, tx.time || ""].join("|");
+  return ["composite", d, tx.time || "", Number(tx.amount || 0).toFixed(2), normalizeName(tx.name), normalizeContact(tx.contact || tx.phone)].join("|");
 }
 // Time-less variant of the receipt key. DB.seen may legitimately hold keys from
 // older rows whose `time` was never stored (cloud-synced rows, pre-fix imports),
@@ -4715,7 +4766,25 @@ function transactionKey(tx) {
 function txKeyNoTime(tx) {
   const receipt = cleanReceipt(tx.receipt);
   if (!receipt) return null;
-  return ["receipt", receipt, tx.date || "", ""].join("|");
+  return ["receipt", receipt, stripTime(tx.date) || tx.date || "", ""].join("|");
+}
+// Rewrites legacy seen-keys that embedded a full timestamp ("2026-08-12T00:00:00.000Z"
+// or "2026-08-12 14:25:30") into date-only keys. Old cloud-synced rows were
+// fingerprinted with the raw timestamp, while new imports write date-only keys —
+// without this rewrite re-importing the same statement would slip past the
+// duplicate guard and double-count revenue.
+function normalizeSeenDates(){
+  if(!DB || !DB.seen) return 0;
+  let changed = 0;
+  Object.keys(DB.seen).forEach(k => {
+    const nk = String(k).replace(/(\d{4}-\d{2}-\d{2})[T ]+\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/, '$1');
+    if(nk !== k){
+      if(!DB.seen[nk]) DB.seen[nk] = DB.seen[k];
+      delete DB.seen[k];
+      changed++;
+    }
+  });
+  return changed;
 }
 // Central dedup lookups — every import/backfill path must use these so the guard
 // stays consistent with the keys written into DB.seen (including time-less receipt
@@ -4901,7 +4970,7 @@ function importTransactions(txs, opts = {}) {
   let imported = 0, dupes = 0, added = 0, updated = 0, unmasked = 0;
   const monthAdd = {};
   const comebacks = [];
-  const txDate = (tx) => tx.date || new Date().toISOString().slice(0, 10);
+  const txDate = (tx) => stripTime(tx.date) || new Date().toISOString().slice(0, 10);
   // FIRST de-duplicate, THEN mutate. Previously the transaction row was pushed to
   // DB.transactions BEFORE the dedup guard, and the final `importedRev` tally summed
   // EVERY input (including duplicates), while customer spent/visits and monthly
@@ -4937,8 +5006,8 @@ function importTransactions(txs, opts = {}) {
       contact: normalizeContact(tx.phone || tx.contact || ''),
       totalSpent: Number(tx.amount || 0),
       visits: Number(tx.visits || 0) || 1,
-      firstVisit: tx.date || '',
-      lastVisit: tx.date || ''
+      firstVisit: stripTime(tx.date) || '',
+      lastVisit: stripTime(tx.date) || ''
     });
     const after = findCustomerMatch(tx);
     if(after && prevLast && noteComebackReturn(after, prevLast, after.lastVisit)) comebacks.push(after.name);
@@ -4956,7 +5025,7 @@ function importTransactions(txs, opts = {}) {
     const product = classifyProduct(tx.date, tx.amount);
     const txAmount = Math.max(0, Number(tx.amount || 0));
     DB.transactions.push({
-      date: tx.date || '',
+      date: stripTime(tx.date) || '',
       time: tx.time || '',
       amount: txAmount,
       name: tx.name || '',
@@ -5123,7 +5192,7 @@ function importTransactions(txs, opts = {}) {
     if(cust){
       if(!DB.customerTx[cust.name]) DB.customerTx[cust.name] = [];
       DB.customerTx[cust.name].push({
-        date: tx.date || '',
+        date: stripTime(tx.date) || '',
         amount: Number(tx.amount || 0),
         product: classifyProduct(tx.date, tx.amount),
         receipt: tx.receipt || '',
@@ -5835,7 +5904,7 @@ function parseSheetRows(raw) {
         name: toTitleCase(name) || 'Unknown',
         phone: pm ? normalizeContact(pm[0]) : '',
         amount: amt, visits: 1,
-        date: iDate >= 0 ? ('' + (r[iDate] || '')).slice(0, 10) : '', time: ''
+        date: iDate >= 0 ? parseDate(r[iDate]) : '', time: ''
       });
     });
   } else if (iName >= 0 && iAmt >= 0) {
@@ -5854,7 +5923,7 @@ function parseSheetRows(raw) {
         receipt: '', name: nm,
         phone: iPhone >= 0 ? normalizeContact(r[iPhone] || '') : '',
         amount: amt, visits: iVis >= 0 ? (parseInt(r[iVis]) || 1) : 1,
-        date: iDate >= 0 ? ('' + (r[iDate] || '')).slice(0, 10) : '', time: '',
+        date: iDate >= 0 ? parseDate(r[iDate]) : '', time: '',
         isAggregate
       });
     });
@@ -5889,7 +5958,7 @@ function showPreview(rows, fmt) {
         : '<span class="badge b-new">New customer</span>';
     }
     return `<tr style="${r.dup ? 'opacity:.45' : ''}"><td>${r.receipt || '—'}</td><td>${r.name}</td><td>${r.phone || '—'}</td>
-    <td>${kes(r.amount)}</td><td>${r.date || '—'}${r.time ? ' ' + r.time : ''}</td><td>${tag}</td></tr>`;
+    <td>${kes(r.amount)}</td><td>${stripTime(r.date) || '—'}${r.time ? ' ' + r.time : ''}</td><td>${tag}</td></tr>`;
   }).join('');
   $('previewCard').style.display = 'block';
   $('previewCard').scrollIntoView({ behavior: 'smooth' });
@@ -6960,7 +7029,7 @@ function showCustomerDetail(name){
   $('modalTotal').textContent = kes(c.spent);
   $('modalVisits').textContent = c.visits;
   $('modalAvg').textContent = 'KES ' + Math.round(c.spent/Math.max(c.visits,1)).toLocaleString();
-  $('modalLast').textContent = c.lastVisit || '—';
+  $('modalLast').textContent = stripTime(c.lastVisit) || '—';
   const ipiInfo = customerIPI(c);
   $('modalAvg').innerHTML = 'KES ' + Math.round(c.spent/Math.max(c.visits,1)).toLocaleString() + '<br><small style="color:var(--muted);font-size:.72rem;">Cycle: ~' + ipiInfo.ipi + 'd (' + (ipiInfo.status==='overdue'?'⚠️ Overdue ' + ipiInfo.multiplier + 'x': 'On track') + ')</small>';
 
@@ -6991,7 +7060,7 @@ function showCustomerDetail(name){
           <div style="display:flex;flex-direction:column;gap:4px;">
             ${monthTxs.map(t => `
               <div style="display:flex;justify-content:space-between;padding:6px 10px;background:rgba(255,255,255,.03);border-radius:4px;">
-                <span style="color:var(--muted);">${t.date || '—'} ${t.product==='soup'?'🍲':'🥩'}</span>
+                <span style="color:var(--muted);">${stripTime(t.date) || '—'} ${t.product==='soup'?'🍲':'🥩'}</span>
                 <span style="font-weight:600;">${kes(t.amount)}</span>
               </div>
             `).join('')}
@@ -7028,7 +7097,7 @@ function backfillTransactions(txs){
 
     const product = classifyProduct(tx.date, tx.amount);
     const ntx = {
-      date: tx.date || '',
+      date: stripTime(tx.date) || '',
       time: tx.time || '',
       amount: Number(tx.amount || 0),
       name: tx.name || '',

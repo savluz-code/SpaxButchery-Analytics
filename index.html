@@ -49,7 +49,9 @@ tr:hover td{background:rgba(255,255,255,.03)}
 .b-new{background:rgba(46,196,182,.25);color:var(--green)}
 /* 🌱 first-ever purchase falls in the current calendar month — acquisition,
    distinct from the teal NEW badge which means 'found in the latest import' */
-.b-month{background:rgba(255,209,102,.18);color:var(--gold);border:1px solid rgba(255,209,102,.35)}.b-dup{background:rgba(230,57,70,.25);color:var(--red2)}
+.b-month{background:rgba(255,209,102,.18);color:var(--gold);border:1px solid rgba(255,209,102,.35)}.b-month.leaf-only{padding:2px 6px}.b-dup{background:rgba(230,57,70,.25);color:var(--red2)}
+.cust-name{display:inline-block;vertical-align:top;line-height:1.35}
+.cust-name.ntm{color:var(--gold)}
 input,select,textarea{background:var(--card2);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-size:.9rem;font-family:inherit}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--red)}
 textarea{width:100%;resize:vertical}
@@ -3865,6 +3867,15 @@ $('kpiGrid').innerHTML=`
 }
 
 /* ══════════ CUSTOMER TABLE ══════════ */
+// Keep the frozen Name column compact: display at most two name words per line
+// and push any third (and later) word onto a new line beneath them.
+function wrapCustomerName(name){
+  const words = String(name || '').trim().split(/\s+/).filter(Boolean);
+  return words.map((w, i) => {
+    const esc = w.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    return (i > 0 && i % 2 === 0 ? '<br>' : (i > 0 ? ' ' : '')) + esc;
+  }).join('');
+}
 function renderCustTable(){
   const q=($('custSearch').value||'').toLowerCase(),f=$('custFilter').value,s=$('custSort').value,pf=$('productFilter')?$('productFilter').value:'all';
   let rows=DB.customers.filter(c=>c.name.toLowerCase().includes(q)||c.contact.includes(q));
@@ -3910,8 +3921,9 @@ function renderCustTable(){
     const[st,cls]=statusOf(c.days);const first=c.firstVisit||'—';const last=c.lastVisit||'—';
     const reach=c.masked||c.contact==='—'?'—':`<button class="btn wa sm" onclick="quickWA('${normPhone(c.contact)}','${c.name.replace(/'/g,"\\'")}')">WA</button>
       <button class="btn blue sm" onclick="quickSMS('${normPhone(c.contact)}','${c.name.replace(/'/g,"\\'")}')">SMS</button>`;
+    const ntm = isNewThisMonth(c);
     return `<tr style="cursor:pointer" onclick="showCustomerDetail('${c.name.replace(/'/g,"\'")}')">
-    <td>${c.name}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${c.isNew?' <span class="badge b-new">NEW</span>':''}${isNewThisMonth(c)?' <span class="badge b-month" title="First-ever purchase this month">🌱 NEW THIS MONTH</span>':''}</td>
+    <td><span class="cust-name${ntm?' ntm':''}">${wrapCustomerName(c.name)}</span>${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${c.isNew?' <span class="badge b-new">NEW</span>':''}${ntm?' <span class="badge b-month leaf-only" title="First-ever purchase this month">🌱</span>':''}</td>
     <td><span class="badge ${c.masked?'b-masked':'b-valid'}">${c.contact}</span></td>
     <td>${kes(c.spent)}</td><td>${c.visits}</td><td>KES ${Math.round(c.spent/Math.max(c.visits,1))}</td>
     <td>${c.days}</td><td>${first}</td><td>${last}</td><td><span class="badge ${cls}">${st}</span>${customerIPI(c).status==='overdue'?' <span class="badge b-risk" title="Personal purchase interval overdue">⚡ Overdue</span>':''}</td>
@@ -6779,13 +6791,15 @@ function showCustomerDetail(name){
   const c = DB.customers.find(x => x.name === name);
   if(!c) return;
 
+  const ntm = isNewThisMonth(c);
   $('modalCustName').textContent = c.name;
+  $('modalCustName').style.color = ntm ? 'var(--gold)' : '';
   $('modalCustInfo').innerHTML = `
     <span class="badge ${c.masked?'b-masked':'b-valid'}">${c.contact}</span>
     <span class="badge ${statusOf(c.days)[1]}">${statusOf(c.days)[0]}</span>
     ${c.spent>=10000?'<span class="badge b-vip">VIP</span>':''}
     ${c.isNew?'<span class="badge b-new">NEW</span>':''}
-    ${isNewThisMonth(c)?`<span class="badge b-month" title="First-ever purchase in ${monthLabelEAT()}">🌱 NEW THIS MONTH</span>`:''}
+    ${ntm?`<span class="badge b-month leaf-only" title="First-ever purchase in ${monthLabelEAT()}">🌱</span>`:''}
   `;
   $('modalTotal').textContent = kes(c.spent);
   $('modalVisits').textContent = c.visits;

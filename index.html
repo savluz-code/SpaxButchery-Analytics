@@ -76,6 +76,15 @@ textarea{width:100%;resize:vertical}
 .conf{font-size:.72rem;padding:3px 9px;border-radius:12px}
 .conf.med{background:rgba(244,162,97,.2);color:var(--amber)}
 .scroll-y{max-height:480px;overflow-y:auto}
+/* Frozen columns: Name + Contact stick when scrolling horizontally */
+#custTable{min-width:960px;border-collapse:separate;border-spacing:0}
+#custTable thead th:nth-child(1),#custTable tbody td:nth-child(1){position:sticky;left:0;z-index:2;background:var(--card);min-width:180px}
+#custTable thead th:nth-child(2),#custTable tbody td:nth-child(2){position:sticky;left:180px;z-index:2;background:var(--card);min-width:130px}
+#custTable thead th{position:sticky;top:0;z-index:3;background:var(--card)}
+#custTable thead th:nth-child(1),#custTable thead th:nth-child(2){z-index:4}
+#custTable tbody tr:hover td:nth-child(1),#custTable tbody tr:hover td:nth-child(2){background:rgba(255,255,255,.06)}
+/* Subtle shadow on the right edge of frozen columns to hint at scroll */
+#custTable thead th:nth-child(2)::after,#custTable tbody td:nth-child(2)::after{content:'';position:absolute;top:0;bottom:0;right:-4px;width:4px;background:linear-gradient(to right,rgba(0,0,0,.18),transparent);pointer-events:none}
 .tpl-preview{background:var(--card2);border-radius:10px;padding:14px;font-size:.85rem;line-height:1.6;border-left:4px solid var(--wa);margin-top:10px;white-space:pre-wrap}
 .toast{position:fixed;bottom:24px;right:24px;background:var(--green);color:#04292a;padding:14px 20px;border-radius:10px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,.4);transform:translateY(140px);transition:.3s;z-index:99;max-width:360px}
 .toast.show{transform:none}
@@ -170,7 +179,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
       </select>
     </div>
     <div id="custStatsBar" style="font-size:.8rem;color:var(--muted);margin-bottom:8px;min-height:20px;"></div>
-    <div class="scroll-y"><table id="custTable">
+    <div class="scroll-y" style="overflow-x:auto"><table id="custTable">
       <thead><tr><th>Name</th><th>Contact</th><th>Spent</th><th>Visits</th><th>Avg</th><th>Days</th><th>First Visit</th><th>Last Visit</th><th>Status</th><th>Reach</th></tr></thead>
       <tbody></tbody></table></div>
   </div>
@@ -405,7 +414,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
   <div class="card">
     <h3>Masked Contacts Remaining</h3>
     <div class="scroll-y" style="max-height:360px"><table id="maskTable">
-      <thead><tr><th>Name</th><th>Masked</th><th>Spent</th><th>Visits</th><th>Days Away</th></tr></thead><tbody></tbody></table></div>
+      <thead><tr><th>Name</th><th>Masked</th><th>Spent</th><th>Visits</th><th>Days Away</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
   </div>
 </section>
 
@@ -802,6 +811,31 @@ function doPost(e) {
       <button class="btn ghost" onclick="closeRebuildModal()">Cancel</button>
       <button class="btn" style="background:var(--amber);color:#000" onclick="proceedRebuild()">📁 Choose Files</button>
     </div>
+  </div>
+</div>
+
+<!-- Contact Edit Modal (Contact Resolver) -->
+<div id="contactEditModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:250;align-items:center;justify-content:center;padding:16px;">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h3 style="margin:0;font-size:1.05rem;">✏️ Edit Contact</h3>
+      <button class="btn ghost" onclick="closeContactEdit()" style="font-size:1.2rem;line-height:1;">✕</button>
+    </div>
+    <div style="font-size:.8rem;color:var(--muted);margin-bottom:14px;">Correct the name and/or contact if they were captured incorrectly.</div>
+    <input type="hidden" id="contactEditIdx">
+    <div style="margin-bottom:12px;">
+      <label style="font-size:.8rem;color:var(--muted);display:block;margin-bottom:4px;font-weight:600;">Name</label>
+      <input type="text" id="contactEditName" style="width:100%;box-sizing:border-box" placeholder="Customer name">
+    </div>
+    <div style="margin-bottom:16px;">
+      <label style="font-size:.8rem;color:var(--muted);display:block;margin-bottom:4px;font-weight:600;">Contact (phone)</label>
+      <input type="text" id="contactEditPhone" style="width:100%;box-sizing:border-box" placeholder="e.g. 0723456321">
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;">
+      <button class="btn ghost" onclick="closeContactEdit()">Cancel</button>
+      <button class="btn green" onclick="saveContactEdit()">💾 Save Changes</button>
+    </div>
+    <div id="contactEditMsg" style="margin-top:10px;font-size:.82rem;min-height:20px;"></div>
   </div>
 </div>
 
@@ -3407,11 +3441,19 @@ function repairDates(){
       fixed++;
     }
     // 2. Single-visit customers: firstVisit must equal lastVisit
-    // BUT only when there is NO transaction history proving otherwise.
-    // Backfill keeps visits frozen while extending real dates from statements,
-    // so a customer CAN legitimately have visits:1 with two different real dates.
+    // If there IS transaction history with multiple dates, the history is
+    // authoritative — the visits count was never updated by backfill, so fix
+    // it now. Otherwise (no history or exactly 1 history entry), force both
+    // dates to be equal.
     const hasHistory = (DB.customerTx[c.name] || []).length > 0;
-    if((c.visits || 0) === 1 && !hasHistory && c.firstVisit && c.lastVisit && c.firstVisit !== c.lastVisit){
+    const histLen = (DB.customerTx[c.name] || []).length;
+    if((c.visits || 0) === 1 && hasHistory && histLen > 1){
+      // Backfill added history but didn't update visits — fix the count from
+      // the actual transaction record.
+      c.visits = histLen;
+      fixed++;
+    }
+    if((c.visits || 0) === 1 && c.firstVisit && c.lastVisit && c.firstVisit !== c.lastVisit){
       // Use the earlier date as both (more conservative)
       const earlier = c.firstVisit < c.lastVisit ? c.firstVisit : c.lastVisit;
       c.firstVisit = earlier;
@@ -3874,7 +3916,7 @@ function renderCustTable(){
     <td><span class="badge ${c.masked?'b-masked':'b-valid'}">${c.contact}</span></td>
     <td>${kes(c.spent)}</td><td>${c.visits}</td><td>KES ${Math.round(c.spent/Math.max(c.visits,1))}</td>
     <td>${c.days}</td><td>${first}</td><td>${last}</td><td><span class="badge ${cls}">${st}</span>${customerIPI(c).status==='overdue'?' <span class="badge b-risk" title="Personal purchase interval overdue">⚡ Overdue</span>':''}</td>
-    <td style="white-space:nowrap"><button class="btn ghost sm" onclick="event.stopPropagation();showCustomerDetail('${c.name.replace(/'/g,"\'")}')">👁️</button>${reach}</td></tr>`;}).join('');
+    <td style="white-space:nowrap"><button class="btn ghost sm" onclick="event.stopPropagation();showCustomerDetail('${c.name.replace(/'/g,"\'")}')">👁️</button><button class="btn ghost sm" onclick="event.stopPropagation();openContactEdit(${DB.customers.indexOf(c)})" title="Edit name & contact">✏️</button>${reach}</td></tr>`;}).join('');
 }
 $('custSearch').oninput=renderCustTable;$('custFilter').onchange=renderCustTable;$('custSort').onchange=renderCustTable;
 $('lastVisitFrom').onchange=renderCustTable;$('lastVisitTo').onchange=renderCustTable;
@@ -6035,9 +6077,97 @@ $('bulkSMSq').onclick=()=>startQueue('sms');
 /* ══════════ CONTACT RESOLVER ══════════ */
 function renderMaskTable(){
   const m=DB.customers.filter(c=>c.masked).sort((a,b)=>b.spent-a.spent);
-  $('maskTable').querySelector('tbody').innerHTML=m.map(c=>
-    `<tr><td>${c.name}</td><td><span class="badge b-masked">${c.contact}</span></td>
-    <td>${kes(c.spent)}</td><td>${c.visits}</td><td>${c.days}d</td></tr>`).join('')||'<tr><td colspan="5">🎉 No masked contacts in tracked list!</td></tr>';}
+  $('maskTable').querySelector('tbody').innerHTML=m.map((c,idx)=>{
+    const origIdx=DB.customers.indexOf(c);
+    return `<tr><td>${c.name}</td><td><span class="badge b-masked">${c.contact}</span></td>
+    <td>${kes(c.spent)}</td><td>${c.visits}</td><td>${c.days}d</td>
+    <td><button class="btn ghost sm" onclick="event.stopPropagation();openContactEdit(${origIdx})" title="Edit name & contact">✏️ Edit</button></td></tr>`;
+  }).join('')||'<tr><td colspan="6">🎉 No masked contacts in tracked list!</td></tr>';}
+/* ══════════ CONTACT EDIT (Contact Resolver) ══════════ */
+function openContactEdit(idx){
+  const c = DB.customers[idx];
+  if(!c) return;
+  $('contactEditIdx').value = idx;
+  $('contactEditName').value = c.name || '';
+  $('contactEditPhone').value = c.contact || '';
+  $('contactEditMsg').textContent = '';
+  $('contactEditModal').style.display = 'flex';
+  $('contactEditName').focus();
+}
+window.openContactEdit = openContactEdit;
+
+function closeContactEdit(){
+  $('contactEditModal').style.display = 'none';
+}
+window.closeContactEdit = closeContactEdit;
+
+function saveContactEdit(){
+  const idx = Number($('contactEditIdx').value);
+  const c = DB.customers[idx];
+  if(!c){ toast('❌ Customer not found'); return; }
+  const newName = $('contactEditName').value.trim();
+  const newContact = normalizeContact($('contactEditPhone').value.trim());
+  const msgEl = $('contactEditMsg');
+
+  if(!newName){
+    msgEl.innerHTML = '<span style="color:var(--red)">Name cannot be empty.</span>';
+    return;
+  }
+
+  const oldName = c.name;
+  let changes = [];
+
+  // Update name (also update transaction history key and transaction references)
+  if(newName !== oldName){
+    // Move transaction history to the new name
+    if(DB.customerTx && DB.customerTx[oldName]){
+      DB.customerTx[newName] = DB.customerTx[oldName];
+      delete DB.customerTx[oldName];
+    }
+    // Update transaction references
+    (DB.transactions || []).forEach(t => {
+      if(t.name === oldName) t.name = newName;
+    });
+    c.name = newName;
+    changes.push('name → ' + newName);
+  }
+
+  // Update contact
+  if(newContact && newContact !== c.contact){
+    const wasMasked = c.masked;
+    c.contact = newContact;
+    // If the new contact is a valid Kenyan phone, unmask the customer
+    if(isValidKenyanContact(newContact)){
+      if(wasMasked){
+        c.masked = false;
+        DB.resolved++;
+      }
+    } else {
+      c.masked = !isValidKenyanContact(newContact);
+    }
+    changes.push('contact → ' + newContact);
+  }
+
+  if(changes.length === 0){
+    msgEl.innerHTML = '<span style="color:var(--amber)">No changes detected.</span>';
+    return;
+  }
+
+  repairDates();
+  save();
+  refreshAll();
+  closeContactEdit();
+  toast('✅ Updated: ' + changes.join(', '));
+}
+window.saveContactEdit = saveContactEdit;
+
+// Close contact edit modal on backdrop click
+if($('contactEditModal')){
+  $('contactEditModal').addEventListener('click', function(e){
+    if(e.target === $('contactEditModal')) closeContactEdit();
+  });
+}
+
 function resolveContacts(list,silent){
   let auto=0;const review=[];const resolvedNames=[];
   list.forEach(item=>{

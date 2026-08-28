@@ -155,8 +155,10 @@ function saveAll_(body) {
     'name', 'contact', 'spent', 'visits', 'days',
     'firstVisit', 'lastVisit', 'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits',
     // newBatch = the import batch that first created this customer. isNew is
-    // derived from it (newBatch === settings.importBatch), so it must survive
-    // the cloud round-trip or NEW badges would be lost/stuck after a sync.
+    // an internal bookkeeping flag derived from it (newBatch ===
+    // settings.importBatch) — it must survive the cloud round-trip because
+    // revenue reconciliation depends on it, but it is never shown in the UI
+    // (the public NEW 🌱 badge comes from firstVisit's month instead).
     'newBatch'
   ]);
 

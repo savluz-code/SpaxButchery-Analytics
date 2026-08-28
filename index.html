@@ -3856,6 +3856,7 @@ function refreshAll(){
   $('maskedCount').textContent=`${REPORT.masked-DB.resolved} masked report-wide · ${cs.filter(c=>c.masked).length} in tracked list · ${DB.resolved} resolved`;
   const active=cs.filter(c=>c.days<=30).length,risk=cs.filter(c=>c.days>60&&c.days<=90).length,lost=cs.filter(c=>c.days>90).length;
   const ipiOverdueCount = cs.filter(c => customerIPI(c).status === 'overdue').length;
+  const newMonthTotal = newThisMonthCustomers().length;
 
 $('kpiGrid').innerHTML=`
   <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">Gross Sales</div></div>
@@ -3875,7 +3876,6 @@ $('kpiGrid').innerHTML=`
   newChart=new Chart($('ovNew'),{type:'bar',data:{labels:newByMonth.labels,datasets:[{data:newByMonth.counts,
     backgroundColor:'rgba(255,209,102,.75)',borderRadius:6}]},options:{maintainAspectRatio:false,
     plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.parsed.y+' new customer(s)'}}},scales:{y:{ticks:{precision:0}}}}});
-  const newMonthTotal = newThisMonthCustomers().length;
   renderCustTable();renderMaskTable();renderSeg();renderTransactions();
   if($('analytics360') && $('analytics360').classList.contains('active')) renderAnalytics();
 }

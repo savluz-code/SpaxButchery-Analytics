@@ -76,15 +76,14 @@ textarea{width:100%;resize:vertical}
 .conf{font-size:.72rem;padding:3px 9px;border-radius:12px}
 .conf.med{background:rgba(244,162,97,.2);color:var(--amber)}
 .scroll-y{max-height:480px;overflow-y:auto}
-/* Frozen columns: Name + Contact stick when scrolling horizontally */
+/* Frozen column: only Name sticks when scrolling horizontally (Contact + rest scroll into view) */
 #custTable{min-width:960px;border-collapse:separate;border-spacing:0}
 #custTable thead th:nth-child(1),#custTable tbody td:nth-child(1){position:sticky;left:0;z-index:2;background:var(--card);min-width:180px}
-#custTable thead th:nth-child(2),#custTable tbody td:nth-child(2){position:sticky;left:180px;z-index:2;background:var(--card);min-width:130px}
 #custTable thead th{position:sticky;top:0;z-index:3;background:var(--card)}
-#custTable thead th:nth-child(1),#custTable thead th:nth-child(2){z-index:4}
-#custTable tbody tr:hover td:nth-child(1),#custTable tbody tr:hover td:nth-child(2){background:rgba(255,255,255,.06)}
-/* Subtle shadow on the right edge of frozen columns to hint at scroll */
-#custTable thead th:nth-child(2)::after,#custTable tbody td:nth-child(2)::after{content:'';position:absolute;top:0;bottom:0;right:-4px;width:4px;background:linear-gradient(to right,rgba(0,0,0,.18),transparent);pointer-events:none}
+#custTable thead th:nth-child(1){z-index:4}
+#custTable tbody tr:hover td:nth-child(1){background:rgba(255,255,255,.06)}
+/* Subtle shadow on the right edge of the frozen column to hint at scroll */
+#custTable thead th:nth-child(1)::after,#custTable tbody td:nth-child(1)::after{content:'';position:absolute;top:0;bottom:0;right:-4px;width:4px;background:linear-gradient(to right,rgba(0,0,0,.18),transparent);pointer-events:none}
 .tpl-preview{background:var(--card2);border-radius:10px;padding:14px;font-size:.85rem;line-height:1.6;border-left:4px solid var(--wa);margin-top:10px;white-space:pre-wrap}
 .toast{position:fixed;bottom:24px;right:24px;background:var(--green);color:#04292a;padding:14px 20px;border-radius:10px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,.4);transform:translateY(140px);transition:.3s;z-index:99;max-width:360px}
 .toast.show{transform:none}

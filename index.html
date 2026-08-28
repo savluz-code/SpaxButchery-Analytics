@@ -49,7 +49,11 @@ tr:hover td{background:rgba(255,255,255,.03)}
 .b-new{background:rgba(46,196,182,.25);color:var(--green)}
 /* 🌱 first-ever purchase falls in the current calendar month — acquisition,
    distinct from the teal NEW badge which means 'found in the latest import' */
-.b-month{background:rgba(255,209,102,.18);color:var(--gold);border:1px solid rgba(255,209,102,.35)}.b-dup{background:rgba(230,57,70,.25);color:var(--red2)}
+.b-month{background:rgba(255,209,102,.18);color:var(--gold);border:1px solid rgba(255,209,102,.35)}.b-month.leaf-only{padding:2px 6px}.b-dup{background:rgba(230,57,70,.25);color:var(--red2)}
+/* Returned after 3+ months away — acquisition/win-back signal */
+.b-comeback{background:rgba(255,209,102,.28);color:var(--gold);border:1px solid rgba(255,209,102,.5)}.b-comeback.leaf-only{padding:2px 6px}
+.cust-name{display:inline-block;vertical-align:top;line-height:1.35;max-width:100%}
+.cust-name.ntm{color:var(--gold)}
 input,select,textarea{background:var(--card2);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-size:.9rem;font-family:inherit}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--red)}
 textarea{width:100%;resize:vertical}
@@ -154,6 +158,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
         <option value="lost">Lost (90+d)</option><option value="overdue">⚡ Overdue (Personal Cadence)</option><option value="masked">Masked contacts</option>
         <option value="new" title="Customers first seen in the most recent import — not on the baseline and not already added by an earlier statement">🆕 New (latest import)</option>
         <option value="firstmonth" title="Customers whose first-ever purchase falls in the current calendar month">🌱 New this month (first purchase)</option>
+        <option value="comeback" title="Customers who returned after being away 3+ months">🔙 Comeback (3+ months away)</option>
       </select>
       <input type="date" id="lastVisitFrom" title="Last visit from" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
       <input type="date" id="lastVisitTo" title="Last visit to" style="width:120px;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0f1419;color:#e2e8f0;font-size:12px;">
@@ -3468,6 +3473,8 @@ function repairDates(){
       const newDays = Math.max(0, Math.round((today - new Date(c.lastVisit)) / 86400000));
       if(newDays !== c.days){ c.days = newDays; }
     }
+    // 5. A comeback episode ends once the customer lapses 3+ months again.
+    resetComebackIfLapsed(c);
   });
   return fixed;
 }
@@ -3865,6 +3872,15 @@ $('kpiGrid').innerHTML=`
 }
 
 /* ══════════ CUSTOMER TABLE ══════════ */
+// Keep the frozen Name column compact: display at most two name words per line
+// and push any third (and later) word onto a new line beneath them.
+function wrapCustomerName(name){
+  const words = String(name || '').trim().split(/\s+/).filter(Boolean);
+  return words.map((w, i) => {
+    const esc = w.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    return (i > 0 && i % 2 === 0 ? '<br>' : (i > 0 ? ' ' : '')) + esc;
+  }).join('');
+}
 function renderCustTable(){
   const q=($('custSearch').value||'').toLowerCase(),f=$('custFilter').value,s=$('custSort').value,pf=$('productFilter')?$('productFilter').value:'all';
   let rows=DB.customers.filter(c=>c.name.toLowerCase().includes(q)||c.contact.includes(q));
@@ -3873,7 +3889,8 @@ function renderCustTable(){
     if(f==='risk')return c.days>60&&c.days<=90;if(f==='lost')return c.days>90;
     if(f==='overdue')return customerIPI(c).status==='overdue';
     if(f==='masked')return c.masked;if(f==='new')return c.isNew;
-    if(f==='firstmonth')return isNewThisMonth(c);return true;});
+    if(f==='firstmonth')return isNewThisMonth(c);
+    if(f==='comeback')return isComebackCustomer(c);return true;});
   if(lvFrom)rows=rows.filter(c=>c.lastVisit&&c.lastVisit>=lvFrom);
   if(lvTo)rows=rows.filter(c=>c.lastVisit&&c.lastVisit<=lvTo);
   if(pf && pf !== 'all') rows = rows.filter(c => customerProduct(c) === pf);
@@ -3910,8 +3927,9 @@ function renderCustTable(){
     const[st,cls]=statusOf(c.days);const first=c.firstVisit||'—';const last=c.lastVisit||'—';
     const reach=c.masked||c.contact==='—'?'—':`<button class="btn wa sm" onclick="quickWA('${normPhone(c.contact)}','${c.name.replace(/'/g,"\\'")}')">WA</button>
       <button class="btn blue sm" onclick="quickSMS('${normPhone(c.contact)}','${c.name.replace(/'/g,"\\'")}')">SMS</button>`;
+    const ntm = isNewThisMonth(c);
     return `<tr style="cursor:pointer" onclick="showCustomerDetail('${c.name.replace(/'/g,"\'")}')">
-    <td>${c.name}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${c.isNew?' <span class="badge b-new">NEW</span>':''}${isNewThisMonth(c)?' <span class="badge b-month" title="First-ever purchase this month">🌱 NEW THIS MONTH</span>':''}</td>
+    <td><span class="cust-name${ntm?' ntm':''}">${wrapCustomerName(c.name)}</span>${comebackBadge(c)}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${c.isNew?' <span class="badge b-new">NEW</span>':''}${ntm?' <span class="badge b-month leaf-only" title="First-ever purchase this month">🌱</span>':''}</td>
     <td><span class="badge ${c.masked?'b-masked':'b-valid'}">${c.contact}</span></td>
     <td>${kes(c.spent)}</td><td>${c.visits}</td><td>KES ${Math.round(c.spent/Math.max(c.visits,1))}</td>
     <td>${c.days}</td><td>${first}</td><td>${last}</td><td><span class="badge ${cls}">${st}</span>${customerIPI(c).status==='overdue'?' <span class="badge b-risk" title="Personal purchase interval overdue">⚡ Overdue</span>':''}</td>
@@ -4797,6 +4815,50 @@ function monthLabelEAT(month){
   return isNaN(d) ? m : d.toLocaleString('en-GB', { month: 'long', year: 'numeric' });
 }
 
+/* ══════════ COMEBACK (3+ months away, then returned) ══════════
+   A customer is flagged as a comeback when a NEW transaction lands after a
+   gap of >= COMEBACK_DAYS (90 days == about 3 months) since their previous
+   last visit. The flag stays visible while they are active again, disappears
+   automatically if they lapse 3+ months again, and can re-trigger for a new
+   comeback episode. */
+const COMEBACK_DAYS = 90;
+function daysBetweenEAT(a, b){
+  if(!a || !b) return null;
+  const d = Math.round((new Date(String(b).slice(0,10)) - new Date(String(a).slice(0,10))) / 86400000);
+  return isNaN(d) ? null : Math.max(0, d);
+}
+function isComebackCustomer(c){
+  return !!(c && c.comeback && c.comebackAt && (c.days == null || c.days < COMEBACK_DAYS));
+}
+function resetComebackIfLapsed(c){
+  if(c && c.comeback && (c.days || 0) >= COMEBACK_DAYS){
+    c.comeback = false;
+    c.comebackAt = '';
+    c.comebackGapDays = 0;
+    c.comebackNotified = false;
+  }
+}
+// Returns true only when this transaction starts a NEW comeback episode.
+function noteComebackReturn(c, prevLastVisit, txDate){
+  if(!c || !txDate) return false;
+  const prev = prevLastVisit || c.lastVisit;
+  if(!prev || !txDate || String(txDate) <= String(prev)) return false;
+  const gap = daysBetweenEAT(prev, txDate);
+  if(gap == null || gap < COMEBACK_DAYS) return false;
+  const newEpisode = !c.comeback || (c.days || 0) >= COMEBACK_DAYS;
+  if(!newEpisode) return false;
+  c.comeback = true;
+  c.comebackAt = txDate;
+  c.comebackGapDays = gap;
+  c.comebackNotified = false;
+  return true;
+}
+function comebackBadge(c){
+  return isComebackCustomer(c)
+    ? ` <span class="badge b-comeback leaf-only" title="Returned after ${c.comebackGapDays || '3+'} days">🔙</span>`
+    : '';
+}
+
 /* Opens a new import batch: everything flagged NEW by a previous import stops
    being NEW from this point on. Multi-file operations (Rebuild) open the batch
    once and pass { continueBatch:true } for the remaining files so the whole
@@ -4812,6 +4874,7 @@ function importTransactions(txs, opts = {}) {
   const currentBatch = Number(DB.importBatch) || 0;
   let imported = 0, dupes = 0, added = 0, updated = 0, unmasked = 0;
   const monthAdd = {};
+  const comebacks = [];
   const txDate = (tx) => tx.date || new Date().toISOString().slice(0, 10);
   // FIRST de-duplicate, THEN mutate. Previously the transaction row was pushed to
   // DB.transactions BEFORE the dedup guard, and the final `importedRev` tally summed
@@ -4841,6 +4904,8 @@ function importTransactions(txs, opts = {}) {
   const aggregateFresh = fresh.filter(tx => tx.isAggregate);
   const txFresh = fresh.filter(tx => !tx.isAggregate);
   aggregateFresh.forEach(tx => {
+    const before = findCustomerMatch(tx);
+    const prevLast = before && before.lastVisit;
     const outcome = mergeBaselineCustomer({
       name: tx.name,
       contact: normalizeContact(tx.phone || tx.contact || ''),
@@ -4849,6 +4914,8 @@ function importTransactions(txs, opts = {}) {
       firstVisit: tx.date || '',
       lastVisit: tx.date || ''
     });
+    const after = findCustomerMatch(tx);
+    if(after && prevLast && noteComebackReturn(after, prevLast, after.lastVisit)) comebacks.push(after.name);
     if (outcome === 'updated') updated++; else added++;
     imported++;
   });
@@ -4877,6 +4944,11 @@ function importTransactions(txs, opts = {}) {
     const match = findCustomerMatch(tx);
     if (match) {
       if (match.isSeed) {
+        // Comeback detection must see the PREVIOUS last visit, before we move it.
+        if(date > (match.lastVisit || '')) {
+          const wasComeback = noteComebackReturn(match, match.lastVisit, date);
+          if(wasComeback) comebacks.push(match.name);
+        }
         // SEED CUSTOMER: this transaction is already reflected in the seed
         // baseline (REPORT.totalRevenue / SEED_MONTHLY). Record it in the
         // per-customer history and update dates/contact, but do NOT add to
@@ -4895,6 +4967,10 @@ function importTransactions(txs, opts = {}) {
       } else {
         // NON-SEED CUSTOMER: add normally (these are genuinely new transactions
         // not already counted in any baseline).
+        if(date > (match.lastVisit || '')) {
+          const wasComeback = noteComebackReturn(match, match.lastVisit, date);
+          if(wasComeback) comebacks.push(match.name);
+        }
         match.spent = Math.max(0, Number(match.spent || 0) + txAmount);
         match.visits = Number(match.visits || 0) + 1;
         if (!match.lastVisit || date > match.lastVisit) match.lastVisit = date;
@@ -5034,6 +5110,7 @@ function importTransactions(txs, opts = {}) {
 
   const importFixed = repairDates();
   if(importFixed > 0){ console.log('Import repair: fixed', importFixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
+  if(comebacks.length) triggerComebackMessages(comebacks);
   return { imported, dupes, added, updated, unmasked };
 }
 
@@ -5859,7 +5936,7 @@ window.restoreLocalBaseline = restoreLocalBaseline;
 // + transactions + customer history).
 function buildSeedCode(){
   const stamp = new Date().toISOString();
-  const customers = DB.customers.map(c => ({ name: c.name, contact: c.contact, spent: c.spent, visits: c.visits, days: c.days, firstVisit: c.firstVisit, lastVisit: c.lastVisit, masked: !!c.masked, isNew: !!c.isNew }));
+  const customers = DB.customers.map(c => ({ name: c.name, contact: c.contact, spent: c.spent, visits: c.visits, days: c.days, firstVisit: c.firstVisit, lastVisit: c.lastVisit, masked: !!c.masked, isNew: !!c.isNew, comeback: !!c.comeback, comebackAt: c.comebackAt || '', comebackGapDays: c.comebackGapDays || 0, comebackNotified: !!c.comebackNotified }));
   const code =
 `/* ══════════ SPAX SEED SNAPSHOT — generated ${stamp} ══════════
  * Paste this into seedDB() (or keep alongside it) to make the current data the
@@ -6003,15 +6080,80 @@ const TEMPLATES={
 winback:`Hi {firstname}! 👋 We've missed you at SpaxButchery — it's been {days} days! As a valued customer (KES {spent} with us 🙏), enjoy KES 100 OFF any order above KES 500 this week. Karibu tena! 🥩`,
 vip:`Hello {firstname}! 🌟 You're one of SpaxButchery's TOP customers — {visits} visits and KES {spent}! Show this message for a FREE 1/2kg of sausages on your next visit. Asante sana! 🥩`,
 upsell:`Hi {firstname}! 🥩 New at SpaxButchery: Family Pack — 1kg beef + sausages + soup bones at a special bundle price! Pop in this week and save. See you soon!`,
+comeback:`Hi {firstname}! 👋 Welcome back to SpaxButchery! It's been {gap} days since your last visit — great to see you again. Enjoy a FREE 1/2kg of sausages on your next order! Karibu tena! 🥩`,
 custom:`Hi {firstname}! `};
 function fill(t,c){return t.replace(/{name}/g,c.name).replace(/{firstname}/g,firstName(c.name))
-  .replace(/{spent}/g,Math.round(c.spent).toLocaleString()).replace(/{visits}/g,c.visits).replace(/{days}/g,c.days);}
+  .replace(/{spent}/g,Math.round(c.spent).toLocaleString()).replace(/{visits}/g,c.visits).replace(/{days}/g,c.days).replace(/{gap}/g,Math.round(c.comebackGapDays || c.gap || 90));}
 function genericMsg(t){return t
   .replace(/{firstname}|{name}/g,'there')
   .replace(/\(KES {spent} with us[^)]*\)/g,'(as one of our valued customers 🙏)')
   .replace(/— {visits} visits and KES {spent}!/g,'— thank you for your loyalty!')
   .replace(/it's been {days} days/g,"it's been a while")
-  .replace(/{spent}|{visits}|{days}/g,'').replace(/\s{2,}/g,' ').trim();}
+  .replace(/{spent}|{visits}|{days}|{gap}/g,'').replace(/\s{2,}/g,' ').trim();}
+
+/* ══════════ COMEBACK SEND — immediate win-back message ══════════ */
+function comebackMessage(c){
+  return fill(TEMPLATES.comeback, Object.assign({}, c, { gap: c.comebackGapDays || 90 }));
+}
+function sendComebackNow(c, channel){
+  if(!c) return false;
+  c.comebackNotified = true;
+  const msg = encodeURIComponent(comebackMessage(c));
+  const ch = channel || 'wa';
+  if(ch === 'sms'){
+    if(c.masked || !c.contact) return false;
+    window.location.href = `sms:${normPhone(c.contact)}?body=${msg}`;
+    return true;
+  }
+  // WhatsApp is the default "immediate" send path.
+  if(!c.contact || c.masked || (c.contact||'').includes('***')) return false;
+  window.open(`https://wa.me/${waNum(c.contact)}?text=${msg}`, '_blank');
+  return true;
+}
+function showComebackPanel(queue){
+  const old = document.getElementById('comebackPanel');
+  if(old) old.remove();
+  const box = document.createElement('div');
+  box.id = 'comebackPanel';
+  box.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:400;display:flex;align-items:center;justify-content:center;padding:16px;';
+  const cards = queue.map((c,i)=>`<div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;">
+    <div style="font-weight:600;">${c.name} <span class="badge b-comeback leaf-only" title="Returned after ${c.comebackGapDays||'3+'} days">🔙</span></div>
+    <div style="font-size:.78rem;color:var(--muted);margin:4px 0;">Away <b>${c.comebackGapDays||'3+'}</b> days · ${kes(c.spent)} · ${c.visits} visits · ${c.contact || 'no reachable contact'}</div>
+    <div style="font-size:.82rem;background:rgba(255,255,255,.04);border-radius:6px;padding:8px;margin-bottom:8px;white-space:pre-wrap;">${comebackMessage(c).replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn wa sm" onclick="sendComebackNow(window._comebackQueue[${i}],'wa')">🟢 WhatsApp</button>
+      <button class="btn blue sm" onclick="sendComebackNow(window._comebackQueue[${i}],'sms')">✉️ SMS</button>
+    </div></div>`).join('');
+  box.innerHTML = `<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:620px;width:100%;max-height:90vh;overflow-y:auto;padding:20px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <h3 style="margin:0;">🔙 Comeback Messages — ${queue.length} ready</h3>
+      <button class="btn ghost" onclick="this.closest('#comebackPanel').remove()" style="font-size:1.1rem;line-height:1;">✕</button>
+    </div>
+    <div style="font-size:.82rem;color:var(--muted);margin-bottom:12px;line-height:1.5;">These customers were away 3+ months and just purchased again. The message below is pre-filled — tap the send button to send now.</div>
+    <div style="margin-bottom:12px;"><button class="btn green" onclick="sendAllComebacks()">⚡ Send All (WhatsApp)</button></div>
+    ${cards}
+  </div>`;
+  document.body.appendChild(box);
+  window._comebackQueue = queue;
+}
+function sendAllComebacks(){
+  const q = window._comebackQueue || [];
+  if(!q.length){ toast('No comeback messages queued'); return; }
+  q.forEach((c,i) => setTimeout(() => sendComebackNow(c,'wa'), i * 450));
+  toast(`🔙 Sending ${q.length} comeback message(s)…`);
+}
+window.sendComebackNow = sendComebackNow;
+window.sendAllComebacks = sendAllComebacks;
+function triggerComebackMessages(list){
+  const queue = (list || []).map(name => DB.customers.find(c => c.name === name)).filter(c => c && isComebackCustomer(c));
+  if(!queue.length) return;
+  toast(`🔙 ${queue.length} comeback customer(s)! Win-back message ready.`);
+  // Intentionally auto-open the first reachable customer immediately (came from a
+  // click on Import/Confirm, so this usually unlocks WhatsApp in the same tab/session).
+  const first = queue.find(c => !c.masked && c.contact && !(c.contact||'').includes('***'));
+  if(first) sendComebackNow(first, 'wa');
+  showComebackPanel(queue);
+}
 function segPool(){
   const s=$('segSel').value,cs=DB.customers.filter(c=>!c.masked&&c.contact!=='—');
   if(s==='risk')return cs.filter(c=>c.days>60&&c.days<=90);
@@ -6779,13 +6921,16 @@ function showCustomerDetail(name){
   const c = DB.customers.find(x => x.name === name);
   if(!c) return;
 
+  const ntm = isNewThisMonth(c);
   $('modalCustName').textContent = c.name;
+  $('modalCustName').style.color = ntm ? 'var(--gold)' : '';
   $('modalCustInfo').innerHTML = `
     <span class="badge ${c.masked?'b-masked':'b-valid'}">${c.contact}</span>
     <span class="badge ${statusOf(c.days)[1]}">${statusOf(c.days)[0]}</span>
     ${c.spent>=10000?'<span class="badge b-vip">VIP</span>':''}
     ${c.isNew?'<span class="badge b-new">NEW</span>':''}
-    ${isNewThisMonth(c)?`<span class="badge b-month" title="First-ever purchase in ${monthLabelEAT()}">🌱 NEW THIS MONTH</span>`:''}
+    ${comebackBadge(c)}
+    ${ntm?`<span class="badge b-month leaf-only" title="First-ever purchase in ${monthLabelEAT()}">🌱</span>`:''}
   `;
   $('modalTotal').textContent = kes(c.spent);
   $('modalVisits').textContent = c.visits;
@@ -6847,6 +6992,7 @@ $('custModal').addEventListener('click', (e) => {
 
 function backfillTransactions(txs){
   let imported = 0, dupes = 0;
+  const comebacks = [];
 
   txs.forEach(tx => {
     // Global Merchant Exclusion: Never backfill transactions for Simon Musyoka
@@ -6892,6 +7038,10 @@ function backfillTransactions(txs){
       // transaction record, so extend them outward if this transaction is newer/older
       // than what's currently stored. Spent/visits counts are left untouched.
       if(ntx.date){
+        if(cust.lastVisit && ntx.date > cust.lastVisit){
+          const wasComeback = noteComebackReturn(cust, cust.lastVisit, ntx.date);
+          if(wasComeback) comebacks.push(cust.name);
+        }
         if(!cust.lastVisit || ntx.date > cust.lastVisit) cust.lastVisit = ntx.date;
         if(!cust.firstVisit || ntx.date < cust.firstVisit) cust.firstVisit = ntx.date;
         const today = new Date(getTodayEAT());
@@ -6914,6 +7064,7 @@ function backfillTransactions(txs){
   // import's job (importTransactions), so numbers aren't double-counted or
   // inflated by history-only backfills.
 
+  if(comebacks.length) triggerComebackMessages(comebacks);
   return { imported, dupes };
 }
 

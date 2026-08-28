@@ -89,6 +89,8 @@ function loadAll_() {
     c.newBatch = Number(c.newBatch) || 0;
     c.seedSpent = Number(c.seedSpent) || 0;
     c.seedVisits = Number(c.seedVisits) || 0;
+    c.firstVisit = dateOnly_(c.firstVisit);
+    c.lastVisit = dateOnly_(c.lastVisit);
   });
 
   var monthlyRows = rowsToObjects_(ss.getSheetByName(SHEETS.monthly));
@@ -108,6 +110,7 @@ function loadAll_() {
   var transactions = rowsToObjects_(ss.getSheetByName(SHEETS.transactions));
   transactions.forEach(function (t) {
     t.amount = Number(t.amount) || 0;
+    t.date = dateOnly_(t.date);
   });
 
   var customerTx = {};
@@ -116,7 +119,7 @@ function loadAll_() {
     if (!name) return;
     if (!customerTx[name]) customerTx[name] = [];
     customerTx[name].push({
-      date: r.date || '',
+      date: dateOnly_(r.date),
       amount: Number(r.amount) || 0,
       product: r.product || '',
       receipt: r.receipt || '',
@@ -359,6 +362,29 @@ function toBool_(v) {
   if (v === true || v === 1) return true;
   var s = String(v || '').toLowerCase();
   return s === 'true' || s === '1' || s === 'yes';
+}
+
+// Strip everything after the date so cloud rows never deliver timestamp digits
+// ("2026-08-12T00:00:00.000Z", "2026-08-12 14:25:30", Excel serials) to the app.
+function dateOnly_(v) {
+  if (v === null || v === undefined || v === '') return '';
+  if (v instanceof Date) {
+    if (isNaN(v.getTime())) return '';
+    return Utilities.formatDate(v, 'UTC', 'yyyy-MM-dd');
+  }
+  var s = String(v).trim();
+  var m = s.match(/(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  var serial = Number(s);
+  if (isFinite(serial) && serial >= 20000 && serial <= 80000) {
+    var d = new Date(Math.round((serial - 25569) * 86400000));
+    if (!isNaN(d.getTime())) return Utilities.formatDate(d, 'UTC', 'yyyy-MM-dd');
+  }
+  var dm = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (dm && Number(dm[2]) <= 12 && Number(dm[1]) <= 31) {
+    return dm[3] + '-' + ('0' + dm[2]).slice(-2) + '-' + ('0' + dm[1]).slice(-2);
+  }
+  return '';
 }
 
 function json_(obj) {

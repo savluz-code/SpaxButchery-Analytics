@@ -878,12 +878,17 @@ let SYNC_MODE = 'auto';
 let isSyncing = false;
 let lastSyncTime = null;
 let lastCloudError = '';
+// Rows per chunked upload request. At ~2,000 rows a slice stays well inside
+// both the request timeout and the Apps Script 6-minute execution limit, while
+// keeping the number of round-trips low. Payloads at or under this size are
+// still sent as a single request.
+const CHUNK_ROWS = 2000;
 
 // Apps Script redirects requests and can return an HTML error page. Parsing it
 // directly as JSON hid the useful deployment/setup error behind "Unexpected <".
 async function cloudRequest(url, options = {}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30000);
+  const timer = setTimeout(() => controller.abort(), 60000);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
     const text = await response.text();
@@ -1119,19 +1124,86 @@ async function saveToCloud(force = false) {
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
 
-    const result = await cloudRequest(GAS_URL, {
+    const post = (obj) => cloudRequest(GAS_URL, {
       method: 'POST',
       // text/plain keeps this a CORS-simple request for Apps Script web apps.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(obj)
     });
 
-    if (result.success) {
+    // Flatten the two big nested tables exactly as the backend does, so the
+    // chunk row counts we promise in saveCommit match what it stages.
+    const txRows = [];
+    Object.keys(payload.customerTx).forEach(name => {
+      (payload.customerTx[name] || []).forEach(t => txRows.push({
+        customer: name,
+        date: t.date || '',
+        amount: t.amount || 0,
+        product: t.product || '',
+        receipt: t.receipt || '',
+        importedAt: t.importedAt || ''
+      }));
+    });
+    const seenRows = Object.keys(payload.seen).map(k => ({ key: k, value: 1 }));
+    const bigTables = {
+      transactions: payload.transactions,
+      customerTx: txRows,
+      seen: seenRows
+    };
+    const totalBigRows = bigTables.transactions.length + txRows.length + seenRows.length;
+
+    // Small shops still save in a single request — chunking only kicks in once
+    // the payload is big enough that one write risks outrunning the timeout.
+    if (totalBigRows <= CHUNK_ROWS) {
+      const result = await post(payload);
+      if (result.success) {
+        lastSyncTime = new Date();
+        showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
+        lastCloudError = '';
+        return true;
+      }
+      throw new Error(result.error || 'Cloud rejected the save');
+    }
+
+    // ── CHUNKED SAVE ──
+    // One giant write could not finish inside the request timeout; the browser
+    // aborted it mid-write and, because the backend clears each sheet before
+    // writing, the sheet was left truncated — that is how a day's imports went
+    // missing. Now the big tables go up in slices to staging sheets and the
+    // live sheets are only swapped in after every row has landed.
+    showSyncStatus('⏳ Saving to cloud… (large upload, sending in parts)');
+    const begin = await post({
+      action: 'saveBegin',
+      customers: payload.customers,
+      monthly: payload.monthly,
+      settings: payload.settings
+    });
+    if (!begin.success) throw new Error(begin.error || 'Cloud rejected the save');
+
+    const expect = {};
+    let sent = 0;
+    for (const table of ['transactions', 'customerTx', 'seen']) {
+      const rows = bigTables[table];
+      expect[table] = rows.length;
+      for (let i = 0; i < rows.length; i += CHUNK_ROWS) {
+        const slice = rows.slice(i, i + CHUNK_ROWS);
+        const res = await post({ action: 'saveChunk', table, rows: slice });
+        if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
+        sent += slice.length;
+        showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%');
+      }
+    }
+
+    // The backend verifies the staged row counts before it swaps anything in,
+    // so a lost chunk aborts the commit and leaves the good data in place.
+    const commit = await post({ action: 'saveCommit', expect });
+    if (commit.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
       lastCloudError = '';
       return true;
     }
+    throw new Error(commit.error || 'Cloud rejected the save');
   } catch (err) {
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);

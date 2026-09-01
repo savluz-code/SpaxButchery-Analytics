@@ -878,17 +878,9 @@ let SYNC_MODE = 'auto';
 let isSyncing = false;
 let lastSyncTime = null;
 let lastCloudError = '';
-// Rows per chunked upload request. At ~2,000 rows a slice stays well inside
-// both the request timeout and the Apps Script 6-minute execution limit, while
-// keeping the number of round-trips low. Payloads at or under this size are
-// still sent as a single request.
-const CHUNK_ROWS = 2000;
-
-// Apps Script redirects requests and can return an HTML error page. Parsing it
-// directly as JSON hid the useful deployment/setup error behind "Unexpected <".
 async function cloudRequest(url, options = {}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60000);
+  const timer = setTimeout(() => controller.abort(), 30000);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
     const text = await response.text();
@@ -977,93 +969,23 @@ async function loadFromCloud() {
         // value can't resurrect NEW badges that a newer local import retired.
         DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
       }
-      // ── TRANSACTIONS / HISTORY / SEEN: UNION MERGE, NEVER REPLACE ──
-      // A failed save leaves the cloud missing the latest local import.
-      // Wholesale-replacing local transactions/history/seen with the stale
-      // cloud copy silently deleted that import — the app then showed fewer
-      // transactions and less revenue for the day than the statement, while
-      // the customer merge kept the customer names (which is why the customer
-      // list still looked fine). Union instead: keep every cloud row AND every
-      // local row the cloud doesn't have, keyed exactly like the import guard.
-      const txNorm = t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0});
-      const cloudTx = (Array.isArray(data.transactions) ? data.transactions : []).map(txNorm);
-      const localTx = (Array.isArray(DB.transactions) ? DB.transactions : []).map(txNorm);
-      const cloudTxKeys = new Set();
-      cloudTx.forEach(t => {
-        cloudTxKeys.add(transactionKey(t));
-        const k2 = txKeyNoTime(t);
-        if (k2) cloudTxKeys.add(k2);
-      });
-      const keptTx = cloudTx.slice();
-      const localOnlyTx = [];
-      localTx.forEach(t => {
-        const k = transactionKey(t);
-        const k2 = txKeyNoTime(t);
-        if (cloudTxKeys.has(k) || (k2 && cloudTxKeys.has(k2))) return; // cloud already has it
-        keptTx.push(t);
-        cloudTxKeys.add(k);
-        if (k2) cloudTxKeys.add(k2);
-        localOnlyTx.push(t);
-      });
-      DB.transactions = keptTx;
-
-      // Per-customer history: union by row identity (date + amount + receipt —
-      // a receipt number is unique per transaction, so this can't merge two
-      // genuine payments).
-      const histKey = t => ((t.date || '') + '|' + Number(t.amount || 0).toFixed(2) + '|' + String(t.receipt || '').toLowerCase());
-      const mergedCustTx = {};
-      Object.keys(DB.customerTx || {}).forEach(name => {
-        mergedCustTx[name] = (DB.customerTx[name] || []).slice();
-      });
-      Object.keys(data.customerTx || {}).forEach(name => {
-        const existing = mergedCustTx[name] || (mergedCustTx[name] = []);
-        const have = new Set(existing.map(histKey));
-        (data.customerTx[name] || []).forEach(t => {
-          const row = {...t, date: stripTime(t.date) || ''};
-          const hk = histKey(row);
-          if (!have.has(hk)) { existing.push(row); have.add(hk); }
+      if (data.transactions) {
+        DB.transactions = data.transactions.map(t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0}));
+      }
+      if (data.customerTx) {
+        DB.customerTx = {};
+        Object.keys(data.customerTx).forEach(name => {
+          DB.customerTx[name] = (data.customerTx[name] || []).map(t => ({...t, date: stripTime(t.date) || ''}));
         });
-      });
-      DB.customerTx = mergedCustTx;
-
-      // Re-book the local-only rows (imports that never reached the cloud)
-      // into the aggregates — exactly as importTransactions would have booked
-      // them at import time, so a failed save + reload no longer rolls the
-      // day's revenue back. Seed-customer history is baseline-backed (already
-      // in REPORT.totalRevenue) and is deliberately NOT added to importedRev,
-      // mirroring the import path.
-      let repairedRev = 0, repairedTx = 0;
-      const syncMonthAdd = {};
-      localOnlyTx.forEach(t => {
-        const match = findCustomerMatch({ name: t.name, contact: t.phone || t.contact });
-        if (match && match.isSeed) return;
-        const amt = Math.max(0, Number(t.amount) || 0);
-        DB.importedRev = (Number(DB.importedRev) || 0) + amt;
-        DB.importedTx = (Number(DB.importedTx) || 0) + 1;
-        repairedRev += amt;
-        repairedTx++;
-        const mk = /^\d{4}-\d{2}/.test(t.date || '') ? t.date.slice(0, 7) : '';
-        if (mk) syncMonthAdd[mk] = (syncMonthAdd[mk] || 0) + amt;
-      });
-      Object.entries(syncMonthAdd).forEach(([k, v]) => {
-        const i = DB.monthly.labels.indexOf(k);
-        if (i >= 0) DB.monthly.revenue[i] = (Number(DB.monthly.revenue[i]) || 0) + v;
-        else { DB.monthly.labels.push(k); DB.monthly.revenue.push(v); }
-      });
-      // NOTE: deliberately NO saveToCloud(true) here. That forced push-back
-      // bypassed the isSyncing guard, so every load that found a local-only
-      // row fired an unthrottled full-snapshot save (~2.5 MB / ~23k rows under
-      // a LockService lock) and wedged syncing. The rows are safe in local
-      // storage below; the next ordinary save flushes them.
-      if (repairedTx > 0) console.log(`Cloud sync: kept ${repairedTx} local-only transaction(s) worth KSh ${Math.round(repairedRev)} that the cloud copy was missing (a save had failed before)`);
-
-      // Restore the dedup map in the SAME key format the import guard uses
-      // (transactionKey / markSeen), unioned with the local keys — the local
-      // keys cover the rows the cloud is missing, so a re-import of that
-      // statement is still guarded after the union.
-      if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
-        DB.seen = Object.assign({}, DB.seen || {}, data.seen);
       } else {
+        DB.transactions = []; }
+      // Restore the dedup map in the SAME key format the import guard uses
+      // (transactionKey / markSeen). The old 'R:'/'C:' scheme never matched those
+      // keys, so after any sync re-importing an already-loaded statement slipped
+      // past the guard and double-counted revenue & stats.
+      if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
+        DB.seen = data.seen;
+      } else if (DB.transactions) {
         DB.seen = {};
         DB.transactions.forEach(tx => { markSeen(tx); });
       }
@@ -1124,86 +1046,19 @@ async function saveToCloud(force = false) {
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
 
-    const post = (obj) => cloudRequest(GAS_URL, {
+    const result = await cloudRequest(GAS_URL, {
       method: 'POST',
       // text/plain keeps this a CORS-simple request for Apps Script web apps.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(obj)
+      body: JSON.stringify(payload)
     });
 
-    // Flatten the two big nested tables exactly as the backend does, so the
-    // chunk row counts we promise in saveCommit match what it stages.
-    const txRows = [];
-    Object.keys(payload.customerTx).forEach(name => {
-      (payload.customerTx[name] || []).forEach(t => txRows.push({
-        customer: name,
-        date: t.date || '',
-        amount: t.amount || 0,
-        product: t.product || '',
-        receipt: t.receipt || '',
-        importedAt: t.importedAt || ''
-      }));
-    });
-    const seenRows = Object.keys(payload.seen).map(k => ({ key: k, value: 1 }));
-    const bigTables = {
-      transactions: payload.transactions,
-      customerTx: txRows,
-      seen: seenRows
-    };
-    const totalBigRows = bigTables.transactions.length + txRows.length + seenRows.length;
-
-    // Small shops still save in a single request — chunking only kicks in once
-    // the payload is big enough that one write risks outrunning the timeout.
-    if (totalBigRows <= CHUNK_ROWS) {
-      const result = await post(payload);
-      if (result.success) {
-        lastSyncTime = new Date();
-        showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
-        lastCloudError = '';
-        return true;
-      }
-      throw new Error(result.error || 'Cloud rejected the save');
-    }
-
-    // ── CHUNKED SAVE ──
-    // One giant write could not finish inside the request timeout; the browser
-    // aborted it mid-write and, because the backend clears each sheet before
-    // writing, the sheet was left truncated — that is how a day's imports went
-    // missing. Now the big tables go up in slices to staging sheets and the
-    // live sheets are only swapped in after every row has landed.
-    showSyncStatus('⏳ Saving to cloud… (large upload, sending in parts)');
-    const begin = await post({
-      action: 'saveBegin',
-      customers: payload.customers,
-      monthly: payload.monthly,
-      settings: payload.settings
-    });
-    if (!begin.success) throw new Error(begin.error || 'Cloud rejected the save');
-
-    const expect = {};
-    let sent = 0;
-    for (const table of ['transactions', 'customerTx', 'seen']) {
-      const rows = bigTables[table];
-      expect[table] = rows.length;
-      for (let i = 0; i < rows.length; i += CHUNK_ROWS) {
-        const slice = rows.slice(i, i + CHUNK_ROWS);
-        const res = await post({ action: 'saveChunk', table, rows: slice });
-        if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
-        sent += slice.length;
-        showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%');
-      }
-    }
-
-    // The backend verifies the staged row counts before it swaps anything in,
-    // so a lost chunk aborts the commit and leaves the good data in place.
-    const commit = await post({ action: 'saveCommit', expect });
-    if (commit.success) {
+    if (result.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
       lastCloudError = '';
       return true;
     }
-    throw new Error(commit.error || 'Cloud rejected the save');
   } catch (err) {
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);

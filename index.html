@@ -972,23 +972,93 @@ async function loadFromCloud() {
         // value can't resurrect NEW badges that a newer local import retired.
         DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
       }
-      if (data.transactions) {
-        DB.transactions = data.transactions.map(t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0}));
-      }
-      if (data.customerTx) {
-        DB.customerTx = {};
-        Object.keys(data.customerTx).forEach(name => {
-          DB.customerTx[name] = (data.customerTx[name] || []).map(t => ({...t, date: stripTime(t.date) || ''}));
+      // ── TRANSACTIONS / HISTORY / SEEN: UNION MERGE, NEVER REPLACE ──
+      // A failed save leaves the cloud missing the latest local import.
+      // Wholesale-replacing local transactions/history/seen with the stale
+      // cloud copy silently deleted that import — the app then showed fewer
+      // transactions and less revenue for the day than the statement, while
+      // the customer merge kept the customer names (which is why the customer
+      // list still looked fine). Union instead: keep every cloud row AND every
+      // local row the cloud doesn't have, keyed exactly like the import guard.
+      const txNorm = t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0});
+      const cloudTx = (Array.isArray(data.transactions) ? data.transactions : []).map(txNorm);
+      const localTx = (Array.isArray(DB.transactions) ? DB.transactions : []).map(txNorm);
+      const cloudTxKeys = new Set();
+      cloudTx.forEach(t => {
+        cloudTxKeys.add(transactionKey(t));
+        const k2 = txKeyNoTime(t);
+        if (k2) cloudTxKeys.add(k2);
+      });
+      const keptTx = cloudTx.slice();
+      const localOnlyTx = [];
+      localTx.forEach(t => {
+        const k = transactionKey(t);
+        const k2 = txKeyNoTime(t);
+        if (cloudTxKeys.has(k) || (k2 && cloudTxKeys.has(k2))) return; // cloud already has it
+        keptTx.push(t);
+        cloudTxKeys.add(k);
+        if (k2) cloudTxKeys.add(k2);
+        localOnlyTx.push(t);
+      });
+      DB.transactions = keptTx;
+
+      // Per-customer history: union by row identity (date + amount + receipt —
+      // a receipt number is unique per transaction, so this can't merge two
+      // genuine payments).
+      const histKey = t => ((t.date || '') + '|' + Number(t.amount || 0).toFixed(2) + '|' + String(t.receipt || '').toLowerCase());
+      const mergedCustTx = {};
+      Object.keys(DB.customerTx || {}).forEach(name => {
+        mergedCustTx[name] = (DB.customerTx[name] || []).slice();
+      });
+      Object.keys(data.customerTx || {}).forEach(name => {
+        const existing = mergedCustTx[name] || (mergedCustTx[name] = []);
+        const have = new Set(existing.map(histKey));
+        (data.customerTx[name] || []).forEach(t => {
+          const row = {...t, date: stripTime(t.date) || ''};
+          const hk = histKey(row);
+          if (!have.has(hk)) { existing.push(row); have.add(hk); }
         });
-      } else {
-        DB.transactions = []; }
+      });
+      DB.customerTx = mergedCustTx;
+
+      // Re-book the local-only rows (imports that never reached the cloud)
+      // into the aggregates — exactly as importTransactions would have booked
+      // them at import time, so a failed save + reload no longer rolls the
+      // day's revenue back. Seed-customer history is baseline-backed (already
+      // in REPORT.totalRevenue) and is deliberately NOT added to importedRev,
+      // mirroring the import path.
+      let repairedRev = 0, repairedTx = 0;
+      const syncMonthAdd = {};
+      localOnlyTx.forEach(t => {
+        const match = findCustomerMatch({ name: t.name, contact: t.phone || t.contact });
+        if (match && match.isSeed) return;
+        const amt = Math.max(0, Number(t.amount) || 0);
+        DB.importedRev = (Number(DB.importedRev) || 0) + amt;
+        DB.importedTx = (Number(DB.importedTx) || 0) + 1;
+        repairedRev += amt;
+        repairedTx++;
+        const mk = /^\d{4}-\d{2}/.test(t.date || '') ? t.date.slice(0, 7) : '';
+        if (mk) syncMonthAdd[mk] = (syncMonthAdd[mk] || 0) + amt;
+      });
+      Object.entries(syncMonthAdd).forEach(([k, v]) => {
+        const i = DB.monthly.labels.indexOf(k);
+        if (i >= 0) DB.monthly.revenue[i] = (Number(DB.monthly.revenue[i]) || 0) + v;
+        else { DB.monthly.labels.push(k); DB.monthly.revenue.push(v); }
+      });
+      // NOTE: deliberately NO saveToCloud(true) here. That forced push-back
+      // bypassed the isSyncing guard, so every load that found a local-only
+      // row fired an unthrottled full-snapshot save (~2.5 MB / ~23k rows under
+      // a LockService lock) and wedged syncing. The rows are safe in local
+      // storage below; the next ordinary save flushes them.
+      if (repairedTx > 0) console.log(`Cloud sync: kept ${repairedTx} local-only transaction(s) worth KSh ${Math.round(repairedRev)} that the cloud copy was missing (a save had failed before)`);
+
       // Restore the dedup map in the SAME key format the import guard uses
-      // (transactionKey / markSeen). The old 'R:'/'C:' scheme never matched those
-      // keys, so after any sync re-importing an already-loaded statement slipped
-      // past the guard and double-counted revenue & stats.
+      // (transactionKey / markSeen), unioned with the local keys — the local
+      // keys cover the rows the cloud is missing, so a re-import of that
+      // statement is still guarded after the union.
       if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
-        DB.seen = data.seen;
-      } else if (DB.transactions) {
+        DB.seen = Object.assign({}, DB.seen || {}, data.seen);
+      } else {
         DB.seen = {};
         DB.transactions.forEach(tx => { markSeen(tx); });
       }

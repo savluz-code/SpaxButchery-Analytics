@@ -878,18 +878,17 @@ let SYNC_MODE = 'auto';
 let isSyncing = false;
 let lastSyncTime = null;
 let lastCloudError = '';
+// Rows per chunked upload request. At ~2,000 rows a slice stays well inside
+// both the request timeout and the Apps Script 6-minute execution limit, while
+// keeping the number of round-trips low. Payloads at or under this size are
+// still sent as a single request.
+const CHUNK_ROWS = 2000;
 
 // Apps Script redirects requests and can return an HTML error page. Parsing it
 // directly as JSON hid the useful deployment/setup error behind "Unexpected <".
-async function cloudRequest(url, options = {}, timeoutMs = 180000) {
-  // The cloud save is a full rewrite of six sheets under a lock — on weak
-  // mobile signal it regularly takes well over 30 s. The old hard 30 s abort
-  // killed exactly those saves ("signal is aborted without reason"), leaving
-  // the latest import only on this device; the next load then rolled the
-  // transactions back to the stale cloud copy. 180 s matches the Apps Script
-  // web-app execution limit with headroom.
+async function cloudRequest(url, options = {}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), 60000);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
     const text = await response.text();
@@ -979,14 +978,13 @@ async function loadFromCloud() {
         DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
       }
       // ── TRANSACTIONS / HISTORY / SEEN: UNION MERGE, NEVER REPLACE ──
-      // A failed save (e.g. the old 30 s "signal is aborted without reason")
-      // leaves the cloud missing the latest local import. Wholesale-replacing
-      // local transactions/history/seen with the stale cloud copy silently
-      // deleted that import — the app then showed fewer transactions and less
-      // revenue for the day than the statement, while the customer merge kept
-      // the customer names (which is why the customer list looked fine).
-      // Union instead: keep every cloud row AND every local row the cloud
-      // doesn't have, keyed exactly like the import dedup guard.
+      // A failed save leaves the cloud missing the latest local import.
+      // Wholesale-replacing local transactions/history/seen with the stale
+      // cloud copy silently deleted that import — the app then showed fewer
+      // transactions and less revenue for the day than the statement, while
+      // the customer merge kept the customer names (which is why the customer
+      // list still looked fine). Union instead: keep every cloud row AND every
+      // local row the cloud doesn't have, keyed exactly like the import guard.
       const txNorm = t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0});
       const cloudTx = (Array.isArray(data.transactions) ? data.transactions : []).map(txNorm);
       const localTx = (Array.isArray(DB.transactions) ? DB.transactions : []).map(txNorm);
@@ -1030,9 +1028,9 @@ async function loadFromCloud() {
 
       // Re-book the local-only rows (imports that never reached the cloud)
       // into the aggregates — exactly as importTransactions would have booked
-      // them at import time, so a failed save + reload no longer rolls the day's
-      // revenue back. Seed-customer history is baseline-backed (already in
-      // REPORT.totalRevenue) and is deliberately NOT added to importedRev,
+      // them at import time, so a failed save + reload no longer rolls the
+      // day's revenue back. Seed-customer history is baseline-backed (already
+      // in REPORT.totalRevenue) and is deliberately NOT added to importedRev,
       // mirroring the import path.
       let repairedRev = 0, repairedTx = 0;
       const syncMonthAdd = {};
@@ -1052,6 +1050,11 @@ async function loadFromCloud() {
         if (i >= 0) DB.monthly.revenue[i] = (Number(DB.monthly.revenue[i]) || 0) + v;
         else { DB.monthly.labels.push(k); DB.monthly.revenue.push(v); }
       });
+      // NOTE: deliberately NO saveToCloud(true) here. That forced push-back
+      // bypassed the isSyncing guard, so every load that found a local-only
+      // row fired an unthrottled full-snapshot save (~2.5 MB / ~23k rows under
+      // a LockService lock) and wedged syncing. The rows are safe in local
+      // storage below; the next ordinary save flushes them.
       if (repairedTx > 0) console.log(`Cloud sync: kept ${repairedTx} local-only transaction(s) worth KSh ${Math.round(repairedRev)} that the cloud copy was missing (a save had failed before)`);
 
       // Restore the dedup map in the SAME key format the import guard uses
@@ -1074,9 +1077,6 @@ async function loadFromCloud() {
       // Merchant exclusion is non-negotiable: if the cloud sheet still carries
       // Simon Musyoka (the Merchant), scrub him from the merged data now.
       purgeMerchantData();
-      // The cloud copy was missing this device's imports — push the union back
-      // so the next load on any device starts from the complete data.
-      if (repairedTx > 0 && SYNC_MODE !== 'local') saveToCloud(true);
       refreshAll();
       return true;
     } else {
@@ -1123,36 +1123,87 @@ async function saveToCloud(force = false) {
       seen: DB.seen || {},
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
-    const post = () => cloudRequest(GAS_URL, {
+
+    const post = (obj) => cloudRequest(GAS_URL, {
       method: 'POST',
       // text/plain keeps this a CORS-simple request for Apps Script web apps.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    }, 180000);
+      body: JSON.stringify(obj)
+    });
 
-    let result;
-    try {
-      result = await post();
-    } catch (firstErr) {
-      // The save is a long full-sheet rewrite; on weak mobile signal the first
-      // request can drop or time out mid-flight. Retry ONCE before giving up —
-      // the payload is a full snapshot, so a retry is idempotent (worst case it
-      // re-writes the same data the first attempt already committed server-side).
-      lastCloudError = firstErr && firstErr.message ? firstErr.message : String(firstErr);
-      console.warn('Cloud save attempt 1 failed (' + lastCloudError + ') — retrying...');
-      showSyncStatus('⏳ Saving to cloud (retry)…');
-      await new Promise(r => setTimeout(r, 2000));
-      result = await post();
+    // Flatten the two big nested tables exactly as the backend does, so the
+    // chunk row counts we promise in saveCommit match what it stages.
+    const txRows = [];
+    Object.keys(payload.customerTx).forEach(name => {
+      (payload.customerTx[name] || []).forEach(t => txRows.push({
+        customer: name,
+        date: t.date || '',
+        amount: t.amount || 0,
+        product: t.product || '',
+        receipt: t.receipt || '',
+        importedAt: t.importedAt || ''
+      }));
+    });
+    const seenRows = Object.keys(payload.seen).map(k => ({ key: k, value: 1 }));
+    const bigTables = {
+      transactions: payload.transactions,
+      customerTx: txRows,
+      seen: seenRows
+    };
+    const totalBigRows = bigTables.transactions.length + txRows.length + seenRows.length;
+
+    // Small shops still save in a single request — chunking only kicks in once
+    // the payload is big enough that one write risks outrunning the timeout.
+    if (totalBigRows <= CHUNK_ROWS) {
+      const result = await post(payload);
+      if (result.success) {
+        lastSyncTime = new Date();
+        showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
+        lastCloudError = '';
+        return true;
+      }
+      throw new Error(result.error || 'Cloud rejected the save');
     }
 
-    if (result && result.success) {
+    // ── CHUNKED SAVE ──
+    // One giant write could not finish inside the request timeout; the browser
+    // aborted it mid-write and, because the backend clears each sheet before
+    // writing, the sheet was left truncated — that is how a day's imports went
+    // missing. Now the big tables go up in slices to staging sheets and the
+    // live sheets are only swapped in after every row has landed.
+    showSyncStatus('⏳ Saving to cloud… (large upload, sending in parts)');
+    const begin = await post({
+      action: 'saveBegin',
+      customers: payload.customers,
+      monthly: payload.monthly,
+      settings: payload.settings
+    });
+    if (!begin.success) throw new Error(begin.error || 'Cloud rejected the save');
+
+    const expect = {};
+    let sent = 0;
+    for (const table of ['transactions', 'customerTx', 'seen']) {
+      const rows = bigTables[table];
+      expect[table] = rows.length;
+      for (let i = 0; i < rows.length; i += CHUNK_ROWS) {
+        const slice = rows.slice(i, i + CHUNK_ROWS);
+        const res = await post({ action: 'saveChunk', table, rows: slice });
+        if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
+        sent += slice.length;
+        showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%');
+      }
+    }
+
+    // The backend verifies the staged row counts before it swaps anything in,
+    // so a lost chunk aborts the commit and leaves the good data in place.
+    const commit = await post({ action: 'saveCommit', expect });
+    if (commit.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
       lastCloudError = '';
       return true;
     }
-    const detail = result && result.error ? (typeof result.error === 'string' ? result.error : JSON.stringify(result.error)) : 'Unknown cloud error';
-    throw new Error(detail);
+    throw new Error(commit.error || 'Cloud rejected the save');
   } catch (err) {
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);

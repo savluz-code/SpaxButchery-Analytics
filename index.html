@@ -881,15 +881,9 @@ let lastCloudError = '';
 
 // Apps Script redirects requests and can return an HTML error page. Parsing it
 // directly as JSON hid the useful deployment/setup error behind "Unexpected <".
-async function cloudRequest(url, options = {}, timeoutMs = 180000) {
-  // The cloud save is a full rewrite of six sheets under a lock — on weak
-  // mobile signal it regularly takes well over 30 s. The old hard 30 s abort
-  // killed exactly those saves ("signal is aborted without reason"), leaving
-  // the latest import only on this device; the next load then rolled the
-  // transactions back to the stale cloud copy. 180 s matches the Apps Script
-  // web-app execution limit with headroom.
+async function cloudRequest(url, options = {}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), 30000);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
     const text = await response.text();
@@ -978,89 +972,23 @@ async function loadFromCloud() {
         // value can't resurrect NEW badges that a newer local import retired.
         DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
       }
-      // ── TRANSACTIONS / HISTORY / SEEN: UNION MERGE, NEVER REPLACE ──
-      // A failed save (e.g. the old 30 s "signal is aborted without reason")
-      // leaves the cloud missing the latest local import. Wholesale-replacing
-      // local transactions/history/seen with the stale cloud copy silently
-      // deleted that import — the app then showed fewer transactions and less
-      // revenue for the day than the statement, while the customer merge kept
-      // the customer names (which is why the customer list looked fine).
-      // Union instead: keep every cloud row AND every local row the cloud
-      // doesn't have, keyed exactly like the import dedup guard.
-      const txNorm = t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0});
-      const cloudTx = (Array.isArray(data.transactions) ? data.transactions : []).map(txNorm);
-      const localTx = (Array.isArray(DB.transactions) ? DB.transactions : []).map(txNorm);
-      const cloudTxKeys = new Set();
-      cloudTx.forEach(t => {
-        cloudTxKeys.add(transactionKey(t));
-        const k2 = txKeyNoTime(t);
-        if (k2) cloudTxKeys.add(k2);
-      });
-      const keptTx = cloudTx.slice();
-      const localOnlyTx = [];
-      localTx.forEach(t => {
-        const k = transactionKey(t);
-        const k2 = txKeyNoTime(t);
-        if (cloudTxKeys.has(k) || (k2 && cloudTxKeys.has(k2))) return; // cloud already has it
-        keptTx.push(t);
-        cloudTxKeys.add(k);
-        if (k2) cloudTxKeys.add(k2);
-        localOnlyTx.push(t);
-      });
-      DB.transactions = keptTx;
-
-      // Per-customer history: union by row identity (date + amount + receipt —
-      // a receipt number is unique per transaction, so this can't merge two
-      // genuine payments).
-      const histKey = t => ((t.date || '') + '|' + Number(t.amount || 0).toFixed(2) + '|' + String(t.receipt || '').toLowerCase());
-      const mergedCustTx = {};
-      Object.keys(DB.customerTx || {}).forEach(name => {
-        mergedCustTx[name] = (DB.customerTx[name] || []).slice();
-      });
-      Object.keys(data.customerTx || {}).forEach(name => {
-        const existing = mergedCustTx[name] || (mergedCustTx[name] = []);
-        const have = new Set(existing.map(histKey));
-        (data.customerTx[name] || []).forEach(t => {
-          const row = {...t, date: stripTime(t.date) || ''};
-          const hk = histKey(row);
-          if (!have.has(hk)) { existing.push(row); have.add(hk); }
+      if (data.transactions) {
+        DB.transactions = data.transactions.map(t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0}));
+      }
+      if (data.customerTx) {
+        DB.customerTx = {};
+        Object.keys(data.customerTx).forEach(name => {
+          DB.customerTx[name] = (data.customerTx[name] || []).map(t => ({...t, date: stripTime(t.date) || ''}));
         });
-      });
-      DB.customerTx = mergedCustTx;
-
-      // Re-book the local-only rows (imports that never reached the cloud)
-      // into the aggregates — exactly as importTransactions would have booked
-      // them at import time, so a failed save + reload no longer rolls the day's
-      // revenue back. Seed-customer history is baseline-backed (already in
-      // REPORT.totalRevenue) and is deliberately NOT added to importedRev,
-      // mirroring the import path.
-      let repairedRev = 0, repairedTx = 0;
-      const syncMonthAdd = {};
-      localOnlyTx.forEach(t => {
-        const match = findCustomerMatch({ name: t.name, contact: t.phone || t.contact });
-        if (match && match.isSeed) return;
-        const amt = Math.max(0, Number(t.amount) || 0);
-        DB.importedRev = (Number(DB.importedRev) || 0) + amt;
-        DB.importedTx = (Number(DB.importedTx) || 0) + 1;
-        repairedRev += amt;
-        repairedTx++;
-        const mk = /^\d{4}-\d{2}/.test(t.date || '') ? t.date.slice(0, 7) : '';
-        if (mk) syncMonthAdd[mk] = (syncMonthAdd[mk] || 0) + amt;
-      });
-      Object.entries(syncMonthAdd).forEach(([k, v]) => {
-        const i = DB.monthly.labels.indexOf(k);
-        if (i >= 0) DB.monthly.revenue[i] = (Number(DB.monthly.revenue[i]) || 0) + v;
-        else { DB.monthly.labels.push(k); DB.monthly.revenue.push(v); }
-      });
-      if (repairedTx > 0) console.log(`Cloud sync: kept ${repairedTx} local-only transaction(s) worth KSh ${Math.round(repairedRev)} that the cloud copy was missing (a save had failed before)`);
-
-      // Restore the dedup map in the SAME key format the import guard uses
-      // (transactionKey / markSeen), unioned with the local keys — the local
-      // keys cover the rows the cloud is missing, so a re-import of that
-      // statement is still guarded after the union.
-      if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
-        DB.seen = Object.assign({}, DB.seen || {}, data.seen);
       } else {
+        DB.transactions = []; }
+      // Restore the dedup map in the SAME key format the import guard uses
+      // (transactionKey / markSeen). The old 'R:'/'C:' scheme never matched those
+      // keys, so after any sync re-importing an already-loaded statement slipped
+      // past the guard and double-counted revenue & stats.
+      if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
+        DB.seen = data.seen;
+      } else if (DB.transactions) {
         DB.seen = {};
         DB.transactions.forEach(tx => { markSeen(tx); });
       }
@@ -1074,9 +1002,6 @@ async function loadFromCloud() {
       // Merchant exclusion is non-negotiable: if the cloud sheet still carries
       // Simon Musyoka (the Merchant), scrub him from the merged data now.
       purgeMerchantData();
-      // The cloud copy was missing this device's imports — push the union back
-      // so the next load on any device starts from the complete data.
-      if (repairedTx > 0 && SYNC_MODE !== 'local') saveToCloud(true);
       refreshAll();
       return true;
     } else {
@@ -1123,36 +1048,20 @@ async function saveToCloud(force = false) {
       seen: DB.seen || {},
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
-    const post = () => cloudRequest(GAS_URL, {
+
+    const result = await cloudRequest(GAS_URL, {
       method: 'POST',
       // text/plain keeps this a CORS-simple request for Apps Script web apps.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(payload)
-    }, 180000);
+    });
 
-    let result;
-    try {
-      result = await post();
-    } catch (firstErr) {
-      // The save is a long full-sheet rewrite; on weak mobile signal the first
-      // request can drop or time out mid-flight. Retry ONCE before giving up —
-      // the payload is a full snapshot, so a retry is idempotent (worst case it
-      // re-writes the same data the first attempt already committed server-side).
-      lastCloudError = firstErr && firstErr.message ? firstErr.message : String(firstErr);
-      console.warn('Cloud save attempt 1 failed (' + lastCloudError + ') — retrying...');
-      showSyncStatus('⏳ Saving to cloud (retry)…');
-      await new Promise(r => setTimeout(r, 2000));
-      result = await post();
-    }
-
-    if (result && result.success) {
+    if (result.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
       lastCloudError = '';
       return true;
     }
-    const detail = result && result.error ? (typeof result.error === 'string' ? result.error : JSON.stringify(result.error)) : 'Unknown cloud error';
-    throw new Error(detail);
   } catch (err) {
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);

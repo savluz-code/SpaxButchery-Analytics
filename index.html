@@ -881,9 +881,15 @@ let lastCloudError = '';
 
 // Apps Script redirects requests and can return an HTML error page. Parsing it
 // directly as JSON hid the useful deployment/setup error behind "Unexpected <".
-async function cloudRequest(url, options = {}) {
+async function cloudRequest(url, options = {}, timeoutMs = 180000) {
+  // The cloud save is a full rewrite of six sheets under a lock — on weak
+  // mobile signal it regularly takes well over 30 s. The old hard 30 s abort
+  // killed exactly those saves ("signal is aborted without reason"), leaving
+  // the latest import only on this device; the next load then rolled the
+  // transactions back to the stale cloud copy. 180 s matches the Apps Script
+  // web-app execution limit with headroom.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
     const text = await response.text();
@@ -972,23 +978,89 @@ async function loadFromCloud() {
         // value can't resurrect NEW badges that a newer local import retired.
         DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
       }
-      if (data.transactions) {
-        DB.transactions = data.transactions.map(t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0}));
-      }
-      if (data.customerTx) {
-        DB.customerTx = {};
-        Object.keys(data.customerTx).forEach(name => {
-          DB.customerTx[name] = (data.customerTx[name] || []).map(t => ({...t, date: stripTime(t.date) || ''}));
+      // ── TRANSACTIONS / HISTORY / SEEN: UNION MERGE, NEVER REPLACE ──
+      // A failed save (e.g. the old 30 s "signal is aborted without reason")
+      // leaves the cloud missing the latest local import. Wholesale-replacing
+      // local transactions/history/seen with the stale cloud copy silently
+      // deleted that import — the app then showed fewer transactions and less
+      // revenue for the day than the statement, while the customer merge kept
+      // the customer names (which is why the customer list looked fine).
+      // Union instead: keep every cloud row AND every local row the cloud
+      // doesn't have, keyed exactly like the import dedup guard.
+      const txNorm = t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0});
+      const cloudTx = (Array.isArray(data.transactions) ? data.transactions : []).map(txNorm);
+      const localTx = (Array.isArray(DB.transactions) ? DB.transactions : []).map(txNorm);
+      const cloudTxKeys = new Set();
+      cloudTx.forEach(t => {
+        cloudTxKeys.add(transactionKey(t));
+        const k2 = txKeyNoTime(t);
+        if (k2) cloudTxKeys.add(k2);
+      });
+      const keptTx = cloudTx.slice();
+      const localOnlyTx = [];
+      localTx.forEach(t => {
+        const k = transactionKey(t);
+        const k2 = txKeyNoTime(t);
+        if (cloudTxKeys.has(k) || (k2 && cloudTxKeys.has(k2))) return; // cloud already has it
+        keptTx.push(t);
+        cloudTxKeys.add(k);
+        if (k2) cloudTxKeys.add(k2);
+        localOnlyTx.push(t);
+      });
+      DB.transactions = keptTx;
+
+      // Per-customer history: union by row identity (date + amount + receipt —
+      // a receipt number is unique per transaction, so this can't merge two
+      // genuine payments).
+      const histKey = t => ((t.date || '') + '|' + Number(t.amount || 0).toFixed(2) + '|' + String(t.receipt || '').toLowerCase());
+      const mergedCustTx = {};
+      Object.keys(DB.customerTx || {}).forEach(name => {
+        mergedCustTx[name] = (DB.customerTx[name] || []).slice();
+      });
+      Object.keys(data.customerTx || {}).forEach(name => {
+        const existing = mergedCustTx[name] || (mergedCustTx[name] = []);
+        const have = new Set(existing.map(histKey));
+        (data.customerTx[name] || []).forEach(t => {
+          const row = {...t, date: stripTime(t.date) || ''};
+          const hk = histKey(row);
+          if (!have.has(hk)) { existing.push(row); have.add(hk); }
         });
-      } else {
-        DB.transactions = []; }
+      });
+      DB.customerTx = mergedCustTx;
+
+      // Re-book the local-only rows (imports that never reached the cloud)
+      // into the aggregates — exactly as importTransactions would have booked
+      // them at import time, so a failed save + reload no longer rolls the day's
+      // revenue back. Seed-customer history is baseline-backed (already in
+      // REPORT.totalRevenue) and is deliberately NOT added to importedRev,
+      // mirroring the import path.
+      let repairedRev = 0, repairedTx = 0;
+      const syncMonthAdd = {};
+      localOnlyTx.forEach(t => {
+        const match = findCustomerMatch({ name: t.name, contact: t.phone || t.contact });
+        if (match && match.isSeed) return;
+        const amt = Math.max(0, Number(t.amount) || 0);
+        DB.importedRev = (Number(DB.importedRev) || 0) + amt;
+        DB.importedTx = (Number(DB.importedTx) || 0) + 1;
+        repairedRev += amt;
+        repairedTx++;
+        const mk = /^\d{4}-\d{2}/.test(t.date || '') ? t.date.slice(0, 7) : '';
+        if (mk) syncMonthAdd[mk] = (syncMonthAdd[mk] || 0) + amt;
+      });
+      Object.entries(syncMonthAdd).forEach(([k, v]) => {
+        const i = DB.monthly.labels.indexOf(k);
+        if (i >= 0) DB.monthly.revenue[i] = (Number(DB.monthly.revenue[i]) || 0) + v;
+        else { DB.monthly.labels.push(k); DB.monthly.revenue.push(v); }
+      });
+      if (repairedTx > 0) console.log(`Cloud sync: kept ${repairedTx} local-only transaction(s) worth KSh ${Math.round(repairedRev)} that the cloud copy was missing (a save had failed before)`);
+
       // Restore the dedup map in the SAME key format the import guard uses
-      // (transactionKey / markSeen). The old 'R:'/'C:' scheme never matched those
-      // keys, so after any sync re-importing an already-loaded statement slipped
-      // past the guard and double-counted revenue & stats.
+      // (transactionKey / markSeen), unioned with the local keys — the local
+      // keys cover the rows the cloud is missing, so a re-import of that
+      // statement is still guarded after the union.
       if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
-        DB.seen = data.seen;
-      } else if (DB.transactions) {
+        DB.seen = Object.assign({}, DB.seen || {}, data.seen);
+      } else {
         DB.seen = {};
         DB.transactions.forEach(tx => { markSeen(tx); });
       }
@@ -1002,6 +1074,9 @@ async function loadFromCloud() {
       // Merchant exclusion is non-negotiable: if the cloud sheet still carries
       // Simon Musyoka (the Merchant), scrub him from the merged data now.
       purgeMerchantData();
+      // The cloud copy was missing this device's imports — push the union back
+      // so the next load on any device starts from the complete data.
+      if (repairedTx > 0 && SYNC_MODE !== 'local') saveToCloud(true);
       refreshAll();
       return true;
     } else {
@@ -1048,20 +1123,36 @@ async function saveToCloud(force = false) {
       seen: DB.seen || {},
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
-
-    const result = await cloudRequest(GAS_URL, {
+    const post = () => cloudRequest(GAS_URL, {
       method: 'POST',
       // text/plain keeps this a CORS-simple request for Apps Script web apps.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(payload)
-    });
+    }, 180000);
 
-    if (result.success) {
+    let result;
+    try {
+      result = await post();
+    } catch (firstErr) {
+      // The save is a long full-sheet rewrite; on weak mobile signal the first
+      // request can drop or time out mid-flight. Retry ONCE before giving up —
+      // the payload is a full snapshot, so a retry is idempotent (worst case it
+      // re-writes the same data the first attempt already committed server-side).
+      lastCloudError = firstErr && firstErr.message ? firstErr.message : String(firstErr);
+      console.warn('Cloud save attempt 1 failed (' + lastCloudError + ') — retrying...');
+      showSyncStatus('⏳ Saving to cloud (retry)…');
+      await new Promise(r => setTimeout(r, 2000));
+      result = await post();
+    }
+
+    if (result && result.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
       lastCloudError = '';
       return true;
     }
+    const detail = result && result.error ? (typeof result.error === 'string' ? result.error : JSON.stringify(result.error)) : 'Unknown cloud error';
+    throw new Error(detail);
   } catch (err) {
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);
@@ -4445,8 +4536,14 @@ function normalizeMpesaText(text) {
     .replace(/\b([A-Z0-9]{8,10})\s+([A-Z0-9]{1,2})\b(?=\s+\d{4}[-\/]\d{2}[-\/]\d{2})/gi, "$1$2");
 }
 
+// No length cap: recent Safaricom statements print 11-character receipt codes
+// (e.g. "UHVH4T4SL28", "UHV1J44VCHA" in the 31 Aug 2026 statement). The old
+// .slice(0, 10) mangled them and let two different long receipts that share a
+// 10-char prefix collide in the dedup map — the second one then imported as a
+// "duplicate" and was dropped. isSeen() still checks the legacy 10-char key
+// variant so receipts already stored truncated keep deduping correctly.
 function cleanReceipt(r) {
-  return String(r || "").replace(/\s+/g, "").replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 10);
+  return String(r || "").replace(/\s+/g, "").replace(/[^A-Z0-9]/gi, "").toUpperCase();
 }
 
 function extractPerson(details) {
@@ -4460,6 +4557,18 @@ function extractPerson(details) {
   const fromMatch = raw.match(/(?:Merchant\s+Payment\s+from|Online\s+from|received\s+from|Small\s+Business\s+Pay\s+Merchant\s+from|Buy\s+Goods\s+from|Pay\s+Bill\s+from)\s+(.+?)(?:\s+-\s+|\s+Customer|\s+Merchant|\s+Payment|\s+OD|\s+Transfer|$)/i);
   if (fromMatch) {
     name = fromMatch[1].replace(phoneMatch ? phoneMatch[1] : "", "").trim();
+  }
+
+  // Pattern 1b: "Business Buy Goods for 750925 - TENTE B4X via API REF …" —
+  // a B2B payment that prints NO phone number; the payer is the business name
+  // after the dash. Without this the whole row fell through to the
+  // "M-Pesa Customer" fallback and lumped every B2B payment into one phantom
+  // customer. Digits may be part of the brand ("B4X"), so flag to skip the
+  // digit-strip cleanup (which exists to remove phone remnants elsewhere).
+  let keepDigits = false;
+  if (!name) {
+    const bbg = raw.match(/business\s+buy\s+goods\s+for\s+\d{5,7}\s*[-–—]\s*([A-Za-z0-9][A-Za-z0-9\s.'’\-]*?)\s*(?:\bvia\b|\bREF\b|$)/i);
+    if (bbg) { name = bbg[1]; keepDigits = true; }
   }
 
   // Pattern 2: "- NAME" prefix ("…by 488519 - NCBA Bank Mpesa via API REF B2B…").
@@ -4484,7 +4593,12 @@ function extractPerson(details) {
     }
   }
 
-  name = name.replace(/[^A-Za-z\s.'’\-]/g, " ").replace(/\s+/g, " ").trim();
+  if (keepDigits) {
+    // Brand names may contain digits ("TENTE B4X") — strip only true junk chars.
+    name = name.replace(/[^\w\s.'’\-]/g, " ").replace(/\s+/g, " ").trim();
+  } else {
+    name = name.replace(/[^A-Za-z\s.'’\-]/g, " ").replace(/\s+/g, " ").trim();
+  }
   // Newer statements print the payer as "from - <phone> <NAME>" (dash BEFORE the
   // phone): once the phone is stripped a stray "- " is left on the name. Also cut
   // "via …" service tails (e.g. "Pay Merchant with OD via STK" descriptors).
@@ -4594,6 +4708,35 @@ function purgeMerchantData(quiet) {
   }
 }
 
+// Fee/charge rows — "Pay merchant Charge", "Merchant to Customer Payment
+// Charge", "Merchant Withdrawal Charge at an Agent", "Service Charge", … —
+// are Safaricom fees, NEVER customer payments. They must be rejected in
+// EVERY parse pass before the receipt|date|time key is claimed, because a
+// charge row SHARES the receipt number and completion time with the payment
+// it belongs to (Safaricom prints the fee on its own row with the same
+// receipt). Letting a fee row through (a) books phantom "M-pesa Customer"
+// revenue, and (b) steals the dedup key so the real payment that shares the
+// receipt is silently dropped as a "duplicate". Whether the fee's minus sign
+// survives the PDF text layer ("3.85" vs "-3.85" vs "−3.85") used to decide
+// this, which is why the same statement imported different row counts
+// depending on the device/text layer. "charge" appears in no customer
+// payment wording, so this can't drop a real payment.
+function isChargeRow(details) {
+  return /\bcharges?\b/i.test(String(details || ''));
+}
+// When a match spans two printed rows (happens when the first row's amount
+// cells can't anchor the regex — e.g. a U+2212 "−" minus sign that is neither
+// in the dash class nor in the amount class), the DETAILS captured by the
+// lazy group also contains the previous row's text ("…Pay merchant Charge
+// Completed −3.85 … <receipt> <date> <time> Merchant Payment from …"). The
+// row that actually OWNS the matched amounts is the LAST segment after an
+// embedded date/time anchor — judge charge wording on that segment only, so a
+// fee row's "Charge" word can't veto the real payment that follows it.
+function chargeJudgeSegment(details) {
+  const parts = String(details || '').split(/\b\d{4}[-\/]\d{2}[-\/]\d{2}\s+\d{2}:\d{2}:\d{2}\b/);
+  return parts[parts.length - 1];
+}
+
 /* Incoming-money wording check. Tighter than the old /from|received|pay bill|buy goods/
    filter: outflow rows such as "Pay Bill Kenya Power Paybill 888880" also contain
    "pay bill", and "Withdraw ... from Till" contains "from". When a statement prints
@@ -4609,6 +4752,11 @@ function parseMpesaText(raw, sourceLabel) {
   const text = normalizeMpesaText(raw).replace(/\n/g, " ").replace(/\s+/g, " ").trim();
   const txs = [];
   const seenKeys = new Set();
+  // Every row a pass RECOGNIZED (imported OR intentionally skipped as
+  // outgoing/charge) owns exactly one "Completed" word. The "possibly missed"
+  // warning compares against this, not against txs.length, so intentionally
+  // excluded rows don't produce a scary (false) "check the statement" toast.
+  const rowKeys = new Set();
 
   // Primary regex: flexible receipt, flexible date/time, and strictly 3 amount columns after 'Completed'
   // This prevents picking up a single 'Balance' number or messy OCR fragments as revenue.
@@ -4619,6 +4767,16 @@ function parseMpesaText(raw, sourceLabel) {
     const date = parseDate(m[2]);
     const time = m[3];
     let details = m[4].trim();
+    // The first amount cell disambiguates a fee row from its payment row —
+    // they share the receipt number and completion time. A cross-row match
+    // (broken amount cells on the anchor row) counts BOTH rows.
+    const crossed1 = /\b\d{4}[-\/]\d{2}[-\/]\d{2}\s+\d{2}:\d{2}:\d{2}\b/.test(details);
+    rowKeys.add(receipt + '|' + date + '|' + time + '|' + (crossed1 ? 'lead' : m[5]));
+    if (crossed1) rowKeys.add(receipt + '|' + date + '|' + time + '|' + m[5]);
+
+    // Fee rows share the receipt+time with their payment — reject BEFORE the
+    // key is claimed so the real payment is not dropped as a "duplicate".
+    if (isChargeRow(chargeJudgeSegment(details))) continue;
 
     // We only take the FIRST amount (Paid In column)
     const amount = parseAmount(m[5]);
@@ -4657,6 +4815,16 @@ function parseMpesaText(raw, sourceLabel) {
   // Rows already captured above are deduped by key.
   const regex2 = /\b([A-Z0-9]{8,11})\s*(\d{4}[-\/]\d{2}[-\/]\d{2})\s+(\d{2}:\d{2}:\d{2})\s+([\s\S]*?)\bCompleted\s+((?:[-–—]\s*|[\d,]+\.\d{2}\s*){2,4})/gi;
   while ((m = regex2.exec(text)) !== null) {
+    const details = m[4].trim();
+    const firstCell = m[5].trim().split(/\s+/)[0];
+    const crossed2 = /\b\d{4}[-\/]\d{2}[-\/]\d{2}\s+\d{2}:\d{2}:\d{2}\b/.test(details);
+    rowKeys.add(cleanReceipt(m[1]) + '|' + parseDate(m[2]) + '|' + m[3] + '|' + (crossed2 ? 'lead' : firstCell));
+    if (crossed2) rowKeys.add(cleanReceipt(m[1]) + '|' + parseDate(m[2]) + '|' + m[3] + '|' + firstCell);
+
+    // Fee rows share the receipt+time with their payment — reject BEFORE the
+    // key is claimed so the real payment is not dropped as a "duplicate".
+    if (isChargeRow(chargeJudgeSegment(details))) continue;
+
     const cells = m[5].trim().split(/\s+/).filter(Boolean);
     if (cells[0] === '-' || cells[0] === '–' || cells[0] === '—') continue; // Withdrawn-first row → money OUT
     const amounts = cells.filter(c => /\d/.test(c));
@@ -4664,7 +4832,6 @@ function parseMpesaText(raw, sourceLabel) {
     const amount = parseAmount(amounts[0]);
     if (!amount || amount <= 0) continue;
 
-    const details = m[4].trim();
     if (!isIncomingMpesaDetails(details)) continue; // strict wording — see isIncomingMpesaDetails
 
     const person = extractPerson(details);
@@ -4709,6 +4876,11 @@ function parseMpesaText(raw, sourceLabel) {
     // Find all decimal amounts after 'Completed'
     const afterStatus = cleanLine.split(/Completed/i)[1];
     if (!afterStatus) continue;
+    rowKeys.add(receipt + '|' + date + '|' + time + '|' + (afterStatus.trim().split(/\s+/)[0] || ''));
+
+    // Fee rows share the receipt+time with their payment — reject BEFORE the
+    // key is claimed so the real payment is not dropped as a "duplicate".
+    if (isChargeRow(cleanLine)) continue;
 
     // Dash-first row ("Completed - 2,000.00 19,605.00") → Withdrawn column → money OUT
     if (/^\s*[-–—]/.test(afterStatus)) continue;
@@ -4747,7 +4919,9 @@ function parseMpesaText(raw, sourceLabel) {
   }
 
   const completedCount = (text.match(/completed/gi) || []).length;
-  txs.possibleMissed = Math.max(0, completedCount - txs.length);
+  // Only rows the regexes failed on can be genuinely missed — recognized rows
+  // that were intentionally excluded (outgoing, fees, merchant) count too.
+  txs.possibleMissed = Math.max(0, completedCount - rowKeys.size);
 
   return txs;
 }
@@ -4792,7 +4966,26 @@ function normalizeSeenDates(){
 function isSeen(tx) {
   if (DB.seen[transactionKey(tx)]) return true;
   const k2 = txKeyNoTime(tx);
-  return k2 ? !!DB.seen[k2] : false;
+  if (k2 && DB.seen[k2]) return true;
+  // Legacy seen-keys: imports made before cleanReceipt stopped truncating
+  // 11-char receipts are keyed at 10 chars. Check those variants too, or a
+  // re-import would re-book already-imported long-receipt rows (double revenue).
+  const legacy = legacyReceiptKeys(tx);
+  for (let i = 0; i < legacy.length; i++) if (DB.seen[legacy[i]]) return true;
+  return false;
+}
+// Key shapes identical to transactionKey/txKeyNoTime but with the receipt
+// truncated to 10 chars. Returns [] when the receipt is 10 chars or shorter
+// (or missing), i.e. there is no legacy variant distinct from the live key.
+function legacyReceiptKeys(tx) {
+  const full = String(tx.receipt || "").replace(/\s+/g, "").replace(/[^A-Z0-9]/gi, "").toUpperCase();
+  const rc = full.slice(0, 10);
+  if (rc.length === full.length) return [];
+  const d = stripTime(tx.date) || tx.date || "";
+  return [
+    ["receipt", rc, d, tx.time || ""].join("|"),
+    ["receipt", rc, d, ""].join("|")
+  ];
 }
 function markSeen(tx) {
   DB.seen[transactionKey(tx)] = 1;

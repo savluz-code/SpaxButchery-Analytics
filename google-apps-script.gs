@@ -37,34 +37,6 @@ var SHEETS = {
   seen: 'Seen'
 };
 
-// Column order for every sheet, shared by the one-shot save and the chunked
-// save so both write byte-identical layouts.
-var HEADERS = {
-  customers: [
-    'name', 'contact', 'spent', 'visits', 'days',
-    'firstVisit', 'lastVisit', 'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits',
-    // newBatch = the import batch that first created this customer. isNew is
-    // an internal bookkeeping flag derived from it (newBatch ===
-    // settings.importBatch) — it must survive the cloud round-trip because
-    // revenue reconciliation depends on it, but it is never shown in the UI
-    // (the public NEW 🌱 badge comes from firstVisit's month instead).
-    'newBatch'
-  ],
-  monthly: ['label', 'revenue'],
-  settings: ['key', 'value'],
-  transactions: ['date', 'time', 'amount', 'name', 'phone', 'product', 'receipt', 'source', 'importedAt', 'backfillOnly'],
-  customerTx: ['customer', 'date', 'amount', 'product', 'receipt', 'importedAt'],
-  seen: ['key', 'value']
-};
-
-// Chunked upload staging. A big statement day pushes ~2.5 MB / ~23k rows, which
-// could not finish inside one request — the browser aborted it mid-write, and
-// because writeObjects_ clears a sheet before writing, an aborted save left the
-// sheet truncated (that is how a day's imports "vanished"). Chunks land in
-// throwaway staging sheets instead; the real sheets are only swapped in once
-// every chunk has arrived and the row counts check out.
-var STAGE_SUFFIX = '__stg';
-
 function doGet(e) {
   var action = (e && e.parameter && e.parameter.action) || 'load';
   try {
@@ -87,16 +59,6 @@ function doPost(e) {
       saveAll_(body);
       return json_({ success: true });
     }
-
-    // ── CHUNKED SAVE ──
-    // saveBegin  → wipe staging sheets, write the small tables (monthly,
-    //              settings, customers) straight away
-    // saveChunk  → append one slice of a big table to its staging sheet
-    // saveCommit → verify the expected row counts, then atomically swap
-    //              staging over the live sheets
-    if (action === 'saveBegin') return json_(saveBegin_(body));
-    if (action === 'saveChunk') return json_(saveChunk_(body));
-    if (action === 'saveCommit') return json_(saveCommit_(body));
 
     if (action === 'kimiVision') {
       return json_(kimiVision_(body));
@@ -190,35 +152,37 @@ function saveAll_(body) {
     ensureSheets_();
     var ss = getSpreadsheet_();
 
-    writeObjects_(ss.getSheetByName(SHEETS.customers), (body.customers || []).filter(function (c) {
-      return c && String(c.name || '').trim() !== '';
-    }), HEADERS.customers);
+  writeObjects_(ss.getSheetByName(SHEETS.customers), (body.customers || []).filter(function (c) {
+    return c && String(c.name || '').trim() !== '';
+  }), [
+    'name', 'contact', 'spent', 'visits', 'days',
+    'firstVisit', 'lastVisit', 'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits',
+    // newBatch = the import batch that first created this customer. isNew is
+    // an internal bookkeeping flag derived from it (newBatch ===
+    // settings.importBatch) — it must survive the cloud round-trip because
+    // revenue reconciliation depends on it, but it is never shown in the UI
+    // (the public NEW 🌱 badge comes from firstVisit's month instead).
+    'newBatch'
+  ]);
 
-    var monthly = body.monthly || { labels: [], revenue: [] };
-    var monthRows = (monthly.labels || []).map(function (label, i) {
-      return { label: label, revenue: monthly.revenue[i] };
-    });
-    writeObjects_(ss.getSheetByName(SHEETS.monthly), monthRows, HEADERS.monthly);
+  var monthly = body.monthly || { labels: [], revenue: [] };
+  var monthRows = (monthly.labels || []).map(function (label, i) {
+    return { label: label, revenue: monthly.revenue[i] };
+  });
+  writeObjects_(ss.getSheetByName(SHEETS.monthly), monthRows, ['label', 'revenue']);
 
-    var settings = body.settings || {};
-    var settingRows = Object.keys(settings).map(function (k) {
-      return { key: k, value: settings[k] };
-    });
-    writeObjects_(ss.getSheetByName(SHEETS.settings), settingRows, HEADERS.settings);
+  var settings = body.settings || {};
+  var settingRows = Object.keys(settings).map(function (k) {
+    return { key: k, value: settings[k] };
+  });
+  writeObjects_(ss.getSheetByName(SHEETS.settings), settingRows, ['key', 'value']);
 
-    writeObjects_(ss.getSheetByName(SHEETS.transactions), body.transactions || [], HEADERS.transactions);
+  writeObjects_(ss.getSheetByName(SHEETS.transactions), body.transactions || [], [
+    'date', 'time', 'amount', 'name', 'phone', 'product', 'receipt', 'source', 'importedAt', 'backfillOnly'
+  ]);
 
-    writeObjects_(ss.getSheetByName(SHEETS.customerTx), flattenCustomerTx_(body.customerTx || {}), HEADERS.customerTx);
-
-    writeObjects_(ss.getSheetByName(SHEETS.seen), flattenSeen_(body.seen || {}), HEADERS.seen);
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-// Shared row-shaping so the one-shot and chunked paths produce identical sheets.
-function flattenCustomerTx_(customerTx) {
   var txRows = [];
+  var customerTx = body.customerTx || {};
   Object.keys(customerTx).forEach(function (name) {
     (customerTx[name] || []).forEach(function (t) {
       txRows.push({
@@ -231,129 +195,15 @@ function flattenCustomerTx_(customerTx) {
       });
     });
   });
-  return txRows;
-}
+  writeObjects_(ss.getSheetByName(SHEETS.customerTx), txRows, [
+    'customer', 'date', 'amount', 'product', 'receipt', 'importedAt'
+  ]);
 
-function flattenSeen_(seen) {
-  return Object.keys(seen).map(function (k) { return { key: k, value: 1 }; });
-}
-
-/* ══════════ CHUNKED SAVE ══════════ */
-// Big payloads are uploaded in slices so no single request has to finish the
-// whole write. Slices go to staging sheets ("Transactions__stg" etc.); the live
-// sheets are untouched until saveCommit verifies every row arrived. A dropped
-// connection mid-upload therefore leaves the previous good data intact instead
-// of a half-written sheet.
-
-function stageName_(key) { return SHEETS[key] + STAGE_SUFFIX; }
-
-function getOrCreateSheet_(ss, name) {
-  var sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  return sh;
-}
-
-function saveBegin_(body) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    ensureSheets_();
-    var ss = getSpreadsheet_();
-
-    // Reset staging for the big tables, headers only.
-    ['transactions', 'customerTx', 'seen'].forEach(function (key) {
-      var sh = getOrCreateSheet_(ss, stageName_(key));
-      sh.clearContents();
-      sh.getRange(1, 1, 1, HEADERS[key].length).setValues([HEADERS[key]]);
-    });
-
-    // Small tables are written directly — they always fit in one request.
-    writeObjects_(ss.getSheetByName(SHEETS.customers), (body.customers || []).filter(function (c) {
-      return c && String(c.name || '').trim() !== '';
-    }), HEADERS.customers);
-
-    var monthly = body.monthly || { labels: [], revenue: [] };
-    var monthRows = (monthly.labels || []).map(function (label, i) {
-      return { label: label, revenue: monthly.revenue[i] };
-    });
-    writeObjects_(ss.getSheetByName(SHEETS.monthly), monthRows, HEADERS.monthly);
-
-    var settings = body.settings || {};
-    var settingRows = Object.keys(settings).map(function (k) {
-      return { key: k, value: settings[k] };
-    });
-    writeObjects_(ss.getSheetByName(SHEETS.settings), settingRows, HEADERS.settings);
-
-    return { success: true };
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function saveChunk_(body) {
-  var key = String(body.table || '');
-  if (!HEADERS[key] || !SHEETS[key]) return { success: false, error: 'unknown table: ' + key };
-
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    var ss = getSpreadsheet_();
-    var sh = getOrCreateSheet_(ss, stageName_(key));
-    var rows = body.rows || [];
-    if (!rows.length) return { success: true, written: 0 };
-
-    var headers = HEADERS[key];
-    var data = rows.map(function (r) {
-      return headers.map(function (h) {
-        var v = r[h];
-        if (v === undefined || v === null) return '';
-        if (typeof v === 'boolean') return v ? 'true' : 'false';
-        return v;
-      });
-    });
-    // Append after whatever previous chunks already landed.
-    sh.getRange(sh.getLastRow() + 1, 1, data.length, headers.length).setValues(data);
-    return { success: true, written: data.length };
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function saveCommit_(body) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    var ss = getSpreadsheet_();
-    var expect = body.expect || {};
-    var keys = ['transactions', 'customerTx', 'seen'];
-
-    // Verify BEFORE touching live data: every staged sheet must hold exactly
-    // the number of rows the client said it sent. A short count means a chunk
-    // was lost, so we abort and leave the live sheets alone.
-    for (var i = 0; i < keys.length; i++) {
-      var key = keys[i];
-      var stg = ss.getSheetByName(stageName_(key));
-      var have = stg ? Math.max(0, stg.getLastRow() - 1) : 0;
-      var want = Number(expect[key] || 0);
-      if (have !== want) {
-        return {
-          success: false,
-          error: 'chunk mismatch on ' + key + ': staged ' + have + ' rows, expected ' + want +
-                 ' — live data left untouched, please retry the save'
-        };
-      }
-    }
-
-    // All present: swap staging over the live sheets.
-    keys.forEach(function (key) {
-      var live = ss.getSheetByName(SHEETS[key]);
-      var stg = ss.getSheetByName(stageName_(key));
-      if (!stg) return;
-      if (live) ss.deleteSheet(live);
-      stg.setName(SHEETS[key]);
-    });
-
-    return { success: true };
+  var seen = body.seen || {};
+  var seenRows = Object.keys(seen).map(function (k) {
+    return { key: k, value: 1 };
+  });
+  writeObjects_(ss.getSheetByName(SHEETS.seen), seenRows, ['key', 'value']);
   } finally {
     lock.releaseLock();
   }

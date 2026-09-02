@@ -878,6 +878,28 @@ let SYNC_MODE = 'auto';
 let isSyncing = false;
 let lastSyncTime = null;
 let lastCloudError = '';
+
+// ── CHUNKED SYNC (client-only) ──
+// A big statement day pushes ~2.5 MB / ~23k rows in ONE request, which weak
+// mobile signal regularly aborts mid-write — and because the backend clears
+// each sheet before writing, an aborted save left the sheet truncated (that
+// is how a day's imports "vanished"). Large saves therefore go up in slices
+// (saveBegin → saveChunk×N → saveCommit) so no single request has to carry
+// the whole database, and the backend only swaps the live sheets in once
+// every promised row has landed.
+//
+// The Apps Script in this repo is deliberately NOT changed: the deployed
+// backend may or may not understand those actions. The first large save of a
+// session probes with saveBegin; a backend that answers "unknown action" (the
+// saveAll-only script) is remembered and every save then uses the single
+// saveAll POST that has always worked. That is the fix for the PR #37
+// breakage — syncing never hard-requires a Code.gs redeploy, and a chunked
+// backend deployed later is picked up automatically on the next session.
+const CHUNK_ROWS = 2000; // rows per chunked upload request
+let cloudChunks = false;      // true once the backend proves it speaks the chunked actions
+let cloudChunkProbed = false; // one probe per session is enough
+try { cloudChunks = localStorage.getItem('spaxCloudChunked') === '1'; } catch (_) {}
+
 async function cloudRequest(url, options = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30000);
@@ -1026,7 +1048,6 @@ async function saveToCloud(force = false) {
     // (the Merchant) to the Google Sheet — his rows, customer record, or
     // history would come back on the next pull and pollute revenue again.
     const payload = {
-      action: 'saveAll',
       customers: (DB.customers || []).filter(c => !isMerchant(c.name)),
       monthly: DB.monthly,
       settings: {
@@ -1046,19 +1067,64 @@ async function saveToCloud(force = false) {
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
 
-    const result = await cloudRequest(GAS_URL, {
+    const post = (obj) => cloudRequest(GAS_URL, {
       method: 'POST',
       // text/plain keeps this a CORS-simple request for Apps Script web apps.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(obj)
     });
 
+    // Flatten the two nested tables exactly as the backend does, so the row
+    // counts promised to saveCommit match what it stages.
+    const ctxRows = [];
+    Object.keys(payload.customerTx).forEach(name => {
+      (payload.customerTx[name] || []).forEach(t => ctxRows.push({
+        customer: name,
+        date: t.date || '',
+        amount: t.amount || 0,
+        product: t.product || '',
+        receipt: t.receipt || '',
+        importedAt: t.importedAt || ''
+      }));
+    });
+    const seenRows = Object.keys(payload.seen).map(k => ({ key: k, value: 1 }));
+    const bigTables = {
+      transactions: payload.transactions,
+      customerTx: ctxRows,
+      seen: seenRows
+    };
+    const totalBigRows = bigTables.transactions.length + ctxRows.length + seenRows.length;
+
+    // Large payloads try the chunked upload first — but only if the backend is
+    // known (or not yet known) to support it. A saveAll-only backend answers
+    // "unknown action", we remember that for the session, and the save falls
+    // straight through to the one-shot request below. Small saves are always
+    // a single request, on every backend.
+    if (totalBigRows > CHUNK_ROWS && (cloudChunks || !cloudChunkProbed)) {
+      try {
+        const chunked = await saveToCloudChunked(post, payload, bigTables, totalBigRows);
+        if (chunked) return true;
+      } catch (err) {
+        if (isUnknownActionError(err)) {
+          cloudChunks = false;
+          cloudChunkProbed = true;
+          try { localStorage.setItem('spaxCloudChunked', '0'); } catch (_) {}
+          console.warn('Cloud backend has no chunked actions — saving in one request.');
+          // fall through to the one-shot saveAll below
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    const result = await post({ action: 'saveAll', ...payload });
     if (result.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
       lastCloudError = '';
       return true;
     }
+    throw new Error(result.error || 'Cloud rejected the save');
   } catch (err) {
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);
@@ -1067,6 +1133,58 @@ async function saveToCloud(force = false) {
   } finally {
     isSyncing = false;
   }
+}
+
+// ── CHUNKED UPLOAD ──
+// saveBegin  → small tables (customers/monthly/settings) + staging reset
+// saveChunk  → one slice of a big table (transactions/customerTx/seen)
+// saveCommit → backend verifies every promised row landed before it swaps the
+//              staging sheets over the live ones, so a dropped connection
+//              costs a retry — never a truncated sheet.
+async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
+  showSyncStatus('⏳ Saving to cloud… (large upload, sending in parts)');
+  const begin = await post({
+    action: 'saveBegin',
+    customers: payload.customers,
+    monthly: payload.monthly,
+    settings: payload.settings
+  });
+  // cloudRequest throws unless success === true, so reaching here means
+  // saveBegin was understood — the backend speaks the chunked protocol.
+  cloudChunks = true;
+  cloudChunkProbed = true;
+  try { localStorage.setItem('spaxCloudChunked', '1'); } catch (_) {}
+
+  const expect = {};
+  let sent = 0;
+  for (const table of ['transactions', 'customerTx', 'seen']) {
+    const rows = bigTables[table];
+    expect[table] = rows.length;
+    for (let i = 0; i < rows.length; i += CHUNK_ROWS) {
+      const slice = rows.slice(i, i + CHUNK_ROWS);
+      const res = await post({ action: 'saveChunk', table, rows: slice });
+      if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
+      sent += slice.length;
+      showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%');
+    }
+  }
+
+  // The backend verifies the staged row counts before it swaps anything in,
+  // so a lost chunk aborts the commit and leaves the good data in place.
+  const commit = await post({ action: 'saveCommit', expect });
+  if (commit.success) {
+    lastSyncTime = new Date();
+    showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
+    lastCloudError = '';
+    return true;
+  }
+  throw new Error(commit.error || 'Cloud rejected the save');
+}
+
+// The pre-chunked backend answers unknown POST actions with exactly this
+// error; it is the signal to fall back to the one-shot saveAll.
+function isUnknownActionError(err) {
+  return /unknown action/i.test(String((err && err.message) || err));
 }
 
 function showSyncStatus(msg) {

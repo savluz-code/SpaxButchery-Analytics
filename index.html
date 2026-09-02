@@ -983,6 +983,9 @@ async function loadFromCloud() {
       if (data.monthly && data.monthly.labels) {
         DB.monthly = data.monthly;
       }
+      // Older cloud backends may omit monthly; a fresh device has no local
+      // bucket table either — never let the re-book loop below throw on it.
+      if (!DB.monthly || !Array.isArray(DB.monthly.labels)) DB.monthly = { labels: [], revenue: [] };
       if (data.settings) {
         DB.importedRev = Number(data.settings.importedRev) || 0;
         DB.importedTx = Number(data.settings.importedTx) || 0;
@@ -1017,7 +1020,8 @@ async function loadFromCloud() {
       reconcileNewFlags();
       const cloudFixed = repairDates();
       if(cloudFixed > 0) console.log('Cloud sync repair: fixed', cloudFixed, 'customers');
-      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
+      try { localStorage.setItem('spaxDB_v23', JSON.stringify(DB)); }
+      catch (storeErr) { console.warn('Cloud sync: merged DB is in memory but could not be persisted (storage full?) — next save will retry.', storeErr); }
       // Merchant exclusion is non-negotiable: if the cloud sheet still carries
       // Simon Musyoka (the Merchant), scrub him from the merged data now.
       purgeMerchantData();
@@ -3070,9 +3074,11 @@ function load(){
     // had a sticky isNew that never expired — those flags are cleared here so
     // NEW strictly means "discovered by the most recent import".
     if (reconcileNewFlags() > 0) needsSave = true;
-    // Persist migration fixes to localStorage
+    // Persist migration fixes to localStorage (a quota error here must never
+    // fall into the catch below — that would replace DB with seed data).
     if(needsSave){
-      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
+      try { localStorage.setItem('spaxDB_v23', JSON.stringify(DB)); }
+      catch (storeErr) { console.warn('Could not persist migration fixes (storage full?) — retrying on next save.', storeErr); }
     }
 
     // MERCHANT CLEANUP: scrub any Simon Musyoka (the Merchant) records that a
@@ -3102,7 +3108,8 @@ function load(){
     return Promise.resolve();
   }
 }function save(){
-  localStorage.setItem('spaxDB_v23',JSON.stringify(DB));
+  try { localStorage.setItem('spaxDB_v23',JSON.stringify(DB)); }
+  catch (storeErr) { console.warn('Could not persist local DB (storage full?) — keeping in-memory state; cloud save still attempted.', storeErr); }
   if (SYNC_MODE === 'auto') {
     saveToCloud();
   }
@@ -4473,6 +4480,16 @@ async function loadPdfDocument(file) {
     }
   }
 
+  // 1b) Almost every M-Pesa statement PDF is NOT encrypted — open it with no
+  //     password BEFORE showing the password dialog. (Regression: password-PDF
+  //     support made every new PDF pop the "PDF password" modal; cancelling
+  //     skipped the file instead of reading its embedded text layer.)
+  try {
+    return await pdfjsLib.getDocument({ data: buffer }).promise;
+  } catch (err) {
+    if (err.name !== 'PasswordException') throw err; // corrupt/real failure, not a password issue
+  }
+
   // 2) Interactive entry with retry until the password works or the user cancels.
   let lastError = '';
   for (;;) {
@@ -4795,8 +4812,15 @@ function parseMpesaText(raw, sourceLabel) {
     // they share the receipt number and completion time. A cross-row match
     // (broken amount cells on the anchor row) counts BOTH rows.
     const crossed1 = /\b\d{4}[-\/]\d{2}[-\/]\d{2}\s+\d{2}:\d{2}:\d{2}\b/.test(details);
-    rowKeys.add(receipt + '|' + date + '|' + time + '|' + (crossed1 ? 'lead' : m[5]));
-    if (crossed1) rowKeys.add(receipt + '|' + date + '|' + time + '|' + m[5]);
+    // Cross-row slide guard: if the captured details contain a LATER row's
+    // date/time header, the "Completed + 3 amounts" belong to that row, not to
+    // this anchor (e.g. this row prints a U+2212 "−" dash cell so it only has
+    // TWO decimal cells). Accepting the match books a phantom row with the
+    // next row's amount AND steals THIS row's dedup key — the real payment is
+    // then dropped as a "duplicate". Reject it; regex2 owns rows with dash
+    // cells, and fee rows anchor themselves there too (rejected as charges).
+    if (crossed1) continue;
+    rowKeys.add(receipt + '|' + date + '|' + time + '|' + m[5]);
 
     // Fee rows share the receipt+time with their payment — reject BEFORE the
     // key is claimed so the real payment is not dropped as a "duplicate".
@@ -4837,20 +4861,24 @@ function parseMpesaText(raw, sourceLabel) {
   // may also come glued to the date in the text layer ("QGH7XTRN7Y2026-08-12"), so
   // allow optional whitespace there (no \b between them: both sides are [A-Z0-9]).
   // Rows already captured above are deduped by key.
-  const regex2 = /\b([A-Z0-9]{8,11})\s*(\d{4}[-\/]\d{2}[-\/]\d{2})\s+(\d{2}:\d{2}:\d{2})\s+([\s\S]*?)\bCompleted\s+((?:[-–—]\s*|[\d,]+\.\d{2}\s*){2,4})/gi;
+  const regex2 = /\b([A-Z0-9]{8,11})\s*(\d{4}[-\/]\d{2}[-\/]\d{2})\s+(\d{2}:\d{2}:\d{2})\s+([\s\S]*?)\bCompleted\s+((?:[-–—\u2212]\s*|[-–—\u2212]?[\d,]+\.\d{2}\s*){2,4})/gi;
   while ((m = regex2.exec(text)) !== null) {
     const details = m[4].trim();
     const firstCell = m[5].trim().split(/\s+/)[0];
     const crossed2 = /\b\d{4}[-\/]\d{2}[-\/]\d{2}\s+\d{2}:\d{2}:\d{2}\b/.test(details);
-    rowKeys.add(cleanReceipt(m[1]) + '|' + parseDate(m[2]) + '|' + m[3] + '|' + (crossed2 ? 'lead' : firstCell));
-    if (crossed2) rowKeys.add(cleanReceipt(m[1]) + '|' + parseDate(m[2]) + '|' + m[3] + '|' + firstCell);
+    // Cross-row slide guard — same rule as the primary pass: never book a row
+    // whose "Completed + amounts" belong to a later printed row (their header
+    // sits inside the captured details). The dash class above anchors every
+    // dash/blank-column row to ITS OWN Completed, so sliding is never needed.
+    if (crossed2) continue;
+    rowKeys.add(cleanReceipt(m[1]) + '|' + parseDate(m[2]) + '|' + m[3] + '|' + firstCell);
 
     // Fee rows share the receipt+time with their payment — reject BEFORE the
     // key is claimed so the real payment is not dropped as a "duplicate".
     if (isChargeRow(chargeJudgeSegment(details))) continue;
 
     const cells = m[5].trim().split(/\s+/).filter(Boolean);
-    if (cells[0] === '-' || cells[0] === '–' || cells[0] === '—') continue; // Withdrawn-first row → money OUT
+    if (cells[0] === '-' || cells[0] === '–' || cells[0] === '—' || cells[0] === '−') continue; // Withdrawn-first row → money OUT
     const amounts = cells.filter(c => /\d/.test(c));
     if (amounts.length < 2) continue; // need Paid In AND Balance columns (guards against lone Balance pickup)
     const amount = parseAmount(amounts[0]);
@@ -4907,7 +4935,7 @@ function parseMpesaText(raw, sourceLabel) {
     if (isChargeRow(cleanLine)) continue;
 
     // Dash-first row ("Completed - 2,000.00 19,605.00") → Withdrawn column → money OUT
-    if (/^\s*[-–—]/.test(afterStatus)) continue;
+    if (/^\s*[-–—\u2212]/.test(afterStatus)) continue;
 
     const amountMatches = afterStatus.match(/[\d,]+\.\d{2}/g);
     // Need at least Paid In + Balance. With all 3 columns present (older statements

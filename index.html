@@ -980,36 +980,98 @@ async function loadFromCloud() {
       }));
 
       DB.customers = merged;
+
+      // ── UNION MERGE FOR TRANSACTIONS / HISTORY / SEEN / MONTHLY / SETTINGS ──
+      // Fix for regression where import toast said 41 but transaction tab showed 11:
+      // loadFromCloud() was REPLACING local transactions/history/seen with the stale
+      // cloud copy (e.g. after a failed save that left the sheet truncated). That
+      // deleted the day's import locally while customers stayed merged, so the list
+      // looked fine but counts didn't. Union instead: keep every cloud row AND every
+      // local row the cloud doesn't have, keyed exactly like the import dedup guard.
+      // No forced push-back — the merged data is saved locally and will reach the
+      // cloud on the next auto-save, avoiding the sync-wedge that PR #38's push-back
+      // caused.
+      const localMonthlySnap = DB.monthly && DB.monthly.labels ? {labels: DB.monthly.labels.slice(), revenue: DB.monthly.revenue.slice()} : {labels:[], revenue:[]};
+      const localTxSnap = Array.isArray(DB.transactions) ? DB.transactions.slice() : [];
+      const localCustTxSnap = DB.customerTx ? JSON.parse(JSON.stringify(DB.customerTx)) : {};
+      const localSeenSnap = DB.seen ? {...DB.seen} : {};
+      const localImportedRevSnap = Number(DB.importedRev) || 0;
+      const localImportedTxSnap = Number(DB.importedTx) || 0;
+      const localResolvedSnap = Number(DB.resolved) || 0;
+      const localImportBatchSnap = Number(DB.importBatch) || 0;
+
+      // Monthly: merge labels, keep max revenue per month to preserve local-only imports
       if (data.monthly && data.monthly.labels) {
-        DB.monthly = data.monthly;
-      }
-      if (data.settings) {
-        DB.importedRev = Number(data.settings.importedRev) || 0;
-        DB.importedTx = Number(data.settings.importedTx) || 0;
-        DB.resolved = Number(data.settings.resolved) || 0;
-        // Keep the highest batch counter seen across devices so a stale cloud
-        // value can't resurrect NEW badges that a newer local import retired.
-        DB.importBatch = Math.max(Number(data.settings.importBatch) || 0, Number(DB.importBatch) || 0);
-      }
-      if (data.transactions) {
-        DB.transactions = data.transactions.map(t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0}));
-      }
-      if (data.customerTx) {
-        DB.customerTx = {};
-        Object.keys(data.customerTx).forEach(name => {
-          DB.customerTx[name] = (data.customerTx[name] || []).map(t => ({...t, date: stripTime(t.date) || ''}));
+        const monthMap = new Map();
+        (data.monthly.labels||[]).forEach((l,i)=>{ monthMap.set(l, Number(data.monthly.revenue[i])||0); });
+        (localMonthlySnap.labels||[]).forEach((l,i)=>{
+          const localRev = Number(localMonthlySnap.revenue[i])||0;
+          const cloudRev = monthMap.get(l);
+          monthMap.set(l, cloudRev!=null ? Math.max(cloudRev, localRev) : localRev);
         });
-      } else {
-        DB.transactions = []; }
-      // Restore the dedup map in the SAME key format the import guard uses
-      // (transactionKey / markSeen). The old 'R:'/'C:' scheme never matched those
-      // keys, so after any sync re-importing an already-loaded statement slipped
-      // past the guard and double-counted revenue & stats.
-      if (data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length) {
-        DB.seen = data.seen;
-      } else if (DB.transactions) {
+        const sorted = Array.from(monthMap.entries()).sort((a,b)=>a[0].localeCompare(b[0]));
+        DB.monthly = {labels: sorted.map(p=>p[0]), revenue: sorted.map(p=>p[1])};
+      }
+      // else keep existing DB.monthly (local)
+
+      if (data.settings) {
+        DB.importedRev = Math.max(Number(data.settings.importedRev)||0, localImportedRevSnap);
+        DB.importedTx = Math.max(Number(data.settings.importedTx)||0, localImportedTxSnap);
+        DB.resolved = Math.max(Number(data.settings.resolved)||0, localResolvedSnap);
+        DB.importBatch = Math.max(Number(data.settings.importBatch)||0, localImportBatchSnap);
+      }
+
+      // Transactions: union by receipt|date|time keys (including legacy 10-char variant)
+      const txNorm = t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0});
+      const cloudTx = Array.isArray(data.transactions) ? data.transactions.map(txNorm) : [];
+      const localTx = localTxSnap.map(txNorm);
+      const cloudTxKeys = new Set();
+      cloudTx.forEach(t=>{
+        cloudTxKeys.add(transactionKey(t));
+        const k2 = txKeyNoTime(t);
+        if (k2) cloudTxKeys.add(k2);
+        try { legacyReceiptKeys(t).forEach(k=>cloudTxKeys.add(k)); } catch(_) {}
+      });
+      const keptTx = cloudTx.slice();
+      localTx.forEach(t=>{
+        const k = transactionKey(t);
+        const k2 = txKeyNoTime(t);
+        let leg = [];
+        try { leg = legacyReceiptKeys(t); } catch(_) {}
+        if (cloudTxKeys.has(k) || (k2 && cloudTxKeys.has(k2)) || leg.some(x=>cloudTxKeys.has(x))) return;
+        keptTx.push(t);
+        cloudTxKeys.add(k);
+        if (k2) cloudTxKeys.add(k2);
+        leg.forEach(x=>cloudTxKeys.add(x));
+      });
+      DB.transactions = keptTx;
+
+      // Per-customer history: union by date|amount|receipt
+      const histKey = t => ((t.date||'')+'|'+Number(t.amount||0).toFixed(2)+'|'+String(t.receipt||'').toLowerCase());
+      const mergedCustTx = {};
+      if (data.customerTx) {
+        Object.keys(data.customerTx).forEach(name=>{
+          mergedCustTx[name] = (data.customerTx[name]||[]).map(t=>({...t, date: stripTime(t.date)||''}));
+        });
+      }
+      Object.keys(localCustTxSnap||{}).forEach(name=>{
+        const existing = mergedCustTx[name] || (mergedCustTx[name]=[]);
+        const have = new Set(existing.map(histKey));
+        (localCustTxSnap[name]||[]).forEach(t=>{
+          const k = histKey(t);
+          if (have.has(k)) return;
+          existing.push({...t, date: stripTime(t.date)||''});
+          have.add(k);
+        });
+      });
+      DB.customerTx = mergedCustTx;
+
+      // Seen map: union (local wins on overlap, both are 1 anyway)
+      const cloudSeen = (data.seen && typeof data.seen === 'object') ? data.seen : {};
+      DB.seen = {...cloudSeen, ...localSeenSnap};
+      if (!Object.keys(DB.seen).length && DB.transactions.length) {
         DB.seen = {};
-        DB.transactions.forEach(tx => { markSeen(tx); });
+        DB.transactions.forEach(tx=>{ markSeen(tx); });
       }
       sanitizeNegativeTotals();
       lastSyncTime = new Date();
@@ -5231,18 +5293,23 @@ function importTransactions(txs, opts = {}) {
     if (outcome === 'updated') updated++; else added++;
     imported++;
   });
-  // Track which seed customers received new transactions so we can reconcile
-  // their aggregates after the import loop (max of seed baseline vs imported
-  // history). This prevents double-counting: seed customers already have their
-  // lifetime spent/visits baked into REPORT.totalRevenue and SEED_MONTHLY, so
-  // importing the same M-Pesa statements must NOT add those amounts again.
+  // Track seed customers that received new transactions so we can reconcile
+  // their aggregates AFTER customerTx already contains the current batch.
+  // Previously reconciliation ran before customerTx was built, so historySum
+  // missed the day's rows and the later monthlyDelta addition used the FULL
+  // history sum (double-counting old months). Now we build history immediately
+  // and only add the incremental delta (newSpent-oldSpent) to importedRev/monthly.
   const seedCustomersTouched = new Set();
+  const seedBatchMap = new Map(); // customerName -> tx[] of this batch
+  const monthAddSeedDelta = {};
 
   txFresh.forEach(tx => {
     const product = classifyProduct(tx.date, tx.amount);
     const txAmount = Math.max(0, Number(tx.amount || 0));
+    const normDate = stripTime(tx.date) || '';
+    const nowISO = new Date().toISOString();
     DB.transactions.push({
-      date: stripTime(tx.date) || '',
+      date: normDate,
       time: tx.time || '',
       amount: txAmount,
       name: tx.name || '',
@@ -5250,21 +5317,30 @@ function importTransactions(txs, opts = {}) {
       product: product,
       receipt: tx.receipt || '',
       source: tx.source || '',
-      importedAt: new Date().toISOString()
+      importedAt: nowISO
     });
+    // Build per-customer history immediately so reconciliation sees current batch
+    const custForHist = findCustomerMatch(tx);
+    if (custForHist) {
+      if (!DB.customerTx[custForHist.name]) DB.customerTx[custForHist.name] = [];
+      DB.customerTx[custForHist.name].push({
+        date: normDate,
+        amount: txAmount,
+        product: product,
+        receipt: tx.receipt || '',
+        importedAt: nowISO
+      });
+      DB.customerTx[custForHist.name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
+    }
+
     const date = txDate(tx);
-    const match = findCustomerMatch(tx);
+    const match = custForHist || findCustomerMatch(tx);
     if (match) {
       if (match.isSeed) {
-        // Comeback detection must see the PREVIOUS last visit, before we move it.
         if(date > (match.lastVisit || '')) {
           const wasComeback = noteComebackReturn(match, match.lastVisit, date);
           if(wasComeback) comebacks.push(match.name);
         }
-        // SEED CUSTOMER: this transaction is already reflected in the seed
-        // baseline (REPORT.totalRevenue / SEED_MONTHLY). Record it in the
-        // per-customer history and update dates/contact, but do NOT add to
-        // spent/visits/monthly/importedRev — that would double-count.
         if (!match.lastVisit || date > match.lastVisit) match.lastVisit = date;
         if (!match.firstVisit || date < match.firstVisit) match.firstVisit = date;
         const today = new Date(getTodayEAT());
@@ -5276,9 +5352,9 @@ function importTransactions(txs, opts = {}) {
           unmasked++;
         }
         seedCustomersTouched.add(match.name);
+        if (!seedBatchMap.has(match.name)) seedBatchMap.set(match.name, []);
+        seedBatchMap.get(match.name).push({date: normDate, amount: txAmount});
       } else {
-        // NON-SEED CUSTOMER: add normally (these are genuinely new transactions
-        // not already counted in any baseline).
         if(date > (match.lastVisit || '')) {
           const wasComeback = noteComebackReturn(match, match.lastVisit, date);
           if(wasComeback) comebacks.push(match.name);
@@ -5295,7 +5371,6 @@ function importTransactions(txs, opts = {}) {
           DB.resolved++;
           unmasked++;
         }
-        // Only non-seed transactions contribute to monthly revenue and importedRev
         const mk = /^\d{4}-\d{2}/.test(tx.date || "") ? tx.date.slice(0, 7) :
           (new Date()).getFullYear() + '-' + String((new Date()).getMonth() + 1).padStart(2, '0');
         monthAdd[mk] = (monthAdd[mk] || 0) + txAmount;
@@ -5303,22 +5378,29 @@ function importTransactions(txs, opts = {}) {
       updated++;
     } else {
       const today = new Date(getTodayEAT());
-      const txDate = stripTime(date) || getTodayEAT();
-      const daysSinceTx = Math.max(0, Math.round((today - new Date(txDate)) / 86400000));
-      DB.customers.push({
+      const txDateNorm = stripTime(date) || getTodayEAT();
+      const daysSinceTx = Math.max(0, Math.round((today - new Date(txDateNorm)) / 86400000));
+      const newCust = {
         name: tx.name || "M-Pesa Customer",
         contact: normalizeContact(tx.contact),
         spent: txAmount,
         visits: 1,
         days: daysSinceTx,
-        lastVisit: txDate,
-        firstVisit: txDate,
+        lastVisit: txDateNorm,
+        firstVisit: txDateNorm,
         masked: (tx.contact || "").includes("***") || !isValidKenyanContact(tx.contact),
         isNew: true,
         newBatch: currentBatch
-      });
+      };
+      DB.customers.push(newCust);
+      if (!DB.customerTx[newCust.name]) DB.customerTx[newCust.name] = [];
+      // history already pushed above under old match? No — new customer had no match, so push now if not already
+      const already = DB.customerTx[newCust.name].some(h=>h.receipt=== (tx.receipt||'') && h.date===normDate);
+      if (!already) {
+        DB.customerTx[newCust.name].push({date: normDate, amount: txAmount, product: product, receipt: tx.receipt||'', importedAt: nowISO});
+        DB.customerTx[newCust.name].sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+      }
       added++;
-      // New customers are never seed — count their revenue normally
       const mk = /^\d{4}-\d{2}/.test(tx.date || "") ? tx.date.slice(0, 7) :
         (new Date()).getFullYear() + '-' + String((new Date()).getMonth() + 1).padStart(2, '0');
       monthAdd[mk] = (monthAdd[mk] || 0) + txAmount;
@@ -5326,61 +5408,41 @@ function importTransactions(txs, opts = {}) {
     imported++;
   });
 
-  // RECONCILE SEED CUSTOMERS: For seed customers that received imported
-  // transactions, recalculate their spent/visits as max(seed_baseline,
-  // sum_of_imported_history). This ensures:
-  // - If imports don't exceed seed data, seed values are preserved (no data loss)
-  // - If imports DO exceed seed (new transactions after the report), use the
-  //   import sum and count the delta toward importedRev/monthly revenue
+  // RECONCILE SEED CUSTOMERS: max(seed baseline, sum(history including current batch))
+  // Delta = newSpent - oldSpent (oldSpent before this import). Only delta goes to
+  // importedRev and monthly, distributed proportionally across current batch months
+  // to avoid adding full historical sum to monthly buckets (which double-counts).
   seedCustomersTouched.forEach(customerName => {
     const cust = DB.customers.find(c => c.name === customerName && c.isSeed);
     if (!cust) return;
-    
     const history = DB.customerTx[customerName] || [];
-    if (history.length === 0) return;
-    
+    if (!history.length) return;
     const historySum = history.reduce((s, t) => s + Math.max(0, Number(t.amount || 0)), 0);
     const historyVisits = history.length;
-    
-    // Use max of seed baseline vs imported history (zero-clamped)
-    const newSpent = Math.max(cust.seedSpent || 0, historySum);
-    const newVisits = Math.max(cust.seedVisits || 0, historyVisits);
-    
-    // Calculate delta (how much imported history exceeds seed baseline)
-    const spentDelta = Math.max(0, historySum - (cust.seedSpent || 0));
-    const visitsDelta = Math.max(0, historyVisits - (cust.seedVisits || 0));
-    
-    // Update customer aggregates
+    const oldSpent = Number(cust.spent || 0);
+    const newSpent = Math.max(Number(cust.seedSpent || 0), historySum);
+    const newVisits = Math.max(Number(cust.seedVisits || 0), historyVisits);
+    const spentDelta = Math.max(0, newSpent - oldSpent);
     cust.spent = newSpent;
     cust.visits = newVisits;
-    
-    // Add delta to importedRev and monthly revenue (only the portion that
-    // exceeds the seed baseline, since seed is already in REPORT.totalRevenue)
     if (spentDelta > 0) {
       DB.importedRev += spentDelta;
-      
-      // Distribute delta across months based on transaction dates
-      const monthlyDelta = {};
-      history.forEach(tx => {
-        if (!tx.date) return;
-        const mk = /^\d{4}-\d{2}/.test(tx.date) ? tx.date.slice(0, 7) : '';
+      const batchTxs = seedBatchMap.get(customerName) || [];
+      const batchSum = batchTxs.reduce((s,t)=>s+Number(t.amount||0),0) || 1;
+      batchTxs.forEach(bt=>{
+        const mk = /^\d{4}-\d{2}/.test(bt.date||"") ? bt.date.slice(0,7) : '';
         if (!mk) return;
-        monthlyDelta[mk] = (monthlyDelta[mk] || 0) + Math.max(0, Number(tx.amount || 0));
-      });
-      
-      Object.entries(monthlyDelta).forEach(([month, amount]) => {
-        // Only add the portion that exceeds what seed monthly already has
-        // (This is complex to calculate precisely, so we add the full amount
-        // from imported history — the seed monthly baseline is already in
-        // SEED_MONTHLY, and this represents new data beyond that baseline)
-        const i = DB.monthly.labels.indexOf(month);
-        if (i >= 0) DB.monthly.revenue[i] += amount;
-        else { DB.monthly.labels.push(month); DB.monthly.revenue.push(amount); }
+        const share = (Number(bt.amount||0)/batchSum) * spentDelta;
+        monthAddSeedDelta[mk] = (monthAddSeedDelta[mk]||0) + share;
       });
     }
   });
 
-  Object.entries(monthAdd).forEach(([k, v]) => {
+  // Merge monthly buckets: non-seed + seed deltas (proportional)
+  const mergedMonthAdd = {};
+  Object.entries(monthAdd).forEach(([k,v])=>{ mergedMonthAdd[k]=(mergedMonthAdd[k]||0)+v; });
+  Object.entries(monthAddSeedDelta).forEach(([k,v])=>{ mergedMonthAdd[k]=(mergedMonthAdd[k]||0)+v; });
+  Object.entries(mergedMonthAdd).forEach(([k, v]) => {
     const i = DB.monthly.labels.indexOf(k);
     if (i >= 0) DB.monthly.revenue[i] += v;
     else { DB.monthly.labels.push(k); DB.monthly.revenue.push(v); }
@@ -5388,37 +5450,22 @@ function importTransactions(txs, opts = {}) {
   const pairs = DB.monthly.labels.map((l, i) => [l, DB.monthly.revenue[i]]).sort((a, b) => a[0].localeCompare(b[0]));
   DB.monthly.labels = pairs.map(p => p[0]);
   DB.monthly.revenue = pairs.map(p => p[1]);
-  // Only non-seed transactions count toward imported revenue and the imported
-  // transaction tally here. Seed customer deltas were already added above in
-  // the reconciliation step. Duplicates are excluded from every aggregate.
+
+  // Imported counts: non-seed fresh + seed deltas already added above.
+  // Non-seed transactions: need to count amount already in monthAdd, but importedRev
+  // for non-seed was previously added via separate sum — we keep that logic but
+  // use the already-computed monthAdd sum to avoid double loop.
   const nonSeedFresh = txFresh.filter(tx => {
-    const match = findCustomerMatch(tx);
-    return !(match && match.isSeed);
+    const m = findCustomerMatch(tx);
+    return !(m && m.isSeed);
   });
+  // Non-seed revenue: sum of their amounts (seed deltas handled separately)
   DB.importedRev += nonSeedFresh.reduce((s, tx) => s + Math.max(0, Number(tx.amount || 0)), 0);
   DB.importedTx += nonSeedFresh.length;
+  // Seed customers that grew beyond baseline count as 1 imported tx per customer whose delta >0?
+  // Keep previous behavior: importedTx only counts non-seed transactions; seed growth
+  // is tracked via importedRev. (No extra Tx inflation)
 
-  // Build per-customer transaction history (dedup-guarded like everything above)
-  txFresh.forEach(tx => {
-    // Same robust matcher used for the spent/visits update above — handles the
-    // phone/contact field fallback and fuzzy name scoring that the old plain
-    // phone-equality + substring check here was missing, which left history
-    // unattached for customers whose contact came through as tx.contact (PDF/OCR
-    // imports) rather than tx.phone.
-    const cust = findCustomerMatch(tx);
-    if(cust){
-      if(!DB.customerTx[cust.name]) DB.customerTx[cust.name] = [];
-      DB.customerTx[cust.name].push({
-        date: stripTime(tx.date) || '',
-        amount: Number(tx.amount || 0),
-        product: classifyProduct(tx.date, tx.amount),
-        receipt: tx.receipt || '',
-        importedAt: new Date().toISOString()
-      });
-      // Sort by date descending
-      DB.customerTx[cust.name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
-    }
-  });
 
   const importFixed = repairDates();
   if(importFixed > 0){ console.log('Import repair: fixed', importFixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }

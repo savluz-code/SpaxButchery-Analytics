@@ -2990,8 +2990,8 @@ const SEED_CUSTOMERS=[
 ["Victor Owino Ocholla","0741***419",150,1,16,"2026-06-26","2026-06-26"],
 ["Victoria Kithome","0717108220",150,1,13,"2026-06-29","2026-06-29"]
 ];
-const SEED_MONTHLY={labels:["2025-06","2025-07","2025-08","2025-09","2025-10","2025-11","2025-12","2026-01","2026-02","2026-03","2026-04","2026-06","2026-07"],
-revenue:[25078,132586,137556,87180,131420,214625,151514,104355,78572,72440,40045,90040,23315]};
+const SEED_MONTHLY={labels:["2025-06","2025-07","2025-08","2025-09","2025-10","2025-11","2025-12","2026-01","2026-02","2026-03","2026-04","2026-05","2026-06","2026-07","2026-08","2026-09"],
+revenue:[25078,132586,137556,87180,131420,214625,151514,104355,78572,72440,40045,65043,90040,23315,0,0]};
 const REPORT={totalCustomers:1669,totalRevenue:1250341,totalTxns:5519,masked:623,valid:1041};
 
 /* ══════════ STATE ══════════ */
@@ -5068,15 +5068,17 @@ function legacyReceiptKeys(tx) {
   const rc = full.slice(0, 10);
   if (rc.length === full.length) return [];
   const d = stripTime(tx.date) || tx.date || "";
+  // Only time-bearing legacy — time-less caused false collisions for
+  // different 11-char receipts sharing same first 10 on same date.
   return [
-    ["receipt", rc, d, tx.time || ""].join("|"),
-    ["receipt", rc, d, ""].join("|")
+    ["receipt", rc, d, tx.time || ""].join("|")
   ];
 }
 function markSeen(tx) {
   DB.seen[transactionKey(tx)] = 1;
   const k2 = txKeyNoTime(tx);
   if (k2) DB.seen[k2] = 1;
+  try { legacyReceiptKeys(tx).forEach(k=>{DB.seen[k]=1;}); } catch(_){}
 }
 
 /* ══════════ NEW-CUSTOMER FLAG (isNew) ══════════

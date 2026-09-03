@@ -879,7 +879,7 @@ let isSyncing = false;
 let lastSyncTime = null;
 let lastCloudError = '';
 
-// ── CHUNKED SYNC (client-only) ──
+// ── CHUNKED SYNC ──
 // A big statement day pushes ~2.5 MB / ~23k rows in ONE request, which weak
 // mobile signal regularly aborts mid-write — and because the backend clears
 // each sheet before writing, an aborted save left the sheet truncated (that
@@ -888,21 +888,32 @@ let lastCloudError = '';
 // the whole database, and the backend only swaps the live sheets in once
 // every promised row has landed.
 //
-// The Apps Script in this repo is deliberately NOT changed: the deployed
-// backend may or may not understand those actions. The first large save of a
-// session probes with saveBegin; a backend that answers "unknown action" (the
-// saveAll-only script) is remembered and every save then uses the single
-// saveAll POST that has always worked. That is the fix for the PR #37
-// breakage — syncing never hard-requires a Code.gs redeploy, and a chunked
+// Backend v3.0 (2026-09-03) speaks the chunked actions and answers saveBegin
+// with an uploadId that every chunk/commit echoes back, so two devices can't
+// interleave slices into one staging area. Deployments still running the
+// saveAll-only script answer "unknown action": that is remembered for the
+// session and every save then uses the single saveAll POST that has always
+// worked — syncing never hard-requires a Code.gs redeploy, and a chunked
 // backend deployed later is picked up automatically on the next session.
 const CHUNK_ROWS = 2000; // rows per chunked upload request
 let cloudChunks = false;      // true once the backend proves it speaks the chunked actions
 let cloudChunkProbed = false; // one probe per session is enough
 try { cloudChunks = localStorage.getItem('spaxCloudChunked') === '1'; } catch (_) {}
 
-async function cloudRequest(url, options = {}) {
+// Per-request timeouts. 30s is plenty for a probe, a commit or a small save,
+// but a one-shot saveAll of the whole database (weak signal + Apps Script
+// rewriting six sheets) regularly needs minutes — aborting it at 30s is what
+// made cloud sync "fail all the time" on big import days. Chunks carry
+// ~CHUNK_ROWS rows each, so they get a comfortable margin; the load that
+// ships the whole database back down gets 90s.
+const CLOUD_TIMEOUT_DEFAULT = 30000;   // probes, commits, small saveAll
+const CLOUD_TIMEOUT_CHUNK = 60000;     // saveBegin + saveChunk (~250 KB each)
+const CLOUD_TIMEOUT_LOAD = 90000;      // action=load (whole DB down)
+const CLOUD_TIMEOUT_BIG_SAVE = 180000; // one-shot saveAll fallback (whole DB up)
+
+async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
     const text = await response.text();
@@ -915,6 +926,13 @@ async function cloudRequest(url, options = {}) {
       throw new Error(detail);
     }
     return data;
+  } catch (err) {
+    // A raw AbortError tells the user nothing. Name it for what it is — the
+    // request outlived its timeout — and say where their data is.
+    if (err && err.name === 'AbortError') {
+      throw new Error('Cloud connection timed out after ' + Math.round(timeoutMs / 1000) + 's (large upload or weak signal). Your data is safe locally and will sync on the next save.');
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -922,7 +940,7 @@ async function cloudRequest(url, options = {}) {
 
 async function cloudLoad() {
   if (!GAS_URL || GAS_URL.includes('YOUR_SCRIPT')) throw new Error('Cloud URL is not configured. Paste your Apps Script /exec URL into GAS_URL.');
-  return cloudRequest(GAS_URL + (GAS_URL.includes('?') ? '&' : '?') + 'action=load');
+  return cloudRequest(GAS_URL + (GAS_URL.includes('?') ? '&' : '?') + 'action=load', {}, CLOUD_TIMEOUT_LOAD);
 }
 
 // A formatted but empty Sheet can produce object rows with blank values. Those
@@ -1098,10 +1116,29 @@ async function loadFromCloud() {
   }
 }
 
-async function saveToCloud(force = false) {
-  if (SYNC_MODE === 'local') return;
-  if (isSyncing && !force) return;
+// Saves are serialized. Apps Script funnels writers through a script lock, so
+// two overlapping POSTs make the second one burn its whole timeout in
+// waitLock and fail — a big self-inflicted source of "cloud sync failed".
+// Forced saves queue behind the in-flight one; unforced saves are dropped
+// while one is running or queued, because the queued save builds its payload
+// from the live DB when it actually runs, so it carries the latest data.
+let cloudSaveChain = Promise.resolve(false);
+let cloudSaveQueued = false;
 
+function saveToCloud(force = false) {
+  if (SYNC_MODE === 'local') return Promise.resolve(false);
+  if (!force && (isSyncing || cloudSaveQueued)) return Promise.resolve(false);
+  cloudSaveQueued = true;
+  const run = cloudSaveChain.catch(() => {}).then(() => {
+    cloudSaveQueued = false;
+    if (SYNC_MODE === 'local') return false;
+    return performSaveToCloud();
+  });
+  cloudSaveChain = run.catch(() => false);
+  return run;
+}
+
+async function performSaveToCloud() {
   isSyncing = true;
   showSyncStatus('⏳ Saving to cloud...');
 
@@ -1129,12 +1166,12 @@ async function saveToCloud(force = false) {
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
 
-    const post = (obj) => cloudRequest(GAS_URL, {
+    const post = (obj, timeoutMs) => cloudRequest(GAS_URL, {
       method: 'POST',
       // text/plain keeps this a CORS-simple request for Apps Script web apps.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(obj)
-    });
+    }, timeoutMs);
 
     // Flatten the two nested tables exactly as the backend does, so the row
     // counts promised to saveCommit match what it stages.
@@ -1173,13 +1210,27 @@ async function saveToCloud(force = false) {
           try { localStorage.setItem('spaxCloudChunked', '0'); } catch (_) {}
           console.warn('Cloud backend has no chunked actions — saving in one request.');
           // fall through to the one-shot saveAll below
+        } else if (err && err.probeFailed) {
+          // The probe failed for a transient reason (network drop, timeout)
+          // — NOT proof that the backend lacks the actions. Don't poison the
+          // capability cache; try the saveAll this once.
+          console.warn('Chunked probe failed (' + (err && err.message) + ') — falling back to a single saveAll.');
+          // fall through to the one-shot saveAll below
         } else {
+          // Slices already started landing — never replay the whole database
+          // as one request. Fail the save; the next save() retries cleanly.
           throw err;
         }
       }
     }
 
-    const result = await post({ action: 'saveAll', ...payload });
+    // One-shot fallback. A payload this size needs minutes on a weak link —
+    // give it CLOUD_TIMEOUT_BIG_SAVE, not the default 30s that aborted
+    // (and kept aborting, server-side write still running) every big day.
+    const result = await post(
+      { action: 'saveAll', ...payload },
+      totalBigRows > CHUNK_ROWS ? CLOUD_TIMEOUT_BIG_SAVE : CLOUD_TIMEOUT_DEFAULT
+    );
     if (result.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
@@ -1205,17 +1256,32 @@ async function saveToCloud(force = false) {
 //              costs a retry — never a truncated sheet.
 async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
   showSyncStatus('⏳ Saving to cloud… (large upload, sending in parts)');
-  const begin = await post({
-    action: 'saveBegin',
-    customers: payload.customers,
-    monthly: payload.monthly,
-    settings: payload.settings
-  });
+  let begin;
+  try {
+    begin = await post({
+      action: 'saveBegin',
+      customers: payload.customers,
+      monthly: payload.monthly,
+      settings: payload.settings
+    }, CLOUD_TIMEOUT_CHUNK);
+  } catch (err) {
+    // Distinguish the probe from the upload itself: a probe that fails for a
+    // transient reason (network drop, timeout) may fall back to saveAll, but
+    // a failure AFTER slices started landing must fail the save — replaying
+    // the whole database as one request is exactly the doomed path chunking
+    // exists to avoid.
+    if (err) err.probeFailed = true;
+    throw err;
+  }
   // cloudRequest throws unless success === true, so reaching here means
   // saveBegin was understood — the backend speaks the chunked protocol.
   cloudChunks = true;
   cloudChunkProbed = true;
   try { localStorage.setItem('spaxCloudChunked', '1'); } catch (_) {}
+  // Backend v3.0 mints an uploadId per upload session so a second device's
+  // save can't interleave slices with ours. Older backends return none —
+  // echo '' and they ignore the field.
+  const uploadId = begin && begin.uploadId ? String(begin.uploadId) : '';
 
   const expect = {};
   let sent = 0;
@@ -1224,7 +1290,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
     expect[table] = rows.length;
     for (let i = 0; i < rows.length; i += CHUNK_ROWS) {
       const slice = rows.slice(i, i + CHUNK_ROWS);
-      const res = await post({ action: 'saveChunk', table, rows: slice });
+      const res = await post({ action: 'saveChunk', table, rows: slice, uploadId }, CLOUD_TIMEOUT_CHUNK);
       if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
       sent += slice.length;
       showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%');
@@ -1233,7 +1299,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
 
   // The backend verifies the staged row counts before it swaps anything in,
   // so a lost chunk aborts the commit and leaves the good data in place.
-  const commit = await post({ action: 'saveCommit', expect });
+  const commit = await post({ action: 'saveCommit', expect, uploadId });
   if (commit.success) {
     lastSyncTime = new Date();
     showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
@@ -7256,7 +7322,7 @@ function updateSyncDetails(){
   const el = $('syncDetails');
   if(!el) return;
   const lastSync = lastSyncTime ? lastSyncTime.toLocaleString() : 'Never';
-  const mode = SYNC_MODE === 'auto' ? 'Auto (every 30s)' : 'Manual';
+  const mode = SYNC_MODE === 'auto' ? 'Auto (on every change)' : SYNC_MODE === 'manual' ? 'Manual' : 'Local only';
   el.innerHTML = `
     <b>Sync Mode:</b> ${mode}<br>
     <b>Last Sync:</b> ${lastSync}<br>

@@ -1,5 +1,5 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v2.5  (2026-08-18)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.0  (2026-09-03)
  * ─────────────────────────────────────────────────────────────────
  * MOBILE: can't edit script.google.com on your phone? Open
  *   https://savluz-code.github.io/SpaxButchery-Analytics/code.html
@@ -10,11 +10,18 @@
  *
  * Sheets used (created automatically):
  *   Customers, Monthly, Settings, Transactions, CustomerTx, Seen
+ *   (+ a *_Staging twin per sheet — see CHUNKED SAVE below)
  *
  * Deploy: Deploy → New deployment → Web app
  *   Execute as: Me
  *   Who has access: Anyone
  * Paste the /exec URL into index.html as GAS_URL.
+ *
+ * ALREADY DEPLOYED? Re-deploy this version (Deploy → Manage deployments →
+ * ✏️ edit → Version: New version → Deploy). v3.0 completes the chunked save
+ * protocol the client has spoken since PR #41: large saves stop dying at the
+ * client's one-shot timeout and no aborted save can truncate a live sheet
+ * anymore. Clients that only know saveAll keep working unchanged.
  *
  * Vision OCR proxy (kimiVision action) works with any provider.
  *   FREE option: set GEMINI_API_KEY below (aistudio.google.com/apikey — no card
@@ -37,6 +44,49 @@ var SHEETS = {
   seen: 'Seen'
 };
 
+/* Column order for every sheet. loadAll_/saveAll_ and the chunked staging
+   writers all use this one map so the round-trip can never drift. */
+var TABLE_HEADERS = {
+  customers: [
+    'name', 'contact', 'spent', 'visits', 'days',
+    'firstVisit', 'lastVisit', 'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits',
+    // newBatch = the import batch that first created this customer. isNew is
+    // an internal bookkeeping flag derived from it (newBatch ===
+    // settings.importBatch) — it must survive the cloud round-trip because
+    // revenue reconciliation depends on it, but it is never shown in the UI
+    // (the public NEW 🌱 badge comes from firstVisit's month instead).
+    'newBatch'
+  ],
+  monthly: ['label', 'revenue'],
+  settings: ['key', 'value'],
+  transactions: ['date', 'time', 'amount', 'name', 'phone', 'product', 'receipt', 'source', 'importedAt', 'backfillOnly'],
+  customerTx: ['customer', 'date', 'amount', 'product', 'receipt', 'importedAt'],
+  seen: ['key', 'value']
+};
+
+/* ══════════ CHUNKED SAVE PROTOCOL (v3.0) ══════════
+   The client has sliced large saves into saveBegin → saveChunk×N → saveCommit
+   since PR #41, but this script only understood saveAll — so a big import day
+   (~2.5 MB / ~23k rows) still went up as ONE request that weak mobile signal
+   regularly aborted, and writeObjects_'s clear-then-write could leave a live
+   sheet truncated ("a day's imports vanished"). These actions complete the
+   protocol:
+
+     saveBegin  → stage the small tables, reset the big staging sheets, mint
+                  an uploadId for this upload session
+     saveChunk  → append one slice of a big table to its staging sheet
+     saveCommit → verify every promised row landed, THEN swap every live sheet
+                  for its staging copy (renames — no second data copy)
+
+   Live sheets are only ever replaced after the staged row counts verify, so a
+   dropped connection costs a retry — never a truncated sheet. saveAll now
+   stages and swaps too, so even one-shot saves are atomic for readers. */
+
+var STAGE_SUFFIX = '_Staging';
+var SWAP_TMP_SUFFIX = '_SwapTmp';
+var UPLOAD_KEY = 'spaxUploadSession';
+var BIG_TABLES = { transactions: 1, customerTx: 1, seen: 1 };
+
 function doGet(e) {
   var action = (e && e.parameter && e.parameter.action) || 'load';
   try {
@@ -58,6 +108,18 @@ function doPost(e) {
     if (action === 'saveAll') {
       saveAll_(body);
       return json_({ success: true });
+    }
+
+    if (action === 'saveBegin') {
+      return json_(saveBegin_(body));
+    }
+
+    if (action === 'saveChunk') {
+      return json_(saveChunk_(body));
+    }
+
+    if (action === 'saveCommit') {
+      return json_(saveCommit_(body));
     }
 
     if (action === 'kimiVision') {
@@ -145,44 +207,145 @@ function loadAll_() {
 
 /* ══════════ SAVE ══════════ */
 
+// One-shot save. Now stages every table first and swaps the live sheets in
+// only after all writes succeed — an aborted or timed-out execution leaves
+// the live database at its previous, complete state instead of truncating it.
 function saveAll_(body) {
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    ensureSheets_();
-    var ss = getSpreadsheet_();
+    prepareStaging_();
+    stageSmallTables_(body);
+    stageBigTable_('transactions', body.transactions || []);
+    stageBigTable_('customerTx', flattenCustomerTx_(body.customerTx || {}));
+    stageBigTable_('seen', flattenSeen_(body.seen || {}));
+    swapAllSheets_();
+  } finally {
+    lock.releaseLock();
+  }
+}
 
-  writeObjects_(ss.getSheetByName(SHEETS.customers), (body.customers || []).filter(function (c) {
+/* ── chunked actions ── */
+
+function saveBegin_(body) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    prepareStaging_();
+    stageSmallTables_(body);
+    // Big staging sheets are reset to header-only and filled by saveChunk.
+    Object.keys(BIG_TABLES).forEach(function (table) {
+      writeObjects_(stagingSheet_(SHEETS[table]), [], TABLE_HEADERS[table]);
+    });
+    var uploadId = Utilities.getUuid();
+    try {
+      CacheService.getScriptCache().put(UPLOAD_KEY, uploadId, 3600);
+    } catch (cacheErr) { /* best-effort session guard only */ }
+    return { success: true, uploadId: uploadId };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function saveChunk_(body) {
+  var table = String(body.table || '');
+  if (!BIG_TABLES[table]) {
+    return { success: false, error: 'unknown table: ' + table };
+  }
+  if (!uploadSessionValid_(body.uploadId)) {
+    return { success: false, error: 'upload superseded by a newer save — please retry the whole save' };
+  }
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var sheet = stagingSheet_(SHEETS[table]);
+    if (!sheet) {
+      return { success: false, error: 'no upload in progress — saveBegin must run before saveChunk' };
+    }
+    var rows = body.rows || [];
+    if (!rows.length) return { success: true, written: 0 };
+    appendObjects_(sheet, rows, TABLE_HEADERS[table]);
+    return { success: true, written: rows.length };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function saveCommit_(body) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    // 1) Verify every promised row landed BEFORE touching any live sheet.
+    var expect = body.expect || {};
+    var tables = Object.keys(BIG_TABLES);
+    for (var i = 0; i < tables.length; i++) {
+      var table = tables[i];
+      var want = Number(expect[table] || 0);
+      var staged = stagedRowCount_(table);
+      if (staged !== want) {
+        return {
+          success: false,
+          error: 'chunk mismatch on ' + table + ': staged ' + staged + ' rows, expected ' + want +
+                 ' — live data left untouched, please retry the save'
+        };
+      }
+    }
+    // 2) Counts are exact — swap every live sheet for its staging copy.
+    swapAllSheets_();
+    try { CacheService.getScriptCache().remove(UPLOAD_KEY); } catch (cacheErr) {}
+    return { success: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ── staging helpers ── */
+
+// Creates any missing staging sheets and, if a previous swap was interrupted
+// half-renamed, folds the leftovers back in (see ensureSheets_ for the live
+// side of that recovery).
+function prepareStaging_() {
+  ensureSheets_();
+  var ss = getSpreadsheet_();
+  Object.keys(SHEETS).forEach(function (k) {
+    var stageName = SHEETS[k] + STAGE_SUFFIX;
+    if (ss.getSheetByName(stageName)) return;
+    // A commit that died after live→SwapTmp but before SwapTmp→Staging left
+    // the old live data under the tmp name — that is a perfectly good staging
+    // sheet (it gets cleared before use anyway).
+    var tmp = ss.getSheetByName(SHEETS[k] + SWAP_TMP_SUFFIX);
+    if (tmp) {
+      tmp.setName(stageName);
+    } else {
+      ss.insertSheet(stageName);
+    }
+  });
+}
+
+function stagingSheet_(liveName) {
+  return getSpreadsheet_().getSheetByName(liveName + STAGE_SUFFIX);
+}
+
+function stageSmallTables_(body) {
+  writeObjects_(stagingSheet_(SHEETS.customers), (body.customers || []).filter(function (c) {
     return c && String(c.name || '').trim() !== '';
-  }), [
-    'name', 'contact', 'spent', 'visits', 'days',
-    'firstVisit', 'lastVisit', 'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits',
-    // newBatch = the import batch that first created this customer. isNew is
-    // an internal bookkeeping flag derived from it (newBatch ===
-    // settings.importBatch) — it must survive the cloud round-trip because
-    // revenue reconciliation depends on it, but it is never shown in the UI
-    // (the public NEW 🌱 badge comes from firstVisit's month instead).
-    'newBatch'
-  ]);
+  }), TABLE_HEADERS.customers);
 
   var monthly = body.monthly || { labels: [], revenue: [] };
   var monthRows = (monthly.labels || []).map(function (label, i) {
     return { label: label, revenue: monthly.revenue[i] };
   });
-  writeObjects_(ss.getSheetByName(SHEETS.monthly), monthRows, ['label', 'revenue']);
+  writeObjects_(stagingSheet_(SHEETS.monthly), monthRows, TABLE_HEADERS.monthly);
 
   var settings = body.settings || {};
   var settingRows = Object.keys(settings).map(function (k) {
     return { key: k, value: settings[k] };
   });
-  writeObjects_(ss.getSheetByName(SHEETS.settings), settingRows, ['key', 'value']);
+  writeObjects_(stagingSheet_(SHEETS.settings), settingRows, TABLE_HEADERS.settings);
+}
 
-  writeObjects_(ss.getSheetByName(SHEETS.transactions), body.transactions || [], [
-    'date', 'time', 'amount', 'name', 'phone', 'product', 'receipt', 'source', 'importedAt', 'backfillOnly'
-  ]);
-
+function flattenCustomerTx_(customerTx) {
   var txRows = [];
-  var customerTx = body.customerTx || {};
   Object.keys(customerTx).forEach(function (name) {
     (customerTx[name] || []).forEach(function (t) {
       txRows.push({
@@ -195,18 +358,75 @@ function saveAll_(body) {
       });
     });
   });
-  writeObjects_(ss.getSheetByName(SHEETS.customerTx), txRows, [
-    'customer', 'date', 'amount', 'product', 'receipt', 'importedAt'
-  ]);
+  return txRows;
+}
 
-  var seen = body.seen || {};
-  var seenRows = Object.keys(seen).map(function (k) {
+function flattenSeen_(seen) {
+  return Object.keys(seen).map(function (k) {
     return { key: k, value: 1 };
   });
-  writeObjects_(ss.getSheetByName(SHEETS.seen), seenRows, ['key', 'value']);
-  } finally {
-    lock.releaseLock();
-  }
+}
+
+// Full-table staging write (saveAll path — one writeObjects_ per table).
+function stageBigTable_(table, rows) {
+  writeObjects_(stagingSheet_(SHEETS[table]), rows, TABLE_HEADERS[table]);
+}
+
+// Data rows currently staged for a big table (header row excluded).
+function stagedRowCount_(table) {
+  var sheet = stagingSheet_(SHEETS[table]);
+  if (!sheet) return -1;
+  return Math.max(0, sheet.getLastRow() - 1);
+}
+
+// Atomically-ish replace every live sheet with its staging copy. Renames are
+// metadata-only, so no data is copied twice; the window where a table has no
+// live-named sheet is a few milliseconds, and ensureSheets_ recovers it if an
+// execution dies inside that window.
+function swapAllSheets_() {
+  var ss = getSpreadsheet_();
+  Object.keys(SHEETS).forEach(function (k) {
+    var liveName = SHEETS[k];
+    var staging = ss.getSheetByName(liveName + STAGE_SUFFIX);
+    if (!staging) throw new Error('missing staging sheet for ' + liveName);
+    var live = ss.getSheetByName(liveName);
+    var tmpName = liveName + SWAP_TMP_SUFFIX;
+    if (live) live.setName(tmpName);
+    staging.setName(liveName);
+    var tmp = ss.getSheetByName(tmpName);
+    if (tmp) {
+      tmp.setName(liveName + STAGE_SUFFIX);
+      tmp.clearContents();
+    }
+  });
+}
+
+// A chunk belongs to the newest saveBegin. Legacy clients that never saw the
+// uploadId response send none — accept those (the commit count check is the
+// real safety net); reject only chunks that provably belong to an older
+// upload than the one currently staged.
+function uploadSessionValid_(uploadId) {
+  if (!uploadId) return true;
+  var current = null;
+  try { current = CacheService.getScriptCache().get(UPLOAD_KEY); } catch (cacheErr) { return true; }
+  if (!current) return true; // evicted/expired cache — cannot prove supersession
+  return String(current) === String(uploadId);
+}
+
+// Appends rows below whatever is already staged (same value coercion as
+// writeObjects_ so a staged sheet is byte-identical to a saveAll write).
+function appendObjects_(sheet, rows, headers) {
+  if (!rows.length) return;
+  var data = rows.map(function (r) {
+    return headers.map(function (h) {
+      var v = r[h];
+      if (v === undefined || v === null) return '';
+      if (typeof v === 'boolean') return v ? 'true' : 'false';
+      return v;
+    });
+  });
+  var at = sheet.getLastRow() + 1;
+  sheet.getRange(at, 1, data.length, headers.length).setValues(data);
 }
 
 /* ══════════ KIMI VISION PROXY ══════════ */
@@ -320,7 +540,22 @@ function getSpreadsheet_() {
 function ensureSheets_() {
   var ss = getSpreadsheet_();
   Object.keys(SHEETS).forEach(function (k) {
-    if (!ss.getSheetByName(SHEETS[k])) ss.insertSheet(SHEETS[k]);
+    if (ss.getSheetByName(SHEETS[k])) return;
+    // A commit that died mid-swap can leave the live sheet under a temp name.
+    // The staging copy holds the newest count-verified data, so promote it;
+    // SwapTmp is the previous live sheet — better than an empty insert, but
+    // only if no staging copy exists.
+    var staging = ss.getSheetByName(SHEETS[k] + STAGE_SUFFIX);
+    if (staging) {
+      staging.setName(SHEETS[k]);
+      return;
+    }
+    var tmp = ss.getSheetByName(SHEETS[k] + SWAP_TMP_SUFFIX);
+    if (tmp) {
+      tmp.setName(SHEETS[k]);
+      return;
+    }
+    ss.insertSheet(SHEETS[k]);
   });
 }
 

@@ -3,20 +3,30 @@
  *
  * Chunked sync (PR #37) was reverted in PR #40 because it hard-required a
  * Code.gs redeploy: on deployments still running the saveAll-only script every
- * large save died with "unknown action". It is back as a CLIENT-ONLY feature:
+ * large save died with "unknown action". It came back in PR #41 as a
+ * CLIENT-ONLY feature, which stopped the hard failures but left large saves as
+ * one giant POST that the 30 s client timeout regularly aborted on weak
+ * mobile signal — the chronic "cloud sync failed".
+ *
+ * Backend v3.0 (2026-09-03) completes the protocol:
  *
  *   • Large saves go up in slices (saveBegin → saveChunk×N → saveCommit) so no
  *     single request has to carry the whole ~2.5 MB database, and the backend
- *     only swaps the live sheets in once every promised row has landed.
- *   • The backend script (google-apps-script.gs) is deliberately UNCHANGED.
- *     The client probes with saveBegin; when the backend answers
- *     "unknown action" it remembers that for the session and falls back to the
- *     single saveAll POST that has always worked — existing deployments keep
- *     syncing and no redeploy is ever required.
+ *     stages every table and only swaps the live sheets in once every promised
+ *     row has landed.
+ *   • saveBegin answers with an uploadId that every chunk/commit echoes, so
+ *     two devices can't interleave slices into one staging area.
+ *   • saveAll stages + swaps too, so even one-shot saves are atomic: a load
+ *     can never again land on a half-written (truncated) sheet.
+ *   • The client still probes first: a backend that answers "unknown action"
+ *     (a pre-v3.0 deployment) is remembered for the session and every save
+ *     falls back to the single saveAll POST — no redeploy is ever REQUIRED.
+ *   • Timeouts are payload-aware now (30 s probes/commits, 60 s chunks,
+ *     90 s load, 180 s one-shot big save) instead of a blanket 30 s.
+ *   • Saves are serialized client-side so two POSTs never fight over the
+ *     backend script lock.
  *
- * These tests pin both halves: the chunked request sequence against a
- * chunk-capable backend, and the automatic fallback against the saveAll-only
- * backend this repo still ships.
+ * Backend behaviour itself is pinned in tests/gas-backend.test.js.
  */
 const test = require('node:test');
 const assert = require('node:assert');
@@ -39,27 +49,36 @@ function syncLayerSource() {
 }
 
 /**
- * Fake Apps Script web app. `chunked: false` behaves exactly like the
- * saveAll-only script this repo ships (doPost answers { success: false,
- * error: 'unknown action' } for the chunked actions); `chunked: true`
- * behaves like the chunk-capable script: saveChunk stages rows, and
- * saveCommit verifies the staged row counts before swapping anything in —
- * a short count aborts the commit and leaves live data untouched.
+ * Fake Apps Script web app. `chunked: false` behaves exactly like a
+ * pre-v3.0 saveAll-only script (doPost answers { success: false, error:
+ * 'unknown action' } for the chunked actions); `chunked: true` behaves like
+ * the v3.0 script: saveBegin stages the small tables and mints an uploadId,
+ * saveChunk stages rows, and saveCommit verifies the staged row counts
+ * before swapping anything in — a short count aborts the commit and leaves
+ * live data untouched.
+ * `uploadIds: false` downgrades to a chunk-capable backend that predates the
+ * uploadId session guard (it never returns one — the client must cope).
  * `failChunk` makes the Nth saveChunk fail; `dropChunk` makes the Nth
  * saveChunk "succeed" while losing its rows (a lost slice).
+ * `failBeginTimes: N` makes the first N saveBegin probes die with an HTTP
+ * error — a transient failure that must fall back to saveAll without
+ * poisoning the capability cache.
  */
-function makeCloud({ chunked = true, failChunk = 0, dropChunk = 0 } = {}) {
+function makeCloud({ chunked = true, uploadIds = true, failChunk = 0, dropChunk = 0, failBeginTimes = 0 } = {}) {
   const calls = [];
   const staged = { transactions: [], customerTx: [], seen: [] };
   const store = {};
   let chunkNo = 0;
+  let beginNo = 0;
   const respond = (body) => ({ ok: true, text: async () => JSON.stringify(body) });
   const fetchImpl = async (url, options) => {
     const body = options && options.body ? JSON.parse(options.body) : {};
     calls.push(body);
     if (body.action === 'saveBegin') {
       if (!chunked) return respond({ success: false, error: 'unknown action' });
-      return respond({ success: true });
+      beginNo += 1;
+      if (beginNo <= failBeginTimes) return { ok: false, status: 500, text: async () => 'Internal Error' };
+      return respond({ success: true, ...(uploadIds ? { uploadId: 'upload-123' } : {}) });
     }
     if (body.action === 'saveChunk') {
       chunkNo += 1;
@@ -68,6 +87,9 @@ function makeCloud({ chunked = true, failChunk = 0, dropChunk = 0 } = {}) {
       return respond({ success: true, written: dropChunk === chunkNo ? 0 : body.rows.length });
     }
     if (body.action === 'saveCommit') {
+      if (uploadIds && body.uploadId !== 'upload-123') {
+        return respond({ success: false, error: 'upload superseded by a newer save — please retry the whole save' });
+      }
       for (const t of ['transactions', 'customerTx', 'seen']) {
         const want = Number((body.expect || {})[t] || 0);
         if (staged[t].length !== want) {
@@ -91,9 +113,8 @@ function makeCloud({ chunked = true, failChunk = 0, dropChunk = 0 } = {}) {
   return { calls, staged, store, localStorage, fetchImpl };
 }
 
-async function runClient(cloud, db, { saveTwice = false } = {}) {
-  const status = [];
-  const sandbox = {
+function makeSandbox(cloud, db, status) {
+  return {
     fetch: cloud.fetchImpl,
     localStorage: cloud.localStorage,
     AbortController,
@@ -104,7 +125,11 @@ async function runClient(cloud, db, { saveTwice = false } = {}) {
     isMerchant: () => false,
     DB: db
   };
-  const ctx = vm.createContext(sandbox);
+}
+
+async function runClient(cloud, db, { saveTwice = false } = {}) {
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
   vm.runInContext(syncLayerSource(), ctx);
   const first = await ctx.saveToCloud(true);
   const second = saveTwice ? await ctx.saveToCloud(true) : undefined;
@@ -187,6 +212,7 @@ test('a chunk that fails mid-upload surfaces the error and never commits', async
   const actions = cloud.calls.map((c) => c.action);
   assert.ok(actions.includes('saveChunk'));
   assert.ok(!actions.includes('saveCommit'), 'a failed chunk must never be committed');
+  assert.ok(!actions.includes('saveAll'), 'a mid-upload failure must NOT replay the whole database as one request');
   assert.match(lastCloudError, /chunk write failed/);
 });
 
@@ -258,21 +284,108 @@ test('small saves stay a single saveAll request on every backend', async () => {
 
 /* ── source-level pins ───────────────────────────────────────────────────── */
 
-test('the backend script stays untouched — saveAll only, no chunked staging actions', () => {
-  assert.match(GAS, /action === 'saveAll'/);
-  assert.doesNotMatch(GAS, /saveBegin_/);
-  assert.doesNotMatch(GAS, /saveChunk_/);
-  assert.doesNotMatch(GAS, /saveCommit_/);
+/* ── upload session guard + probe resilience (backend v3.0 era) ──────────── */
+
+test('the uploadId from saveBegin is echoed on every chunk and the commit', async () => {
+  const cloud = makeCloud({ chunked: true, uploadIds: true });
+  const { first } = await runClient(cloud, bigDB());
+
+  assert.strictEqual(first, true);
+  cloud.calls
+    .filter((c) => c.action === 'saveChunk' || c.action === 'saveCommit')
+    .forEach((c) => assert.strictEqual(c.uploadId, 'upload-123', c.action + ' must echo the uploadId'));
 });
 
-test('client keeps the 30 s timeout and wires the chunked actions + fallback', () => {
-  assert.match(HTML, /controller\.abort\(\), 30000/, 'cloudRequest should time out at 30s');
+test('a chunk-capable backend that predates uploadIds still syncs (uploadId: "")', async () => {
+  const cloud = makeCloud({ chunked: true, uploadIds: false });
+  const { first } = await runClient(cloud, bigDB());
+
+  assert.strictEqual(first, true);
+  const actions = cloud.calls.map((c) => c.action);
+  assert.strictEqual(actions[0], 'saveBegin');
+  assert.strictEqual(actions[actions.length - 1], 'saveCommit');
+});
+
+test('a transient probe failure falls back to one saveAll without poisoning the capability cache', async () => {
+  const cloud = makeCloud({ chunked: true, failBeginTimes: 1 });
+  const { first, second } = await runClient(cloud, bigDB(), { saveTwice: true });
+
+  // First save: the probe died with HTTP 500 (NOT "unknown action"), so the
+  // client must not conclude the backend is saveAll-only — it saves via the
+  // one-shot path this once and leaves the cache alone.
+  assert.strictEqual(first, true);
+  assert.deepStrictEqual(
+    cloud.calls.map((c) => c.action).slice(0, 2),
+    ['saveBegin', 'saveAll']
+  );
+  assert.notStrictEqual(cloud.store.spaxCloudChunked, '0', 'transient probe failure must not be cached as one-shot');
+
+  // Second save in the same session: still unprobed, so it tries chunked
+  // again — and this time the backend answers, so it goes up in slices.
+  const actions = cloud.calls.map((c) => c.action);
+  assert.ok(actions.includes('saveChunk'), 'second save should retry the chunked protocol');
+  assert.strictEqual(actions[actions.length - 1], 'saveCommit');
+  assert.strictEqual(second, true);
+});
+
+test('forced saves queue behind each other — never two requests in flight', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 10); // small save → single saveAll each
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const inner = cloud.fetchImpl;
+  cloud.fetchImpl = async (url, options) => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    try {
+      await new Promise((r) => setTimeout(r, 15));
+      return await inner(url, options);
+    } finally {
+      inFlight -= 1;
+    }
+  };
+  ctx.fetch = cloud.fetchImpl;
+
+  vm.runInContext(syncLayerSource(), ctx);
+  const [a, b] = await Promise.all([ctx.saveToCloud(true), ctx.saveToCloud(true)]);
+
+  assert.strictEqual(a, true);
+  assert.strictEqual(b, true);
+  assert.strictEqual(maxInFlight, 1, 'saves must be serialized — overlapping POSTs fight over the backend script lock');
+  assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveAll').length, 2);
+});
+
+/* ── source-level pins ───────────────────────────────────────────────────── */
+
+test('backend v3.0 ships the chunked staging actions alongside saveAll', () => {
+  assert.match(GAS, /action === 'saveAll'/);
+  assert.match(GAS, /action === 'saveBegin'/);
+  assert.match(GAS, /action === 'saveChunk'/);
+  assert.match(GAS, /action === 'saveCommit'/);
+  // The commit verifies staged counts BEFORE swapping any live sheet.
+  assert.match(GAS, /chunk mismatch on /);
+  assert.match(GAS, /live data left untouched/);
+  // An upload session id guards against interleaved uploads.
+  assert.match(GAS, /uploadId/);
+});
+
+test('client keeps payload-aware timeouts and wires the chunked actions + fallback', () => {
+  assert.match(HTML, /controller\.abort\(\), timeoutMs/, 'cloudRequest timeout must be parameterized');
+  assert.match(HTML, /CLOUD_TIMEOUT_DEFAULT = 30000/);
+  assert.match(HTML, /CLOUD_TIMEOUT_CHUNK = 60000/);
+  assert.match(HTML, /CLOUD_TIMEOUT_LOAD = 90000/);
+  assert.match(HTML, /CLOUD_TIMEOUT_BIG_SAVE = 180000/);
   assert.match(HTML, /const CHUNK_ROWS = 2000/);
   assert.match(HTML, /action: 'saveBegin'/);
   assert.match(HTML, /action: 'saveChunk'/);
   assert.match(HTML, /action: 'saveCommit'/);
   assert.match(HTML, /isUnknownActionError/, 'the unknown-action fallback must stay wired');
   assert.match(HTML, /spaxCloudChunked/, 'backend capability must be cached');
+  assert.match(HTML, /uploadId/, 'the upload session id must be echoed');
 });
 
 test('loadFromCloud does not force a push-back save', () => {

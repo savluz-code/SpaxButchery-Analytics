@@ -1091,6 +1091,10 @@ async function loadFromCloud() {
         DB.seen = {};
         DB.transactions.forEach(tx=>{ markSeen(tx); });
       }
+      // Transactions are now final (local ∪ cloud): drop any seen-key that has
+      // no backing transaction so re-importing a previously-lost statement
+      // re-books its rows rather than skipping them as "already imported".
+      healOrphanedSeenKeys();
       sanitizeNegativeTotals();
       lastSyncTime = new Date();
       showSyncStatus('✅ Synced ' + lastSyncTime.toLocaleTimeString());
@@ -3214,11 +3218,19 @@ function load(){
         // Cloud failed — keep local data and refresh
         refreshAll();
       }
+      // Once transactions are final (local, or local∪cloud), clear any seen-key
+      // that no longer has a backing transaction so a re-import of a statement
+      // whose rows were previously lost can re-book them instead of skipping
+      // them as "already imported".
+      const healed = healOrphanedSeenKeys();
+      if (healed > 0) localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
       const fixed = repairDates();
       if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
       return cloudLoaded;
     }).catch(() => {
       refreshAll();
+      const healed = healOrphanedSeenKeys();
+      if (healed > 0) localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
       const fixed = repairDates();
       if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
     });
@@ -5140,11 +5152,41 @@ function legacyReceiptKeys(tx) {
     ["receipt", rc, d, tx.time || ""].join("|")
   ];
 }
-function markSeen(tx) {
-  DB.seen[transactionKey(tx)] = 1;
+// Writes a transaction's full dedup key set into the given map (transactionKey
+// + time-less variant + any legacy 10-char receipt variant). markSeen() writes
+// into DB.seen; healOrphanedSeenKeys() uses the same writer into a scratch map
+// so the two can never drift apart.
+function markSeenInto(map, tx) {
+  map[transactionKey(tx)] = 1;
   const k2 = txKeyNoTime(tx);
-  if (k2) DB.seen[k2] = 1;
-  try { legacyReceiptKeys(tx).forEach(k=>{DB.seen[k]=1;}); } catch(_){}
+  if (k2) map[k2] = 1;
+  try { legacyReceiptKeys(tx).forEach(k => { map[k] = 1; }); } catch (_) {}
+}
+function markSeen(tx) {
+  markSeenInto(DB.seen, tx);
+}
+// The dedup seen-map must always be derivable from the transactions that
+// actually exist: every booked row is marked seen at import time, and every
+// code path that removes a transaction (rollback, merchant purge) rebuilds the
+// map. The one historical exception is the pre-PR-38 wholesale-replace bug:
+// it deleted transactions (e.g. after a truncated cloud save) while later
+// union-merges kept the orphaned seen-keys sticky. Those phantom keys then
+// made a re-import of the lost statement skip its rows as "already imported",
+// so a day could sit at 11 transactions instead of 41 even though the rows were
+// long gone. This heal clears any seen-key with no backing transaction, so the
+// next re-import re-books the rows the map wrongly claimed were present.
+function healOrphanedSeenKeys() {
+  if (!DB || !Array.isArray(DB.transactions) || !DB.seen) return 0;
+  const expected = {};
+  DB.transactions.forEach(t => { try { markSeenInto(expected, t); } catch (_) {} });
+  let cleared = 0;
+  Object.keys(DB.seen).forEach(k => {
+    if (!Object.prototype.hasOwnProperty.call(expected, k)) { delete DB.seen[k]; cleared++; }
+  });
+  if (cleared > 0) {
+    console.warn('Seen-map heal: cleared ' + cleared + ' orphaned dedup key(s) with no backing transaction');
+  }
+  return cleared;
 }
 
 /* ══════════ NEW-CUSTOMER FLAG (isNew) ══════════

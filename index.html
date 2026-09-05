@@ -791,10 +791,11 @@ function doPost(e) {
     <div style="font-size:3rem;margin-bottom:8px">📥</div>
     <h3 style="margin-bottom:6px">Backfill Transaction History</h3>
     <div style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">
-      Import past M-Pesa statements <b>without touching</b> your current customer summary stats.<br><br>
+      Import past M-Pesa statements to fill in each customer's history <b>without booking new revenue</b>.<br><br>
       ✓ Adds transactions to per-customer history<br>
       ✓ Skips duplicates automatically<br>
-      ✓ Keeps spent, visits, and dates intact
+      ✓ Keeps Total Spent / Visits in tally with that history<br>
+      ✓ Overview revenue &amp; monthly totals are not changed
     </div>
     <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
       <button class="btn ghost" onclick="closeBackfillModal()">Cancel</button>
@@ -980,6 +981,10 @@ async function loadFromCloud() {
           merged.push({
             ...localCust,
             ...(useCloud ? cloudCust : {}),
+            // Baseline facts are merged field by field (fuller copy wins); the
+            // displayed spent/visits are re-derived from baseline + the
+            // unioned history by repairDates() below (CUSTOMER TALLY).
+            ...mergeBaselineFields(localCust, cloudCust),
             firstVisit: stripTime(useCloud ? (cloudCust.firstVisit || localCust.firstVisit) : (localCust.firstVisit || cloudCust.firstVisit)),
             lastVisit: stripTime(useCloud ? (cloudCust.lastVisit || localCust.lastVisit) : (localCust.lastVisit || cloudCust.lastVisit))
           });
@@ -3121,13 +3126,14 @@ function seedDB(){
         name:c[0],contact:c[1],spent:c[2],visits:c[3],days:c[4],
         firstVisit: firstVisit, lastVisit: lastVisit,
         masked:c[1].includes('***'),isNew:false,
-        // FIX: mark seed customers so imports don't double-count their
-        // lifetime aggregates (already baked into REPORT.totalRevenue and
-        // SEED_MONTHLY). seedSpent/seedVisits preserve the original baseline
-        // so reconciliation can use max(seed, imported_history).
+        // Seed customers carry their report row as an explicit BASELINE
+        // (seedSpent/seedVisits up to seedLastVisit). spent/visits are DERIVED
+        // from baseline + transaction history — see CUSTOMER TALLY.
         isSeed: true,
         seedSpent: c[2],
-        seedVisits: c[3]
+        seedVisits: c[3],
+        // The report row covers everything up to this date (CUSTOMER TALLY).
+        seedLastVisit: lastVisit
       };
     }),
     monthly:JSON.parse(JSON.stringify(SEED_MONTHLY)),
@@ -3197,6 +3203,9 @@ function load(){
         c.seedVisits = seedVisitsLookup[c.name];
         needsSave = true;
       }
+      // Every record needs an explicit baseline (seedSpent/seedVisits/
+      // seedLastVisit) before totals can be derived — stamp legacy ones once.
+      if (ensureBaselineFields(c)) needsSave = true;
     });
     DB.customers.forEach(c=>{
       // Fix firstVisit from seed data if missing/empty — but NEVER overwrite
@@ -3726,56 +3735,281 @@ function classifyProduct(dateStr, amount){
   if(!dateStr || dateStr < SOUP_START_DATE) return 'meat';
   return amount <= 50 ? 'soup' : 'meat';
 }
-function getProductStats(){
-  // backfillOnly transactions are history-only records (from statement backfill) —
-  // they must never feed revenue, visit, or customer-count aggregates. Only
-  // transactions from the main import path count here.
-  // Also exclude transactions that match seed customers, since those are already
-  // reflected in the seed baseline (c.spent/c.visits) and counting them again
-  // would double-count.
-  // Negative totals guard: revenue is made up of non-negative amounts. A corrupt
-  // negative spent/transaction amount (usually a customer-export row whose
-  // Amount/Revenue column held a withdrawal) must never pull the headline total
-  // below zero.
-  const revAmt = x => Math.max(0, Number(x) || 0);
-  const countAmt = x => Math.max(0, Number(x) || 0);
-  const seedCustomerNames = new Set(DB.customers.filter(c => c.isSeed).map(c => c.name));
-  const countable = DB.transactions.filter(t => 
-    !t.backfillOnly && !seedCustomerNames.has(t.name) && revAmt(t.amount) >= 0
-  );
-  const meatTx = countable.filter(t => t.product === 'meat');
-  const soupTx = countable.filter(t => t.product === 'soup');
-  const meatTxRev = meatTx.reduce((s,t)=>s+revAmt(t.amount),0);
-  const soupTxRev = soupTx.reduce((s,t)=>s+revAmt(t.amount),0);
-  const meatTxVisits = meatTx.length;
-  const soupTxVisits = soupTx.length;
-  const meatTxPhones = new Set(meatTx.map(t=>t.phone).filter(Boolean));
-  const soupTxPhones = new Set(soupTx.map(t=>t.phone).filter(Boolean));
-  let seedMeatRev=0, seedSoupRev=0, seedMeatVisits=0, seedSoupVisits=0;
-  let seedMeatCust=0, seedSoupCust=0;
-  DB.customers.forEach(c=>{
-    if(c.isNew) return;
-    const cSpent = revAmt(c.spent);
-    const cVisits = countAmt(c.visits);
-    const avg = cSpent / Math.max(cVisits || 1,1);
-    if(c.lastVisit && c.lastVisit < SOUP_START_DATE){
-      seedMeatRev += cSpent; seedMeatVisits += cVisits; seedMeatCust++;
-    } else {
-      if(avg <= 50){ seedSoupRev += cSpent; seedSoupVisits += cVisits; seedSoupCust++; }
-      else { seedMeatRev += cSpent; seedMeatVisits += cVisits; seedMeatCust++; }
-    }
+// Splits ONE customer's reconciled lifetime totals (c.spent / c.visits — see
+// CUSTOMER TALLY below) into meat vs soup. The itemised part of the total is
+// split by the product stamped on each history row; the remainder (the report
+// baseline, which is not itemised) is classified with the legacy heuristic:
+// pre-soup-launch → meat, otherwise an average ticket of ≤ KES 50 → soup.
+// The two halves always add up to exactly c.spent / c.visits, so the stats bar,
+// the product filter and the Overview can never disagree with the customer list.
+function customerProductSplit(c){
+  const spent = Math.max(0, Number(c.spent) || 0);
+  const visits = Math.max(0, Number(c.visits) || 0);
+  let rowMeat = 0, rowSoup = 0, nMeat = 0, nSoup = 0;
+  customerHistoryFor(c).forEach(t => {
+    const a = Math.max(0, Number(t.amount) || 0);
+    const p = t.product || classifyProduct(t.date, a);
+    if (p === 'soup') { rowSoup += a; nSoup++; } else { rowMeat += a; nMeat++; }
   });
+  const rowSum = rowMeat + rowSoup, rowN = nMeat + nSoup;
+  let meat = { spent: rowMeat, visits: nMeat }, soup = { spent: rowSoup, visits: nSoup };
+  if (rowSum > spent || rowN > visits) {
+    // Stored totals are behind the history (stale record) — never report more
+    // than the customer's total: scale the itemised split down to fit it.
+    const fs = rowSum ? Math.min(1, spent / rowSum) : 0;
+    const fv = rowN ? Math.min(1, visits / rowN) : 0;
+    meat = { spent: rowMeat * fs, visits: Math.round(nMeat * fv) };
+    soup = { spent: rowSoup * fs, visits: Math.round(nSoup * fv) };
+  }
+  const restSpent = Math.max(0, spent - meat.spent - soup.spent);
+  const restVisits = Math.max(0, visits - meat.visits - soup.visits);
+  if (restSpent > 0 || restVisits > 0) {
+    const asOf = String(c.seedLastVisit || c.lastVisit || '');
+    const avg = restSpent / Math.max(restVisits, 1);
+    if (asOf >= SOUP_START_DATE && avg <= 50) { soup.spent += restSpent; soup.visits += restVisits; }
+    else { meat.spent += restSpent; meat.visits += restVisits; }
+  }
+  const product = (soup.spent > meat.spent || (soup.spent === meat.spent && soup.visits > meat.visits)) ? 'soup' : 'meat';
+  return { meat, soup, spent, visits, product };
+}
+function getProductStats(){
+  // Every customer's reconciled lifetime total is the single source of truth
+  // (spent/visits are derived from baseline + history by repairDates, see
+  // CUSTOMER TALLY). Revenue is therefore Σ spent — NOT "spent for some
+  // customers + transactions for others": that formula double counted every
+  // non-seed customer as soon as a newer import cleared their isNew flag, and
+  // every seed customer whose statement name didn't match their record exactly.
+  // Negative totals guard: customerProductSplit clamps every amount to ≥ 0, so
+  // a corrupt negative row can never pull the headline total below zero.
+  let meatRevenue = 0, soupRevenue = 0, meatVisits = 0, soupVisits = 0;
+  let meatCustomers = 0, soupCustomers = 0, totalRevenue = 0, totalVisits = 0;
+  (DB.customers || []).forEach(c => {
+    const s = customerProductSplit(c);
+    meatRevenue += s.meat.spent; soupRevenue += s.soup.spent;
+    meatVisits += s.meat.visits; soupVisits += s.soup.visits;
+    totalRevenue += s.spent; totalVisits += s.visits;
+    if (s.spent > 0 || s.visits > 0) { if (s.product === 'soup') soupCustomers++; else meatCustomers++; }
+  });
+  const r2 = x => Math.round(x * 100) / 100;
   return {
-    meatRevenue: seedMeatRev + meatTxRev,
-    soupRevenue: seedSoupRev + soupTxRev,
-    totalRevenue: seedMeatRev + seedSoupRev + meatTxRev + soupTxRev,
-    meatCustomers: seedMeatCust + meatTxPhones.size,
-    soupCustomers: seedSoupCust + soupTxPhones.size,
-    totalCustomers: DB.customers.length,
-    meatVisits: seedMeatVisits + meatTxVisits,
-    soupVisits: seedSoupVisits + soupTxVisits,
-    totalVisits: DB.customers.reduce((s,c)=>s+(c.visits||0),0)
+    meatRevenue: r2(meatRevenue),
+    soupRevenue: r2(soupRevenue),
+    totalRevenue: r2(totalRevenue),
+    meatCustomers,
+    soupCustomers,
+    totalCustomers: (DB.customers || []).length,
+    meatVisits,
+    soupVisits,
+    totalVisits
   };
+}
+
+/* ══════════ CUSTOMER TALLY — spent / visits are DERIVED, never accumulated ══════════
+   The customer card (Total Spent · Visits · Avg/Visit) and the Transaction
+   History beneath it kept drifting apart ("counts not in tally"): `spent` and
+   `visits` were running counters that several code paths incremented, max()'d,
+   subtracted or copied from the cloud, while the per-customer history was a
+   separate list — and nothing ever forced the two to agree again. Backfill in
+   particular added rows to the history without touching the counters at all.
+
+   Every customer now carries an explicit BASELINE — the part of their lifetime
+   that is NOT itemised as individual transactions — and everything else is
+   derived from the history:
+
+     baseline = { seedSpent, seedVisits, seedLastVisit }
+                • seed customers: their row in the original report
+                  (SEED_CUSTOMERS), which covers everything up to seedLastVisit
+                • customer-export (aggregate) rows: the export's lifetime totals
+                  as of its Last_Visit
+                • legacy records: whatever stored total the history can't
+                  explain, stamped once (see ensureBaselineFields)
+     inside   = history rows dated on/before seedLastVisit — the baseline already
+                covers this period, so the BIGGER of the two wins and backfilling
+                an old statement can never inflate a total
+     after    = history rows dated after seedLastVisit — new business, always
+                added ON TOP of the baseline (never absorbed by it)
+
+     spent  = max(baseline.spent,  Σ inside.amount) + Σ after.amount
+     visits = max(baseline.visits, inside.count)    + after.count
+
+   reconcileCustomerAggregates() is idempotent and runs from repairDates() — i.e.
+   after every import, backfill, cloud merge, dedupe, rollback and on load — so
+   the stored numbers always equal this formula and the modal, the customer
+   table and the Overview all read the same figure. */
+const _dateOnly = v => (String(v === null || v === undefined ? '' : v).match(/(\d{4}-\d{2}-\d{2})/) || [, ''])[1];
+const _round2 = x => Math.round(x * 100) / 100;
+let _seedBaselineIndex = null;
+function _seedIndex(){
+  if (_seedBaselineIndex) return _seedBaselineIndex;
+  const byName = new Map(), byNameContact = new Map();
+  let cutoff = '';
+  if (typeof SEED_CUSTOMERS !== 'undefined' && Array.isArray(SEED_CUSTOMERS)) {
+    SEED_CUSTOMERS.forEach(r => {
+      const row = { spent: Math.max(0, Number(r[2]) || 0), visits: Math.max(0, Number(r[3]) || 0), lastVisit: _dateOnly(r[6]) };
+      if (row.lastVisit > cutoff) cutoff = row.lastVisit;
+      if (!byName.has(r[0])) byName.set(r[0], row);
+      const ck = r[0] + '|' + String(r[1] || '');
+      if (!byNameContact.has(ck)) byNameContact.set(ck, row);
+    });
+  }
+  _seedBaselineIndex = { byName, byNameContact, cutoff };
+  return _seedBaselineIndex;
+}
+// The original report row for a seed customer. The report lists 41 names
+// twice (different phones), so the name+contact pair is tried first. Cached.
+function seedBaselineFor(name, contact){
+  const idx = _seedIndex();
+  return idx.byNameContact.get(name + '|' + String(contact || '')) || idx.byName.get(name) || null;
+}
+// Latest Last Visit anywhere in the seed report = the report's cut-off date.
+// A seed customer whose own cut-off is unknown (e.g. renamed) still knows that
+// anything after this date cannot be part of the report baseline.
+function seedReportCutoff(){
+  return _seedIndex().cutoff || '';
+}
+// DB.customerTx is keyed by name; when two records share one exact name (the
+// seed report lists 41 such pairs with different phones) the FIRST record —
+// the one showCustomerDetail() and findCustomerMatch() resolve — owns the
+// shared history, so the same rows are never counted twice. The name → owner
+// map is cached per customer array (rebuilt when the array is replaced or
+// grows, and self-heals after an in-place rename).
+let _ownerCache = { list: null, len: -1, map: null };
+function historyOwnerMap(){
+  const list = (DB && DB.customers) || [];
+  if (_ownerCache.list !== list || _ownerCache.len !== list.length) {
+    const map = new Map();
+    list.forEach(c => { if (c && !map.has(c.name)) map.set(c.name, c); });
+    _ownerCache = { list, len: list.length, map };
+  }
+  return _ownerCache.map;
+}
+function customerOwnsHistory(c){
+  const owner = historyOwnerMap().get(c.name);
+  if (owner === undefined || owner === c) return true;
+  if (owner.name !== c.name) { _ownerCache.len = -1; return customerOwnsHistory(c); } // stale after a rename
+  return false;
+}
+function customerHistoryFor(c){
+  if (!c) return [];
+  return customerOwnsHistory(c) ? (((DB && DB.customerTx) || {})[c.name] || []) : [];
+}
+function dayBefore(iso){
+  const d = new Date(iso + 'T12:00:00Z');
+  if (isNaN(d)) return '';
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+// Guarantees the record has an explicit baseline. A record is "stamped" once
+// seedLastVisit is a string ('' = no baseline / unknown cut-off). Runs once per
+// record; returns true when it changed anything.
+function ensureBaselineFields(c, hist){
+  const stamped = typeof c.seedLastVisit === 'string';
+  const seedRow = seedBaselineFor(c.name, c.contact);
+  let changed = false;
+  if (seedRow && (c.isSeed || (c.isSeed === undefined && !stamped))) {
+    // The report row is authoritative for a seed customer's baseline.
+    if (!c.isSeed) { c.isSeed = true; changed = true; }
+    if (!(Number(c.seedSpent) > 0 || Number(c.seedVisits) > 0)) { c.seedSpent = seedRow.spent; c.seedVisits = seedRow.visits; changed = true; }
+    if (!_dateOnly(c.seedLastVisit)) { c.seedLastVisit = seedRow.lastVisit; changed = true; }
+  } else if (!stamped) {
+    const rows = hist || customerHistoryFor(c);
+    let sum = 0, minDate = '';
+    rows.forEach(t => {
+      sum += Math.max(0, Number(t.amount) || 0);
+      const d = _dateOnly(t.date);
+      if (d && (!minDate || d < minDate)) minDate = d;
+    });
+    const surplusSpent = _round2((Number(c.spent) || 0) - sum);
+    const surplusVisits = (Number(c.visits) || 0) - rows.length;
+    if (c.isSeed) {
+      // Seed flag but no report row (renamed customer): keep the seed totals it
+      // carries; the cut-off falls back to the report's global cut-off.
+      c.seedSpent = Math.max(0, Number(c.seedSpent) || 0);
+      c.seedVisits = Math.max(0, Number(c.seedVisits) || 0);
+      c.seedLastVisit = '';
+    } else if (surplusVisits >= 1 && surplusSpent >= 0) {
+      // Legacy record whose total the history can't explain (e.g. created from
+      // a customer export before baselines existed): freeze the unexplained
+      // part as its baseline so nothing the user already sees gets smaller.
+      // Every itemised row came after that aggregate, so the cut-off sits just
+      // before the earliest one.
+      c.seedSpent = surplusSpent;
+      c.seedVisits = surplusVisits;
+      c.seedLastVisit = minDate ? dayBefore(minDate) : (_dateOnly(c.lastVisit) || '');
+    } else {
+      c.seedSpent = 0;
+      c.seedVisits = 0;
+      c.seedLastVisit = '';
+    }
+    changed = true;
+  }
+  // Normalise the stamped fields (numbers, date-only) without changing meaning.
+  const ns = Math.max(0, Number(c.seedSpent) || 0), nv = Math.max(0, Number(c.seedVisits) || 0);
+  if (c.seedSpent !== ns) { c.seedSpent = ns; changed = true; }
+  if (c.seedVisits !== nv) { c.seedVisits = nv; changed = true; }
+  const nd = _dateOnly(c.seedLastVisit);
+  if (typeof c.seedLastVisit === 'string' && c.seedLastVisit !== nd) { c.seedLastVisit = nd; changed = true; }
+  return changed;
+}
+// Pure: computes what the customer's totals SHOULD be from baseline + history.
+function customerTally(c, hist){
+  const rows = hist || customerHistoryFor(c);
+  const base = {
+    spent: Math.max(0, Number(c.seedSpent) || 0),
+    visits: Math.max(0, Number(c.seedVisits) || 0),
+    lastVisit: _dateOnly(c.seedLastVisit) || (c.isSeed ? seedReportCutoff() : '')
+  };
+  let inSpent = 0, inCount = 0, afterSpent = 0, afterCount = 0;
+  rows.forEach(t => {
+    const a = Math.max(0, Number(t.amount) || 0);
+    const d = _dateOnly(t.date);
+    // Undated rows, or an unknown cut-off, count as "inside" (conservative —
+    // can only ever avoid double counting, never inflate).
+    if (!base.lastVisit || !d || d <= base.lastVisit) { inSpent += a; inCount++; }
+    else { afterSpent += a; afterCount++; }
+  });
+  let spent, visits;
+  if (!rows.length && base.spent === 0 && base.visits === 0) {
+    // Nothing to derive from — keep the stored figures.
+    spent = _round2(Math.max(0, Number(c.spent) || 0));
+    visits = Math.max(0, Number(c.visits) || 0);
+  } else {
+    spent = _round2(Math.max(base.spent, inSpent) + afterSpent);
+    visits = Math.max(base.visits, inCount) + afterCount;
+  }
+  return {
+    spent, visits, base,
+    inside: { spent: _round2(inSpent), count: inCount },
+    after: { spent: _round2(afterSpent), count: afterCount },
+    // The part of the baseline that no listed transaction accounts for.
+    unitemised: { spent: _round2(Math.max(0, base.spent - inSpent)), visits: Math.max(0, base.visits - inCount) }
+  };
+}
+// Writes the derived totals back onto the record. Idempotent. Returns true when
+// the stored spent/visits (or baseline stamps) changed.
+function reconcileCustomerAggregates(c, hist){
+  if (!c) return false;
+  const rows = hist || customerHistoryFor(c);
+  let changed = ensureBaselineFields(c, rows);
+  const t = customerTally(c, rows);
+  if (Number(c.spent) !== t.spent) { c.spent = t.spent; changed = true; }
+  if (Number(c.visits) !== t.visits) { c.visits = t.visits; changed = true; }
+  return changed;
+}
+// Baseline facts are immutable per customer, so when two copies of a record
+// meet (cloud merge, duplicate merge) the fuller copy wins field by field.
+function mergeBaselineFields(a, b){
+  a = a || {}; b = b || {};
+  const out = {};
+  const sa = Number(a.seedSpent), sb = Number(b.seedSpent);
+  if (isFinite(sa) || isFinite(sb)) out.seedSpent = Math.max(isFinite(sa) ? sa : 0, isFinite(sb) ? sb : 0);
+  const va = Number(a.seedVisits), vb = Number(b.seedVisits);
+  if (isFinite(va) || isFinite(vb)) out.seedVisits = Math.max(isFinite(va) ? va : 0, isFinite(vb) ? vb : 0);
+  const la = typeof a.seedLastVisit === 'string' ? _dateOnly(a.seedLastVisit) : null;
+  const lb = typeof b.seedLastVisit === 'string' ? _dateOnly(b.seedLastVisit) : null;
+  if (la !== null || lb !== null) out.seedLastVisit = (la && lb) ? (la > lb ? la : lb) : (la || lb || '');
+  if (a.isSeed || b.isSeed) out.isSeed = true;
+  return out;
 }
 function repairDates(){
   let fixed = 0;
@@ -3825,19 +4059,12 @@ function repairDates(){
       c.lastVisit = tmp;
       fixed++;
     }
-    // 2. Single-visit customers: firstVisit must equal lastVisit
-    // If there IS transaction history with multiple dates, the history is
-    // authoritative — the visits count was never updated by backfill, so fix
-    // it now. Otherwise (no history or exactly 1 history entry), force both
-    // dates to be equal.
-    const hasHistory = (DB.customerTx[c.name] || []).length > 0;
-    const histLen = (DB.customerTx[c.name] || []).length;
-    if((c.visits || 0) === 1 && hasHistory && histLen > 1){
-      // Backfill added history but didn't update visits — fix the count from
-      // the actual transaction record.
-      c.visits = histLen;
-      fixed++;
-    }
+    // 2. Totals: spent/visits are DERIVED from baseline + history (see CUSTOMER
+    // TALLY). This is what keeps the customer card in tally with the
+    // Transaction History listed under it, whichever path added the rows
+    // (import, backfill, cloud merge, dedupe, rollback).
+    if(reconcileCustomerAggregates(c)) fixed++;
+    // 3. Single-visit customers: firstVisit must equal lastVisit.
     if((c.visits || 0) === 1 && c.firstVisit && c.lastVisit && c.firstVisit !== c.lastVisit){
       // Use the earlier date as both (more conservative)
       const earlier = c.firstVisit < c.lastVisit ? c.firstVisit : c.lastVisit;
@@ -3845,32 +4072,24 @@ function repairDates(){
       c.lastVisit = earlier;
       fixed++;
     }
-    // 3. If only one date exists, copy it to the other
+    // 4. If only one date exists, copy it to the other
     if(!c.firstVisit && c.lastVisit){ c.firstVisit = c.lastVisit; fixed++; }
     if(!c.lastVisit && c.firstVisit){ c.lastVisit = c.firstVisit; fixed++; }
-    // 4. Recompute days-since from the (now-reconciled) lastVisit
+    // 5. Recompute days-since from the (now-reconciled) lastVisit
     if(c.lastVisit){
       const today = new Date(getTodayEAT());
       const newDays = Math.max(0, Math.round((today - new Date(c.lastVisit)) / 86400000));
       if(newDays !== c.days){ c.days = newDays; }
     }
-    // 5. A comeback episode ends once the customer lapses 3+ months again.
+    // 6. A comeback episode ends once the customer lapses 3+ months again.
     resetComebackIfLapsed(c);
   });
   return fixed;
 }
+// Same split the stats bar / Overview use, so the 🥩/🍲 filter, the per-product
+// totals and the customer list can never disagree about who counts as what.
 function customerProduct(c){
-  if(isNewThisMonth(c) && DB.transactions.length){
-    const custTx = DB.transactions.filter(t => t.phone && normPhone(t.phone) === normPhone(c.contact));
-    if(custTx.length){
-      const soupCount = custTx.filter(t => t.product === 'soup').length;
-      const meatCount = custTx.filter(t => t.product === 'meat').length;
-      return soupCount > meatCount ? 'soup' : 'meat';
-    }
-  }
-  if(c.lastVisit && c.lastVisit < SOUP_START_DATE) return 'meat';
-  const avg = (c.spent||0) / Math.max(c.visits||1,1);
-  return avg <= 50 ? 'soup' : 'meat';
+  return customerProductSplit(c).product;
 }
 function maskedMatches(masked,full){const m=(''+masked).match(/^(\d{4})\*+(\d{3})$/);if(!m)return false;
   full=normPhone(full);return full.length===10&&!full.includes('*')&&full.startsWith(m[1])&&full.endsWith(m[2]);}
@@ -4588,12 +4807,35 @@ function mergeBaselineCustomer(c) {
   const dOnly = (f) => (f === null || f === undefined || f === '') ? '' : (String(f).match(/(\d{4}-\d{2}-\d{2})/) || [,''])[1];
   const firstVisit = dOnly(c.firstVisit);
   const lastVisit = dOnly(c.lastVisit);
+  // A baseline/aggregate row is a lifetime total "as of" its Last Visit with no
+  // itemised transactions behind it — exactly what the customer BASELINE models
+  // (see CUSTOMER TALLY). It is merged into seedSpent/seedVisits/seedLastVisit;
+  // the displayed spent/visits are then derived from baseline + history by
+  // reconcileCustomerAggregates(), so an aggregate can never be double counted
+  // against the M-Pesa rows that make it up, nor swallow rows dated after it.
+  const applyBaseline = (rec) => {
+    ensureBaselineFields(rec);
+    const curSpent = Number(rec.seedSpent) || 0;
+    const curVisits = Number(rec.seedVisits) || 0;
+    const curLast = dOnly(rec.seedLastVisit);
+    const newer = !curLast || (lastVisit && lastVisit > curLast);
+    if (newer) {
+      // The incoming total is more recent — it supersedes the stored baseline
+      // where it is bigger (a total as of a later date can only be ≥).
+      rec.seedSpent = Math.max(curSpent, totalSpent);
+      rec.seedVisits = Math.max(curVisits, totalVisits);
+      if (lastVisit) rec.seedLastVisit = lastVisit;
+    } else {
+      rec.seedSpent = Math.max(curSpent, totalSpent);
+      rec.seedVisits = Math.max(curVisits, totalVisits);
+    }
+    reconcileCustomerAggregates(rec);
+  };
   if (existing) {
     existing.name = existing.name || c.name;
     if (isValidKenyanContact(c.contact) && !isValidKenyanContact(existing.contact)) existing.contact = c.contact;
     else if (!existing.contact && c.contact) existing.contact = c.contact;
-    existing.spent = Math.max(0, Number(existing.spent || 0), totalSpent);
-    existing.visits = Math.max(0, Number(existing.visits || 0), totalVisits);
+    applyBaseline(existing);
     // Handle visit dates: firstVisit = earliest, lastVisit = latest
     if (lastVisit) {
       const cur = dOnly(existing.lastVisit);
@@ -4614,7 +4856,7 @@ function mergeBaselineCustomer(c) {
     }
     return "updated";
   }
-  DB.customers.push({
+  const created = {
     name: c.name,
     contact: c.contact,
     spent: totalSpent,
@@ -4626,8 +4868,15 @@ function mergeBaselineCustomer(c) {
     // Baseline/aggregate rows are never "new" — they represent existing
     // history, not a customer discovered by the latest statement batch.
     isNew: false,
-    newBatch: 0
-  });
+    newBatch: 0,
+    // The aggregate IS this customer's baseline (see CUSTOMER TALLY).
+    isSeed: false,
+    seedSpent: totalSpent,
+    seedVisits: totalVisits || 1,
+    seedLastVisit: lastVisit || firstVisit || ""
+  };
+  DB.customers.push(created);
+  reconcileCustomerAggregates(created);
   return "added";
 }
 
@@ -5470,9 +5719,9 @@ function importTransactions(txs, opts = {}) {
   });
 
   // AGGREGATE ROWS (isAggregate:true — customer/analytics exports carrying a
-  // lifetime Total_Spent + Visits, not a single dated payment): merge into
-  // the customer's running totals via max(), exactly like a baseline
-  // snapshot. These must never reach DB.transactions, DB.customerTx, the
+  // lifetime Total_Spent + Visits, not a single dated payment): merged into
+  // the customer's BASELINE (mergeBaselineCustomer → seedSpent/seedVisits/
+  // seedLastVisit). These must never reach DB.transactions, DB.customerTx, the
   // monthly buckets, or importedRev — the aggregate already represents many
   // past transactions, so booking it as a line-item AND later importing the
   // real M-Pesa rows behind it would count that history twice (this is what
@@ -5495,15 +5744,27 @@ function importTransactions(txs, opts = {}) {
     if (outcome === 'updated') updated++; else added++;
     imported++;
   });
-  // Track seed customers that received new transactions so we can reconcile
-  // their aggregates AFTER customerTx already contains the current batch.
-  // Previously reconciliation ran before customerTx was built, so historySum
-  // missed the day's rows and the later monthlyDelta addition used the FULL
-  // history sum (double-counting old months). Now we build history immediately
-  // and only add the incremental delta (newSpent-oldSpent) to importedRev/monthly.
-  const seedCustomersTouched = new Set();
-  const seedBatchMap = new Map(); // customerName -> tx[] of this batch
-  const monthAddSeedDelta = {};
+  // Customer totals are DERIVED (see CUSTOMER TALLY): every fresh row goes into
+  // the customer's history first, then reconcileCustomerAggregates() recomputes
+  // spent/visits from baseline + history. The revenue that reaches importedRev
+  // and the monthly buckets is exactly the change in those derived totals
+  // (Σ after-import − Σ before-import), split across the batch's months in
+  // proportion to what each row contributed — so a customer's card, the
+  // Transactions tab, the monthly chart and the Overview all move by the same
+  // amount, and nothing can be counted twice. Seed and non-seed customers no
+  // longer follow two different bookkeeping schemes.
+  const touched = new Map(); // customer record -> { before:number, rows:[{date,amount}] }
+  // Called BEFORE the row is added to the customer's history: on first touch
+  // the record is reconciled so `before` is the true derived total (a drifted
+  // legacy value must not leak into this batch's revenue delta).
+  const noteTouched = (cust, normDate, amount) => {
+    if (!touched.has(cust)) {
+      reconcileCustomerAggregates(cust);
+      touched.set(cust, { before: Math.max(0, Number(cust.spent) || 0), rows: [] });
+    }
+    touched.get(cust).rows.push({ date: normDate, amount });
+  };
+  const monthKeyOf = (d) => /^\d{4}-\d{2}/.test(d || '') ? String(d).slice(0, 7) : getTodayEAT().slice(0, 7);
 
   txFresh.forEach(tx => {
     const product = classifyProduct(tx.date, tx.amount);
@@ -5521,61 +5782,28 @@ function importTransactions(txs, opts = {}) {
       source: tx.source || '',
       importedAt: nowISO
     });
-    // Build per-customer history immediately so reconciliation sees current batch
-    const custForHist = findCustomerMatch(tx);
-    if (custForHist) {
-      if (!DB.customerTx[custForHist.name]) DB.customerTx[custForHist.name] = [];
-      DB.customerTx[custForHist.name].push({
-        date: normDate,
-        amount: txAmount,
-        product: product,
-        receipt: tx.receipt || '',
-        importedAt: nowISO
-      });
-      DB.customerTx[custForHist.name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
-    }
+    const histRow = { date: normDate, amount: txAmount, product: product, receipt: tx.receipt || '', importedAt: nowISO };
 
     const date = txDate(tx);
-    const match = custForHist || findCustomerMatch(tx);
+    const match = findCustomerMatch(tx);
     if (match) {
-      if (match.isSeed) {
-        if(date > (match.lastVisit || '')) {
-          const wasComeback = noteComebackReturn(match, match.lastVisit, date);
-          if(wasComeback) comebacks.push(match.name);
-        }
-        if (!match.lastVisit || date > match.lastVisit) match.lastVisit = date;
-        if (!match.firstVisit || date < match.firstVisit) match.firstVisit = date;
-        const today = new Date(getTodayEAT());
-        match.days = Math.max(0, Math.round((today - new Date(match.lastVisit)) / 86400000));
-        if (isValidKenyanContact(tx.contact) && !isValidKenyanContact(match.contact)) {
-          match.contact = normalizeContact(tx.contact);
-          match.masked = false;
-          DB.resolved++;
-          unmasked++;
-        }
-        seedCustomersTouched.add(match.name);
-        if (!seedBatchMap.has(match.name)) seedBatchMap.set(match.name, []);
-        seedBatchMap.get(match.name).push({date: normDate, amount: txAmount});
-      } else {
-        if(date > (match.lastVisit || '')) {
-          const wasComeback = noteComebackReturn(match, match.lastVisit, date);
-          if(wasComeback) comebacks.push(match.name);
-        }
-        match.spent = Math.max(0, Number(match.spent || 0) + txAmount);
-        match.visits = Number(match.visits || 0) + 1;
-        if (!match.lastVisit || date > match.lastVisit) match.lastVisit = date;
-        if (!match.firstVisit || date < match.firstVisit) match.firstVisit = date;
-        const today = new Date(getTodayEAT());
-        match.days = Math.max(0, Math.round((today - new Date(match.lastVisit)) / 86400000));
-        if (isValidKenyanContact(tx.contact) && !isValidKenyanContact(match.contact)) {
-          match.contact = normalizeContact(tx.contact);
-          match.masked = false;
-          DB.resolved++;
-          unmasked++;
-        }
-        const mk = /^\d{4}-\d{2}/.test(tx.date || "") ? tx.date.slice(0, 7) :
-          (new Date()).getFullYear() + '-' + String((new Date()).getMonth() + 1).padStart(2, '0');
-        monthAdd[mk] = (monthAdd[mk] || 0) + txAmount;
+      if(date > (match.lastVisit || '')) {
+        const wasComeback = noteComebackReturn(match, match.lastVisit, date);
+        if(wasComeback) comebacks.push(match.name);
+      }
+      noteTouched(match, normDate, txAmount);
+      if (!DB.customerTx[match.name]) DB.customerTx[match.name] = [];
+      DB.customerTx[match.name].push(histRow);
+      DB.customerTx[match.name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
+      if (!match.lastVisit || date > match.lastVisit) match.lastVisit = date;
+      if (!match.firstVisit || date < match.firstVisit) match.firstVisit = date;
+      const today = new Date(getTodayEAT());
+      match.days = Math.max(0, Math.round((today - new Date(match.lastVisit)) / 86400000));
+      if (isValidKenyanContact(tx.contact) && !isValidKenyanContact(match.contact)) {
+        match.contact = normalizeContact(tx.contact);
+        match.masked = false;
+        DB.resolved++;
+        unmasked++;
       }
       updated++;
     } else {
@@ -5585,66 +5813,61 @@ function importTransactions(txs, opts = {}) {
       const newCust = {
         name: tx.name || "M-Pesa Customer",
         contact: normalizeContact(tx.contact),
-        spent: txAmount,
-        visits: 1,
+        spent: 0,
+        visits: 0,
         days: daysSinceTx,
         lastVisit: txDateNorm,
         firstVisit: txDateNorm,
         masked: (tx.contact || "").includes("***") || !isValidKenyanContact(tx.contact),
         isNew: true,
-        newBatch: currentBatch
+        newBatch: currentBatch,
+        // A customer discovered by a statement has no un-itemised baseline:
+        // everything they ever spent is in their history.
+        isSeed: false,
+        seedSpent: 0,
+        seedVisits: 0,
+        seedLastVisit: ''
       };
       DB.customers.push(newCust);
+      noteTouched(newCust, normDate, txAmount);
       if (!DB.customerTx[newCust.name]) DB.customerTx[newCust.name] = [];
-      // history already pushed above under old match? No — new customer had no match, so push now if not already
-      const already = DB.customerTx[newCust.name].some(h=>h.receipt=== (tx.receipt||'') && h.date===normDate);
-      if (!already) {
-        DB.customerTx[newCust.name].push({date: normDate, amount: txAmount, product: product, receipt: tx.receipt||'', importedAt: nowISO});
-        DB.customerTx[newCust.name].sort((a,b)=>(b.date||'').localeCompare(a.date||''));
-      }
+      DB.customerTx[newCust.name].push(histRow);
+      DB.customerTx[newCust.name].sort((a,b)=>(b.date||'').localeCompare(a.date||''));
       added++;
-      const mk = /^\d{4}-\d{2}/.test(tx.date || "") ? tx.date.slice(0, 7) :
-        (new Date()).getFullYear() + '-' + String((new Date()).getMonth() + 1).padStart(2, '0');
-      monthAdd[mk] = (monthAdd[mk] || 0) + txAmount;
     }
     imported++;
   });
 
-  // RECONCILE SEED CUSTOMERS: max(seed baseline, sum(history including current batch))
-  // Delta = newSpent - oldSpent (oldSpent before this import). Only delta goes to
-  // importedRev and monthly, distributed proportionally across current batch months
-  // to avoid adding full historical sum to monthly buckets (which double-counts).
-  seedCustomersTouched.forEach(customerName => {
-    const cust = DB.customers.find(c => c.name === customerName && c.isSeed);
-    if (!cust) return;
-    const history = DB.customerTx[customerName] || [];
-    if (!history.length) return;
-    const historySum = history.reduce((s, t) => s + Math.max(0, Number(t.amount || 0)), 0);
-    const historyVisits = history.length;
-    const oldSpent = Number(cust.spent || 0);
-    const newSpent = Math.max(Number(cust.seedSpent || 0), historySum);
-    const newVisits = Math.max(Number(cust.seedVisits || 0), historyVisits);
-    const spentDelta = Math.max(0, newSpent - oldSpent);
-    cust.spent = newSpent;
-    cust.visits = newVisits;
-    if (spentDelta > 0) {
-      DB.importedRev += spentDelta;
-      const batchTxs = seedBatchMap.get(customerName) || [];
-      const batchSum = batchTxs.reduce((s,t)=>s+Number(t.amount||0),0) || 1;
-      batchTxs.forEach(bt=>{
-        const mk = /^\d{4}-\d{2}/.test(bt.date||"") ? bt.date.slice(0,7) : '';
-        if (!mk) return;
-        const share = (Number(bt.amount||0)/batchSum) * spentDelta;
-        monthAddSeedDelta[mk] = (monthAddSeedDelta[mk]||0) + share;
-      });
-    }
+  // Recompute every touched customer's totals and book ONLY the resulting
+  // increase into importedRev / the monthly buckets (never the raw row sum: a
+  // row dated inside a seed customer's report period is already part of their
+  // baseline and must not be counted again).
+  let batchRevenue = 0, batchTxCount = 0;
+  const spread = (rows, amount) => {
+    const sum = rows.reduce((s, r) => s + r.amount, 0);
+    if (sum > 0) rows.forEach(r => { const mk = monthKeyOf(r.date); monthAdd[mk] = (monthAdd[mk] || 0) + (r.amount / sum) * amount; });
+    else if (rows.length) { const mk = monthKeyOf(rows[0].date); monthAdd[mk] = (monthAdd[mk] || 0) + amount; }
+  };
+  touched.forEach((info, cust) => {
+    reconcileCustomerAggregates(cust);
+    const t = customerTally(cust);
+    const delta = Math.max(0, _round2((Number(cust.spent) || 0) - info.before));
+    if (delta <= 0) return;
+    batchRevenue = _round2(batchRevenue + delta);
+    batchTxCount += info.rows.length;
+    // Rows dated after the baseline cut-off are the ones that add revenue —
+    // credit their months first; anything left (a baseline pushed up by rows
+    // inside its period) goes to those older months.
+    const cutoff = t.base.lastVisit;
+    const afterRows = info.rows.filter(r => cutoff && r.date && r.date > cutoff);
+    const insideRows = info.rows.filter(r => afterRows.indexOf(r) < 0);
+    const afterSum = afterRows.reduce((s, r) => s + r.amount, 0);
+    const toAfter = Math.min(delta, afterSum);
+    if (toAfter > 0) spread(afterRows, toAfter);
+    const rest = _round2(delta - toAfter);
+    if (rest > 0) spread(insideRows.length ? insideRows : afterRows, rest);
   });
-
-  // Merge monthly buckets: non-seed + seed deltas (proportional)
-  const mergedMonthAdd = {};
-  Object.entries(monthAdd).forEach(([k,v])=>{ mergedMonthAdd[k]=(mergedMonthAdd[k]||0)+v; });
-  Object.entries(monthAddSeedDelta).forEach(([k,v])=>{ mergedMonthAdd[k]=(mergedMonthAdd[k]||0)+v; });
-  Object.entries(mergedMonthAdd).forEach(([k, v]) => {
+  Object.entries(monthAdd).forEach(([k, v]) => {
     const i = DB.monthly.labels.indexOf(k);
     if (i >= 0) DB.monthly.revenue[i] += v;
     else { DB.monthly.labels.push(k); DB.monthly.revenue.push(v); }
@@ -5652,22 +5875,8 @@ function importTransactions(txs, opts = {}) {
   const pairs = DB.monthly.labels.map((l, i) => [l, DB.monthly.revenue[i]]).sort((a, b) => a[0].localeCompare(b[0]));
   DB.monthly.labels = pairs.map(p => p[0]);
   DB.monthly.revenue = pairs.map(p => p[1]);
-
-  // Imported counts: non-seed fresh + seed deltas already added above.
-  // Non-seed transactions: need to count amount already in monthAdd, but importedRev
-  // for non-seed was previously added via separate sum — we keep that logic but
-  // use the already-computed monthAdd sum to avoid double loop.
-  const nonSeedFresh = txFresh.filter(tx => {
-    const m = findCustomerMatch(tx);
-    return !(m && m.isSeed);
-  });
-  // Non-seed revenue: sum of their amounts (seed deltas handled separately)
-  DB.importedRev += nonSeedFresh.reduce((s, tx) => s + Math.max(0, Number(tx.amount || 0)), 0);
-  DB.importedTx += nonSeedFresh.length;
-  // Seed customers that grew beyond baseline count as 1 imported tx per customer whose delta >0?
-  // Keep previous behavior: importedTx only counts non-seed transactions; seed growth
-  // is tracked via importedRev. (No extra Tx inflation)
-
+  DB.importedRev = _round2((Number(DB.importedRev) || 0) + batchRevenue);
+  DB.importedTx = (Number(DB.importedTx) || 0) + batchTxCount;
 
   const importFixed = repairDates();
   if(importFixed > 0){ console.log('Import repair: fixed', importFixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
@@ -5701,8 +5910,9 @@ function reconcileImportedRevenue(){
     amount += Number(t.amount || 0);
     const cust = findCustomerMatch(t);
     if(cust){
-      cust.spent = Math.max(0, (Number(cust.spent || 0) - Number(t.amount || 0)));
-      cust.visits = Math.max(0, (Number(cust.visits || 0) - 1));
+      // spent/visits are re-derived from the remaining history by repairDates()
+      // below — removing the duplicate row from the history is what rolls the
+      // customer's totals back (CUSTOMER TALLY).
       if(DB.customerTx && DB.customerTx[cust.name]){
         // Remove exactly one matching history entry per duplicate row (the
         // survivor's matching entry must be preserved).
@@ -5804,9 +6014,11 @@ function dedupeCustomers(){
       } else if (!primary.contact && o.contact){
         primary.contact = o.contact;
       }
-      // Keep the larger lifetime aggregate (duplicates share the same baseline).
-      primary.spent = Math.max(Number(primary.spent || 0), Number(o.spent || 0));
-      primary.visits = Math.max(Number(primary.visits || 0), Number(o.visits || 0));
+      // Duplicates share one baseline (the report/export row): keep the fuller
+      // baseline facts; spent/visits are re-derived from baseline + the merged
+      // history by repairDates() below (CUSTOMER TALLY), so nothing is summed
+      // twice and nothing the history proves is lost.
+      Object.assign(primary, mergeBaselineFields(primary, o));
       if (o.lastVisit && (!primary.lastVisit || o.lastVisit > primary.lastVisit)) primary.lastVisit = o.lastVisit;
       if (o.firstVisit && (!primary.firstVisit || o.firstVisit < primary.firstVisit)) primary.firstVisit = o.firstVisit;
       // Consolidate transaction history onto the survivor (only when the two
@@ -7349,6 +7561,7 @@ async function forcePullFromCloud(){
     }
 
     sanitizeNegativeTotals();
+    repairDates(); // re-derive spent/visits from the pulled baseline + history
     save();
     purgeMerchantData();
     refreshAll();
@@ -7384,6 +7597,7 @@ async function smartMergeCloud(){
         merged.push({
           ...localCust,
           ...(useCloud ? cloudCust : {}),
+          ...mergeBaselineFields(localCust, cloudCust),
           firstVisit: (() => { const f1 = stripTime(cloudCust.firstVisit), f2 = stripTime(localCust.firstVisit); return (f1 && f2) ? (f1 < f2 ? f1 : f2) : (f1 || f2 || ""); })(),
           lastVisit: (() => { const l1 = stripTime(cloudCust.lastVisit), l2 = stripTime(localCust.lastVisit); return (l1 && l2) ? (l1 > l2 ? l1 : l2) : (l1 || l2 || ""); })()
         });
@@ -7424,6 +7638,7 @@ async function smartMergeCloud(){
     });
 
     sanitizeNegativeTotals();
+    repairDates(); // re-derive spent/visits from the merged baseline + history
     save();
     // Merchant exclusion survives merges too — drop any Simon Musyoka records
     // pulled in from the cloud BEFORE pushing, so the sheet gets scrubbed too.
@@ -7493,17 +7708,38 @@ function showCustomerDetail(name){
     ${comebackBadge(c)}
     ${ntm?`<span class="badge b-month leaf-only" title="First-ever purchase in ${monthLabelEAT()}">🌱</span>`:''}
   `;
+  // The card is always rendered from the derived tally (baseline + history),
+  // so Total Spent / Visits can never disagree with the history listed below.
+  reconcileCustomerAggregates(c);
+  const tally = customerTally(c);
   $('modalTotal').textContent = kes(c.spent);
   $('modalVisits').textContent = c.visits;
-  $('modalAvg').textContent = 'KES ' + Math.round(c.spent/Math.max(c.visits,1)).toLocaleString();
   $('modalLast').textContent = stripTime(c.lastVisit) || '—';
   const ipiInfo = customerIPI(c);
   $('modalAvg').innerHTML = 'KES ' + Math.round(c.spent/Math.max(c.visits,1)).toLocaleString() + '<br><small style="color:var(--muted);font-size:.72rem;">Cycle: ~' + ipiInfo.ipi + 'd (' + (ipiInfo.status==='overdue'?'⚠️ Overdue ' + ipiInfo.multiplier + 'x': 'On track') + ')</small>';
 
   // Build transaction history
-  const txs = DB.customerTx[name] || [];
+  const txs = customerHistoryFor(c);
+  // Footer that reconciles the card with the list: listed rows + any part of
+  // the baseline (report / export total) that is not itemised = Total Spent.
+  const listedSpent = txs.reduce((s,t) => s + Math.max(0, Number(t.amount)||0), 0);
+  const un = tally.unitemised;
+  let tallyNote = '';
+  if(txs.length){
+    tallyNote += '<div style="display:flex;justify-content:space-between;padding:8px 10px;margin-top:4px;border-top:1px solid var(--border);font-size:.78rem;color:var(--muted);">' +
+      '<span>Listed above</span><span>' + txs.length + ' tx · ' + kes(listedSpent) + '</span></div>';
+  }
+  if(un.spent > 0 || un.visits > 0){
+    const asOf = tally.base.lastVisit;
+    tallyNote += '<div style="display:flex;justify-content:space-between;padding:6px 10px;font-size:.78rem;color:var(--muted);" title="Part of the baseline total (original report / customer export) that has no itemised M-Pesa row yet. Backfill the matching statement to itemise it.">' +
+      '<span>+ Earlier purchases' + (asOf ? ' up to ' + asOf : '') + ' (not itemised)</span><span>' + un.visits + ' visit' + (un.visits===1?'':'s') + ' · ' + kes(un.spent) + '</span></div>';
+  }
+  if(tallyNote){
+    tallyNote += '<div style="display:flex;justify-content:space-between;padding:8px 10px;font-size:.82rem;font-weight:600;border-top:1px solid var(--border);">' +
+      '<span>= Total</span><span>' + c.visits + ' visit' + (c.visits===1?'':'s') + ' · ' + kes(c.spent) + '</span></div>';
+  }
   if(txs.length === 0){
-    $('modalTxList').innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px;">No individual transactions recorded.<br><span style="font-size:.75rem">Import M-Pesa data to build history.</span></div>';
+    $('modalTxList').innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px;">No individual transactions recorded.<br><span style="font-size:.75rem">Import M-Pesa data to build history.</span></div>' + tallyNote;
   } else {
     // Group by month
     const byMonth = {};
@@ -7534,7 +7770,7 @@ function showCustomerDetail(name){
           </div>
         </div>
       `;
-    }).join('');
+    }).join('') + tallyNote;
   }
 
   $('custModal').style.display = 'flex';
@@ -7554,6 +7790,7 @@ $('custModal').addEventListener('click', (e) => {
 function backfillTransactions(txs){
   let imported = 0, dupes = 0;
   const comebacks = [];
+  const touchedCustomers = new Set();
 
   txs.forEach(tx => {
     // Global Merchant Exclusion: Never backfill transactions for Simon Musyoka
@@ -7592,12 +7829,13 @@ function backfillTransactions(txs){
       });
       DB.customerTx[cust.name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
 
-      // Reconcile last/first visit against the ACTUAL transaction history — this is
-      // a date-accuracy fix, not a revenue change: seed data (e.g. an older analytics
-      // CSV) can have a stale Last Visit that predates transactions a statement
-      // backfill later reveals. Last/First Visit should always agree with the real
-      // transaction record, so extend them outward if this transaction is newer/older
-      // than what's currently stored. Spent/visits counts are left untouched.
+      // Reconcile last/first visit against the ACTUAL transaction history — seed
+      // data (e.g. an older analytics CSV) can have a stale Last Visit that
+      // predates transactions a statement backfill later reveals. Last/First
+      // Visit should always agree with the real transaction record, so extend
+      // them outward if this transaction is newer/older than what's stored.
+      // Spent/visits are re-derived below (touched set) once the whole file is in.
+      touchedCustomers.add(cust);
       if(ntx.date){
         if(cust.lastVisit && ntx.date > cust.lastVisit){
           const wasComeback = noteComebackReturn(cust, cust.lastVisit, ntx.date);
@@ -7621,9 +7859,13 @@ function backfillTransactions(txs){
   });
 
   // Deliberately no DB.monthly / DB.importedRev / DB.importedTx updates here —
-  // backfill only captures transaction history. Revenue totals are the main
-  // import's job (importTransactions), so numbers aren't double-counted or
-  // inflated by history-only backfills.
+  // backfill captures transaction history for a period the report (or a later
+  // import) already booked as revenue. The customer's own card, however, must
+  // stay in tally with the history listed under it, so each touched customer's
+  // spent/visits are re-derived from baseline + history (CUSTOMER TALLY): rows
+  // dated inside the baseline period are absorbed by the baseline (never
+  // inflating it), rows dated after it are added on top.
+  touchedCustomers.forEach(c => reconcileCustomerAggregates(c));
 
   if(comebacks.length) triggerComebackMessages(comebacks);
   return { imported, dupes };
@@ -7680,13 +7922,15 @@ async function handleRebuild(input){
     // seedVisits) so the reconciliation logic can still distinguish seed
     // customers from imported ones after rebuild.
     DB.customers.forEach(c => {
+      // Make sure the baseline is stamped BEFORE the derived totals are zeroed,
+      // otherwise a legacy record would lose its un-itemised history.
+      ensureBaselineFields(c);
       c.spent = 0;
       c.visits = 0;
       c.isNew = false;
       c.newBatch = 0;
-      // Seed customers keep their baseline for reconciliation
-      // (seedSpent/seedVisits are preserved, spent/visits start at 0 and
-      // will be set to max(seed, imported) by recalcFromHistory)
+      // Baselines (seedSpent/seedVisits/seedLastVisit) are preserved; spent/
+      // visits are re-derived from baseline + re-imported history.
     });
     let totalImported = 0, totalDupes = 0, totalAdded = 0, totalUpdated = 0;
     for(let fi=0; fi<files.length; fi++){
@@ -7738,24 +7982,13 @@ async function handleRebuild(input){
 
 function recalcFromHistory(){
   DB.customers.forEach(c => {
-    const txs = DB.customerTx[c.name] || [];
+    const txs = customerHistoryFor(c);
+    // Totals come from the one formula everything else uses (CUSTOMER TALLY):
+    // baseline (seed report / export aggregate) for the un-itemised period,
+    // plus every history row dated after it.
+    reconcileCustomerAggregates(c, txs);
     if(txs.length === 0) return;
-    
-    const historySum = txs.reduce((s, t) => s + (t.amount || 0), 0);
-    const historyVisits = txs.length;
-    
-    if (c.isSeed) {
-      // SEED CUSTOMER: use max of seed baseline vs imported history
-      // This preserves seed data when imports don't cover the full history,
-      // and uses imports when they exceed the seed baseline
-      c.spent = Math.max(c.seedSpent || 0, historySum);
-      c.visits = Math.max(c.seedVisits || 0, historyVisits);
-    } else {
-      // NON-SEED CUSTOMER: use transaction history directly
-      c.spent = Math.max(0, historySum);
-      c.visits = Math.max(0, historyVisits);
-    }
-    
+
     const dates = txs.map(t => t.date).filter(Boolean).sort();
     if(dates.length > 0){
       const minTx = dates[0];

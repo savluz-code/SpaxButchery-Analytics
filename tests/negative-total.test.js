@@ -33,6 +33,17 @@ function baseContext(overrides = {}) {
   });
 }
 
+// mergeBaselineCustomer now writes the incoming aggregate into the customer's
+// BASELINE and derives spent/visits through the CUSTOMER TALLY helpers, so the
+// sandbox needs that block too.
+function customerTallySource() {
+  const start = htmlSource.indexOf('/* ══════════ CUSTOMER TALLY');
+  assert.notEqual(start, -1, 'CUSTOMER TALLY block not found');
+  const end = htmlSource.indexOf('function repairDates', start);
+  assert.notEqual(end, -1, 'CUSTOMER TALLY end not found');
+  return htmlSource.slice(start, end);
+}
+
 test('mergeBaselineCustomer clamps a negative baseline spent for a new customer', () => {
   const start = htmlSource.indexOf('function mergeBaselineCustomer');
   assert.notEqual(start, -1, 'mergeBaselineCustomer not found');
@@ -60,6 +71,7 @@ test('mergeBaselineCustomer clamps a negative baseline spent for a new customer'
       seen: {}
     };
   `, context);
+  vm.runInContext(customerTallySource(), context);
   vm.runInContext(htmlSource.slice(start, end), context);
 
   vm.runInContext(`
@@ -104,6 +116,7 @@ test('mergeBaselineCustomer never lowers an existing customer to a negative spen
       return DB.customers.find(x => normalizeName(x.name) === normalizeName(c.name)) || null;
     }
   `, context);
+  vm.runInContext(customerTallySource(), context);
   vm.runInContext(htmlSource.slice(start, end), context);
 
   vm.runInContext(`

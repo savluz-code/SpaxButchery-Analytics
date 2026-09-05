@@ -1101,7 +1101,7 @@ async function loadFromCloud() {
       reconcileNewFlags();
       const cloudFixed = repairDates();
       if(cloudFixed > 0) console.log('Cloud sync repair: fixed', cloudFixed, 'customers');
-      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
+      persistDB();
       // Merchant exclusion is non-negotiable: if the cloud sheet still carries
       // Simon Musyoka (the Merchant), scrub him from the merged data now.
       purgeMerchantData();
@@ -1231,10 +1231,24 @@ async function performSaveToCloud() {
     // One-shot fallback. A payload this size needs minutes on a weak link —
     // give it CLOUD_TIMEOUT_BIG_SAVE, not the default 30s that aborted
     // (and kept aborting, server-side write still running) every big day.
-    const result = await post(
-      { action: 'saveAll', ...payload },
-      totalBigRows > CHUNK_ROWS ? CLOUD_TIMEOUT_BIG_SAVE : CLOUD_TIMEOUT_DEFAULT
-    );
+    const saveAllBody = { action: 'saveAll', ...payload };
+    const saveAllTimeout = totalBigRows > CHUNK_ROWS ? CLOUD_TIMEOUT_BIG_SAVE : CLOUD_TIMEOUT_DEFAULT;
+    let result;
+    try {
+      result = await post(saveAllBody, saveAllTimeout);
+    } catch (err) {
+      // A transient mobile drop surfaces as "Failed to fetch". saveAll is
+      // atomic on the backend (stage → swap), so one retry of the WHOLE request
+      // can never land on a truncated sheet — it just re-sends the same body.
+      // Never retry timeouts (they already burned their full budget) or a
+      // body/HTTP rejection (retrying wastes another round-trip).
+      if (isTransientNetworkError(err) && !err._spaxRetried) {
+        try { err._spaxRetried = true; result = await post(saveAllBody, saveAllTimeout); }
+        catch (err2) { err2._spaxRetried = true; throw err2; }
+      } else {
+        throw err;
+      }
+    }
     if (result.success) {
       lastSyncTime = new Date();
       showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
@@ -1317,6 +1331,17 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
 // error; it is the signal to fall back to the one-shot saveAll.
 function isUnknownActionError(err) {
   return /unknown action/i.test(String((err && err.message) || err));
+}
+
+// True only for a genuine, RE-usable network failure ("Failed to fetch",
+// DNS/connection drop). Not for timeouts (those already burned their full
+// budget) and not for HTTP/body rejections (a retry just repeats the same
+// problem). Used to retry the one-shot saveAll exactly once.
+function isTransientNetworkError(err) {
+  if (err && err.name === 'AbortError') return false;
+  const msg = String((err && err.message) || err);
+  if (/timed out|timeout/i.test(msg)) return false;
+  return /failed to fetch|network error|load failed|typeerror|connection|net::/i.test(msg);
 }
 
 function showSyncStatus(msg) {
@@ -3204,7 +3229,7 @@ function load(){
     if (reconcileNewFlags() > 0) needsSave = true;
     // Persist migration fixes to localStorage
     if(needsSave){
-      localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
+      persistDB();
     }
 
     // MERCHANT CLEANUP: scrub any Simon Musyoka (the Merchant) records that a
@@ -3223,14 +3248,14 @@ function load(){
       // whose rows were previously lost can re-book them instead of skipping
       // them as "already imported".
       const healed = healOrphanedSeenKeys();
-      if (healed > 0) localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
+      if (healed > 0) persistDB();
       const fixed = repairDates();
       if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
       return cloudLoaded;
     }).catch(() => {
       refreshAll();
       const healed = healOrphanedSeenKeys();
-      if (healed > 0) localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
+      if (healed > 0) persistDB();
       const fixed = repairDates();
       if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
     });
@@ -3242,11 +3267,78 @@ function load(){
     return Promise.resolve();
   }
 }function save(){
-  localStorage.setItem('spaxDB_v23',JSON.stringify(DB));
+  // A full localStorage must NEVER block a save. persistDB() compacts the DB
+  // when it won't fit and reports whether a durable copy was written, but the
+  // cloud sync and the UI refresh always run — otherwise a (previously thrown)
+  // QuotaExceededError stopped auto-sync exactly when imports were growing the
+  // database, and left the Contact Resolver red-ringing with
+  // "exceeded the quota" (save() threw before its own saveToCloud() ran).
+  const persisted = persistDB();
+  if (persisted) {
+    DB_persistFailed = false;
+    DB_persistWarned = false;
+  } else if (!DB_persistWarned) {
+    DB_persistWarned = true;
+    showSyncStatus('⚠️ Local storage is full — data is safe in memory & the cloud. Free storage or reduce imports to save locally.');
+    if (typeof toast === 'function') toast('⚠️ Local storage full — data kept in memory & cloud only');
+  }
   if (SYNC_MODE === 'auto') {
     saveToCloud();
   }
   refreshAll();
+}
+
+// ── QUOTA-SAFE LOCAL PERSISTENCE ──
+// A single localStorage key holds ~5 MB. A big import day (23k+ rows) easily
+// blows that, and an unguarded setItem then throws QuotaExceededError. Before
+// this helper that error bubbled out of save(), so every caller (Resolve,
+// Apply, dedupe, imports, contact-edit save…) crashed and cloud sync got
+// skipped at the worst moment. persistDB() swallows the failure, drops what is
+// safe to drop (seen-keys with no backing transaction, and history-only
+// backfill rows), retries once, and reports whether it got a durable copy
+// down. Cloud sync is deliberately OUTSIDE this helper — it must run even when
+// local is full.
+let DB_persistFailed = false;
+let DB_persistWarned = false;
+let DB_persistCompacted = false;
+function persistDB(){
+  // Serialize ONCE, then try to write. If we already compacted this session
+  // and it still won't fit, skip the expensive re-compaction + re-serialize on
+  // every subsequent save — just record the failure (the next successful write
+  // resets DB_persistCompacted so a future overflow re-compacts).
+  let payload;
+  try { payload = JSON.stringify(DB); }
+  catch (_) { DB_persistFailed = true; return false; }
+  try {
+    localStorage.setItem('spaxDB_v23', payload);
+    DB_persistFailed = false;
+    DB_persistCompacted = false;
+    return true;
+  } catch (err) {
+    if (!DB_persistCompacted) {
+      DB_persistCompacted = true;
+      try {
+        // 1) Seen-keys with no backing transaction are pure waste — the dedup
+        //    map is rebuilt from DB.transactions on load, so a re-import of a
+        //    previously-lost statement can book its rows again.
+        healOrphanedSeenKeys();
+        // 2) History-only backfill rows are retained per-customer in customerTx;
+        //    drop their global copies so a big DB can fit again. Any revenue /
+        //    visit aggregates are untouched.
+        if (Array.isArray(DB.transactions)) {
+          DB.transactions = DB.transactions.filter(t => !t.backfillOnly);
+        }
+        payload = JSON.stringify(DB);
+        localStorage.setItem('spaxDB_v23', payload);
+        DB_persistFailed = false;
+        return true;
+      } catch (_) {}
+    }
+    // Still over quota — the live DB stays in memory and reaches the cloud on
+    // the next auto-save, so this device's session loses nothing.
+    DB_persistFailed = true;
+    return false;
+  }
 }
 const saveDB = save;
 const renderAll = refreshAll;
@@ -7352,7 +7444,7 @@ function resetLocalData(){
 
   localStorage.removeItem('spaxDB_v23');
   DB = seedDB();
-  localStorage.setItem('spaxDB_v23', JSON.stringify(DB));
+  persistDB();
   refreshAll();
 
   // A local reset must never silently overwrite a recoverable cloud copy.
@@ -7372,6 +7464,7 @@ function updateSyncDetails(){
     <b>Local Transactions:</b> ${(DB.transactions || []).length.toLocaleString()}<br>
     <b>Imported Revenue:</b> KSh ${(DB.importedRev || 0).toLocaleString()}<br>
     <b>Contacts Resolved:</b> ${DB.resolved || 0}<br>
+    <b>Local Storage:</b> ${typeof DB_persistFailed !== 'undefined' && DB_persistFailed ? '<span style="color:var(--amber)">⚠️ Full — data is in memory &amp; cloud only</span>' : '<span style="color:var(--green)">OK</span>'}<br>
     <b>GAS URL:</b> ${GAS_URL.includes('YOUR_SCRIPT') ? '<span style="color:var(--red)">Not configured</span>' : '<span style="color:var(--green)">Connected</span>'}
   `;
 }

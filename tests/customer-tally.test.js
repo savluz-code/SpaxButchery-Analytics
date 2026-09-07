@@ -388,7 +388,7 @@ test('seedDB stamps the report date, and the service worker cache was bumped', (
   const seed = slice('function seedDB(){', 'function load(){');
   assert.match(seed, /seedLastVisit:\s*\(lastVisit && days < 999\) \? _addDays\(lastVisit, days\) : lastVisit/);
   const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
-  assert.match(sw, /const CACHE_NAME = 'spax-v14';/);
+  assert.match(sw, /const CACHE_NAME = 'spax-v15';/);
 });
 
 test('every mutation path re-derives the totals instead of hand-adjusting them', () => {
@@ -414,7 +414,10 @@ test('every mutation path re-derives the totals instead of hand-adjusting them',
 
   const rebuildHandler = slice('async function handleRebuild(input){', 'function recalcFromHistory(){');
   assert.match(rebuildHandler, /DB\.monthly = JSON\.parse\(JSON\.stringify\(SEED_MONTHLY\)\)/, 'rebuild must restart the monthly chart from the seed months');
-  assert.match(rebuildHandler, /dailyLedgers/);
+  // The daily ledgers are folded back in by reconcileRevenueLedgers() (REVENUE
+  // LEDGERS) rather than re-added by hand here, so a rebuild can neither drop
+  // them nor credit them twice.
+  assert.match(rebuildHandler, /DB\.importedRev = 0/, 'rebuild must reset importedRev before re-deriving');
 
   const rebuild = slice('function recalcFromHistory(){', '/* ══════════ IMPORT MODAL HELPERS');
   assert.match(rebuild, /reconcileCustomerAggregates\(c, txs\)/);

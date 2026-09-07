@@ -16,8 +16,18 @@
 // Fix: every customer carries an explicit BASELINE (seedSpent / seedVisits /
 // seedLastVisit) and the totals are DERIVED:
 //
-//   spent  = max(baseline.spent,  Σ rows dated ≤ baseline.lastVisit) + Σ rows after
-//   visits = max(baseline.visits, count(rows ≤ cutoff))              + count(rows after)
+//   spent  = baseline.spent  + Σ rows dated after baseline.lastVisit
+//   visits = baseline.visits + count(rows after cutoff)
+//
+// PR #47 first shipped this with two mistakes that DOUBLED the header revenue
+// (KES 4,075K): (a) a seed customer's cut-off was their own Last Visit rather
+// than the REPORT date (Last Visit + Days Since — one date for the whole
+// export: 2026-06-24, and 2026-07-12 for the later export), so statement rows
+// dated between their last purchase and the report date were booked on top
+// of a total that already included them; (b) inside the period the formula
+// took max(baseline, Σ rows), so duplicate rows raised the total further. The
+// baseline is now authoritative for its period and the cut-off is the report
+// date for every seed row.
 //
 // These tests run the REAL functions from index.html inside a vm sandbox.
 
@@ -38,21 +48,23 @@ function slice(startMarker, endMarker) {
   return htmlSource.slice(start, end);
 }
 
-// Three seed rows exactly as they appear in SEED_CUSTOMERS (name, contact,
-// spent, visits, days, firstVisit, lastVisit).
+// Five seed rows exactly as they appear in SEED_CUSTOMERS (name, contact,
+// spent, visits, days, firstVisit, lastVisit). Last Visit + Days Since is
+// 2026-06-24 for every row — the date the report was generated.
 const SEED_ROWS = [
   ['George Owiti', '0710428075', 600, 2, 23, '2026-06-01', '2026-06-01'],
   ['Diana Muli Musili', '0113***835', 150, 1, 155, '2026-01-20', '2026-01-20'],
   ['Eunice Mbithe Ndelesi', '0723***680', 100, 1, 325, '2025-08-03', '2025-08-03'],
   // Same-name pair (the report has 41 of these) — must not double count.
-  ['Tobias Odipo', '0720208056', 2900, 7, 40, '2025-07-01', '2026-06-20'],
-  ['Tobias Odipo', '0720964081', 500, 1, 90, '2026-05-01', '2026-05-01']
+  ['Tobias Odipo', '0720208056', 2900, 7, 4, '2025-07-01', '2026-06-20'],
+  ['Tobias Odipo', '0720964081', 500, 1, 54, '2026-05-01', '2026-05-01']
 ];
+const REPORT_DATE = '2026-06-24';
 
-function makeContext(today = '2026-09-05') {
-  const ctx = vm.createContext({ console, Date, Math, Number, String, Map, Set, Object, Array, JSON, isFinite });
+function makeContext(today = '2026-09-05', seedRows = SEED_ROWS) {
+  const ctx = vm.createContext({ console, Date, Math, Number, String, Map, Set, Object, Array, JSON, isFinite, isNaN });
   vm.runInContext(`
-    const SEED_CUSTOMERS = ${JSON.stringify(SEED_ROWS)};
+    const SEED_CUSTOMERS = ${JSON.stringify(seedRows)};
     function getTodayEAT(){ return ${JSON.stringify(today)}; }
     function stripTime(d){ if(d===null||d===undefined||d==='') return ''; const m=String(d).match(/(\\d{4}-\\d{2}-\\d{2})/); return m?m[1]:''; }
     function normalizeSeenDates(){ return 0; }
@@ -66,6 +78,8 @@ function makeContext(today = '2026-09-05') {
   return ctx;
 }
 
+// A seed record exactly as the MERGED build (PR #47) wrote it: the cut-off is
+// the customer's own Last Visit. ensureBaselineFields must re-stamp it.
 function seedCustomer(ctx, row) {
   const c = {
     name: row[0], contact: row[1], spent: row[2], visits: row[3], days: row[4],
@@ -77,10 +91,65 @@ function seedCustomer(ctx, row) {
 }
 
 function history(ctx, name, rows) {
-  ctx.DB.customerTx[name] = rows.map(([date, amount]) => ({ date, amount, product: amount <= 50 && date >= '2026-06-01' ? 'soup' : 'meat', receipt: 'R' + date + amount }));
+  // An explicit receipt (even '') is kept as given; otherwise a unique one is
+  // generated so the receipt dedupe in repairDates never touches these rows.
+  ctx.DB.customerTx[name] = rows.map(([date, amount, receipt], i) => ({ date, amount, product: amount <= 50 && date >= '2026-06-01' ? 'soup' : 'meat', receipt: receipt !== undefined ? receipt : ('R' + date.replace(/-/g, '') + amount + 'N' + i) }));
 }
 
 const SEP = (amt) => [['2026-09-01', amt], ['2026-09-02', amt], ['2026-09-03', amt]];
+
+test('the report date is one cut-off for every seed row (Last Visit + Days Since)', () => {
+  const ctx = makeContext();
+  assert.equal(ctx._addDays('2026-06-01', 23), REPORT_DATE);
+  assert.equal(ctx._addDays('2025-08-03', 325), REPORT_DATE);
+  assert.equal(ctx._addDays('2026-01-31', 1), '2026-02-01');
+  assert.equal(ctx._addDays('not-a-date', 3), '');
+  assert.equal(ctx.seedReportCutoff(), REPORT_DATE);
+  // Every row carries the report date, not its own Last Visit.
+  for (const row of SEED_ROWS) {
+    const r = ctx.seedBaselineFor(row[0], row[1]);
+    assert.equal(r.asOf, REPORT_DATE, `${row[0]} asOf`);
+    assert.equal(r.lastVisit, row[6]);
+  }
+});
+
+test('a later export moves the cut-off for the whole report, and 999-day rows fall back to their Last Visit', () => {
+  const rows = [
+    ['Early Customer', '0711111111', 1000, 4, 23, '2026-01-01', '2026-06-01'],  // 2026-06-24
+    ['Late Customer', '0722222222', 2000, 8, 0, '2026-01-01', '2026-07-12'],    // 2026-07-12 (later export)
+    ['Unknown Days', '0733333333', 300, 1, 999, '', '2026-03-03']
+  ];
+  const ctx = makeContext('2026-09-05', rows);
+  assert.equal(ctx.seedReportCutoff(), '2026-07-12');
+  assert.equal(ctx.seedBaselineFor('Early Customer', '0711111111').asOf, '2026-07-12');
+  assert.equal(ctx.seedBaselineFor('Unknown Days', '0733333333').asOf, '2026-07-12');
+});
+
+test('a record the merged build stamped with its own Last Visit is moved to the report date', () => {
+  const ctx = makeContext();
+  const george = seedCustomer(ctx, SEED_ROWS[0]);
+  assert.equal(george.seedLastVisit, '2026-06-01');
+  assert.equal(ctx.ensureBaselineFields(george), true);
+  assert.equal(george.seedLastVisit, REPORT_DATE);
+  assert.equal(george.seedSpent, 600);
+  assert.equal(george.seedVisits, 2);
+  // Idempotent.
+  assert.equal(ctx.ensureBaselineFields(george), false);
+
+  // A record without any cut-off gets the report date too.
+  const diana = seedCustomer(ctx, SEED_ROWS[1]);
+  diana.seedLastVisit = '';
+  ctx.ensureBaselineFields(diana);
+  assert.equal(diana.seedLastVisit, REPORT_DATE);
+
+  // A newer export aggregate has superseded the report figures (bigger
+  // baseline as of its own date): that cut-off is kept.
+  const eunice = seedCustomer(ctx, SEED_ROWS[2]);
+  Object.assign(eunice, { seedSpent: 900, seedVisits: 5, seedLastVisit: '2026-06-10' });
+  ctx.ensureBaselineFields(eunice);
+  assert.equal(eunice.seedLastVisit, '2026-06-10');
+  assert.equal(eunice.seedSpent, 900);
+});
 
 test('the three customers from the screenshots come back into tally with their history', () => {
   const ctx = makeContext();
@@ -102,21 +171,37 @@ test('the three customers from the screenshots come back into tally with their h
   const fixed = ctx.repairDates();
   assert.ok(fixed >= 3, 'repairDates must report the three repaired customers');
 
-  // Card == what the history lists (all rows are itemised, and they exceed the
-  // report baseline in each period, so the sum of the list is the total).
-  assert.equal(eunice.spent, 520); assert.equal(eunice.visits, 7);
-  assert.equal(diana.spent, 840); assert.equal(diana.visits, 7);
-  assert.equal(george.spent, 2100); assert.equal(george.visits, 7);
+  // Card = report baseline (authoritative for everything up to 2026-06-24)
+  // + this month's rows. The backfilled April/July/December rows are already
+  // part of the report total and are NOT added again.
+  assert.equal(eunice.spent, 100 + 120); assert.equal(eunice.visits, 1 + 3);
+  assert.equal(diana.spent, 150 + 240); assert.equal(diana.visits, 1 + 3);
+  assert.equal(george.spent, 1500); assert.equal(george.visits, 5);
+
+  // The modal footer reconciles the list to the card:
+  //   Listed above 7 tx · KES 2,100
+  //   + Earlier purchases up to 2026-06-24 (not itemised)   0 (all itemised — and then some)
+  //   − Already in the report total (up to 2026-06-24)      2 visits · KES 600
+  //   = Total 5 visits · KES 1,500
+  const t = ctx.customerTally(george);
+  const listed = ctx.customerHistoryFor(george);
+  assert.equal(listed.length, 7);
+  assert.equal(listed.reduce((s, r) => s + r.amount, 0), 2100);
+  assert.equal(t.unitemised.spent, 0); assert.equal(t.unitemised.visits, 0);
+  assert.equal(t.excess.spent, 600); assert.equal(t.excess.visits, 2);
+  assert.equal(t.base.lastVisit, REPORT_DATE);
+  assert.equal(listed.reduce((s, r) => s + r.amount, 0) + t.unitemised.spent - t.excess.spent, george.spent);
+  assert.equal(listed.length + t.unitemised.visits - t.excess.visits, george.visits);
 
   // Idempotent — a second pass changes nothing.
   assert.equal(ctx.repairDates(), 0);
-  assert.equal(eunice.spent, 520);
-  assert.equal(george.visits, 7);
+  assert.equal(eunice.spent, 220);
+  assert.equal(george.visits, 5);
 });
 
-test('rows dated inside the baseline period are absorbed by the baseline, rows after it are added on top', () => {
+test('the baseline is authoritative for its period: rows up to the report date never move the total, rows after it are added on top', () => {
   const ctx = makeContext();
-  // Report says KES 600 over 2 visits up to 2026-06-01.
+  // Report (generated 2026-06-24) says KES 600 over 2 visits.
   const george = seedCustomer(ctx, SEED_ROWS[0]);
 
   // Backfilling ONE of the two report-period purchases must not change the total.
@@ -131,11 +216,30 @@ test('rows dated inside the baseline period are absorbed by the baseline, rows a
   assert.equal(george.spent, 600);
   assert.equal(george.visits, 2);
 
-  // A backfilled statement that reveals MORE than the report knew inside the
-  // period wins (the history is the more complete record).
+  // A statement row dated between his last purchase (2026-06-01) and the
+  // report date (2026-06-24) is ALREADY in the report total — this is the row
+  // the merged build double counted (its cut-off was his own Last Visit).
+  history(ctx, 'George Owiti', [['2026-05-20', 300], ['2026-06-01', 300], ['2026-06-15', 300]]);
+  ctx.repairDates();
+  assert.equal(george.spent, 600);
+  assert.equal(george.visits, 2);
+  assert.equal(george.seedLastVisit, REPORT_DATE);
+
+  // More rows inside the period than the report recorded (a re-imported or
+  // duplicated statement) do not raise it either — the report is the
+  // authority for its own period.
   history(ctx, 'George Owiti', [['2026-05-20', 300], ['2026-06-01', 300], ['2026-05-01', 250]]);
   ctx.repairDates();
-  assert.equal(george.spent, 850);
+  assert.equal(george.spent, 600);
+  assert.equal(george.visits, 2);
+  assert.equal(ctx.customerTally(george).excess.spent, 250);
+  assert.equal(ctx.customerTally(george).excess.visits, 1);
+
+  // The report is dated 2026-06-24 for the seed rows in this fixture: the day
+  // after the cut-off is new business.
+  history(ctx, 'George Owiti', [['2026-06-24', 300], ['2026-06-25', 300]]);
+  ctx.repairDates();
+  assert.equal(george.spent, 900);
   assert.equal(george.visits, 3);
 
   // New business after the report cut-off is always ADDED — never swallowed
@@ -144,6 +248,48 @@ test('rows dated inside the baseline period are absorbed by the baseline, rows a
   ctx.repairDates();
   assert.equal(george.spent, 600 + 900);
   assert.equal(george.visits, 2 + 3);
+});
+
+test('a row dated 2026-07-01 leaves George at 600/2; a row dated 2026-07-13 makes him 900/3 under the later export', () => {
+  // The real report mixes the 2026-06-24 export with a later one generated
+  // 2026-07-12; one cut-off (the later one) applies to every row.
+  const rows = SEED_ROWS.concat([['Onyango Akinyi Edwina', '0720638326', 9960, 33, 0, '2025-07-14', '2026-07-12']]);
+  const ctx = makeContext('2026-09-05', rows);
+  assert.equal(ctx.seedReportCutoff(), '2026-07-12');
+  const george = seedCustomer(ctx, SEED_ROWS[0]);
+  history(ctx, 'George Owiti', [['2026-07-01', 300]]);
+  ctx.repairDates();
+  assert.equal(george.seedLastVisit, '2026-07-12');
+  assert.equal(george.spent, 600);
+  assert.equal(george.visits, 2);
+  history(ctx, 'George Owiti', [['2026-07-01', 300], ['2026-07-13', 300]]);
+  ctx.repairDates();
+  assert.equal(george.spent, 900);
+  assert.equal(george.visits, 3);
+});
+
+test('a phone whose history holds every report receipt twice comes back to exactly the report total plus post-report rows', () => {
+  const ctx = makeContext();
+  const george = seedCustomer(ctx, SEED_ROWS[0]);
+  // Two report-period receipts, each imported twice (older builds let a
+  // re-imported statement through), plus one September payment, also twice.
+  history(ctx, 'George Owiti', [
+    ['2026-05-20', 300, 'ABC12345678'], ['2026-05-20', 300, 'ABC12345678'],
+    ['2026-06-01', 300, 'ABC22345678'], ['2026-06-01', 300, 'abc-2234-5678'],
+    ['2026-09-01', 250, 'SEP00000001'], ['2026-09-01', 250, 'SEP00000001'],
+    // Rows without a usable receipt are never touched by the dedupe.
+    ['2026-09-02', 100, ''], ['2026-09-02', 100, ''], ['2026-09-03', 80, 'SHORT1']
+  ]);
+  const fixed = ctx.repairDates();
+  assert.ok(fixed >= 3, 'three duplicate receipts must be counted as repairs');
+  const hist = ctx.DB.customerTx['George Owiti'];
+  assert.equal(hist.length, 6);
+  assert.deepEqual(hist.map(r => r.receipt), ['ABC12345678', 'ABC22345678', 'SEP00000001', '', '', 'SHORT1']);
+  // Report total + the post-report rows (one copy each of the receipts).
+  assert.equal(george.spent, 600 + 250 + 100 + 100 + 80);
+  assert.equal(george.visits, 2 + 4);
+  // A second pass is a no-op.
+  assert.equal(ctx.repairDates(), 0);
 });
 
 test('two records sharing one exact name never count the same history twice', () => {
@@ -233,7 +379,16 @@ test('the modal renders card figures from the same tally it lists — with a rec
   assert.match(body, /customerHistoryFor\(c\)/, 'history must come from the owning record');
   assert.match(body, /Listed above/);
   assert.match(body, /not itemised/);
+  assert.match(body, /Already in the report total/);
+  assert.match(body, /tally\.excess/);
   assert.match(body, /= Total/);
+});
+
+test('seedDB stamps the report date, and the service worker cache was bumped', () => {
+  const seed = slice('function seedDB(){', 'function load(){');
+  assert.match(seed, /seedLastVisit:\s*\(lastVisit && days < 999\) \? _addDays\(lastVisit, days\) : lastVisit/);
+  const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
+  assert.match(sw, /const CACHE_NAME = 'spax-v14';/);
 });
 
 test('every mutation path re-derives the totals instead of hand-adjusting them', () => {
@@ -241,17 +396,25 @@ test('every mutation path re-derives the totals instead of hand-adjusting them',
   assert.doesNotMatch(importBody, /match\.spent\s*=\s*Math\.max\(0,\s*Number\(match\.spent/, 'import must not accumulate spent');
   assert.doesNotMatch(importBody, /match\.visits\s*=\s*Number\(match\.visits \|\| 0\) \+ 1/, 'import must not accumulate visits');
   assert.match(importBody, /reconcileCustomerAggregates\(cust\)/);
+  // The revenue delta is measured on the record that owns the history.
+  assert.match(importBody, /historyOwnerMap\(\)\.get\(cust\.name\) \|\| cust/);
 
   const backfillBody = slice('function backfillTransactions(txs){', 'async function handleBackfill(input){');
   assert.match(backfillBody, /reconcileCustomerAggregates\(c\)/, 'backfill must bring the card back in tally');
 
   const rollback = slice('function reconcileImportedRevenue(){', 'window.reconcileImportedRevenue');
   assert.doesNotMatch(rollback, /cust\.spent\s*=\s*Math\.max\(0,\s*\(Number\(cust\.spent/, 'rollback must not subtract by hand');
+  assert.doesNotMatch(rollback, /DB\.importedRev\s*=\s*Math\.max\(0,\s*\(Number\(DB\.importedRev \|\| 0\) - amount\)\)/, 'rollback must debit the drop in derived totals, not the raw duplicate sum');
+  assert.match(rollback, /rolledBack/);
   assert.match(rollback, /repairDates\(\)/);
 
   const dedupe = slice('function dedupeCustomers(){', 'window.dedupeCustomers');
   assert.match(dedupe, /mergeBaselineFields\(primary, o\)/);
   assert.doesNotMatch(dedupe, /primary\.spent\s*=\s*Math\.max/);
+
+  const rebuildHandler = slice('async function handleRebuild(input){', 'function recalcFromHistory(){');
+  assert.match(rebuildHandler, /DB\.monthly = JSON\.parse\(JSON\.stringify\(SEED_MONTHLY\)\)/, 'rebuild must restart the monthly chart from the seed months');
+  assert.match(rebuildHandler, /dailyLedgers/);
 
   const rebuild = slice('function recalcFromHistory(){', '/* ══════════ IMPORT MODAL HELPERS');
   assert.match(rebuild, /reconcileCustomerAggregates\(c, txs\)/);

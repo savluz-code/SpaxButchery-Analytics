@@ -4015,23 +4015,73 @@ function customerTally(c, hist){
     visits: Math.max(0, Number(c.seedVisits) || 0),
     lastVisit: _dateOnly(c.seedLastVisit) || (c.isSeed ? seedReportCutoff() : '')
   };
+  // Date that separates "already reported" from "new business". Normally the
+  // record's own baseline cut-off; for a record with NO baseline (one an import
+  // created) it is the report cut-off, because the report is complete for its
+  // own period whichever record ends up holding the row.
+  const hasBaseline = base.spent > 0 || base.visits > 0;
+  const splitAt = base.lastVisit || (hasBaseline ? '' : seedReportCutoff());
   let inSpent = 0, inCount = 0, afterSpent = 0, afterCount = 0;
+  // Undated rows are a sub-set of "inside" (see below) but tracked separately:
+  // against a baseline they must not inflate, yet on a record that has no
+  // baseline at all they are the only total the customer has.
+  let undSpent = 0, undCount = 0;
   rows.forEach(t => {
     const a = Math.max(0, Number(t.amount) || 0);
     const d = _dateOnly(t.date);
     // Undated rows, or an unknown cut-off, count as "inside" (conservative —
     // can only ever avoid double counting, never inflate).
-    if (!base.lastVisit || !d || d <= base.lastVisit) { inSpent += a; inCount++; }
+    if (!splitAt || !d || d <= splitAt) {
+      inSpent += a; inCount++;
+      if (!d) { undSpent += a; undCount++; }
+    }
     else { afterSpent += a; afterCount++; }
   });
   let spent, visits;
-  const hasBaseline = base.spent > 0 || base.visits > 0;
   if (!rows.length && !hasBaseline) { spent = _round2(Math.max(0, Number(c.spent) || 0)); visits = Math.max(0, Number(c.visits) || 0); }
   // The baseline is AUTHORITATIVE for its period: the report / export total
   // already includes every purchase up to its cut-off, so rows dated inside
   // that period (backfilled statements, re-imports, duplicate receipts) can
   // never raise it. Only rows dated after the cut-off add to the total.
   else if (hasBaseline) { spent = _round2(base.spent + afterSpent); visits = base.visits + afterCount; }
+  // No baseline at all — a record an import CREATED. The report is complete
+  // for its own period (Σ seed spent === REPORT.totalRevenue, Σ seed visits
+  // === REPORT.totalTxns), so every shilling taken up to the report cut-off is
+  // already inside that figure, whichever record ends up holding the row.
+  //
+  // A statement writes names differently from the analytics report (initials,
+  // UPPERCASE, a missing middle name) and may pay from a second phone, so
+  // findCustomerMatch legitimately misses and a NEW record is created. Counting
+  // that record's in-period rows charges the same money twice: once inside the
+  // report total, once on the new card. That is what pushed the header to
+  // ~2.8x (2,215 customers / KES 3.5M against a 1,669 / 1.25M report).
+  //
+  // So rows dated on or before the report cut-off are treated as already
+  // reported, exactly as they are for a seed customer, and only genuinely new
+  // business — dated after the cut-off — counts. `splitAt` has already put
+  // every in-period row in `inSpent`, so that is simply what came after.
+  // `reportedInPeriod` records what was suppressed so the modal can explain
+  // the card.
+  else if (splitAt) {
+    // Undated rows carry no evidence of belonging to the reported period, so
+    // they keep counting; only rows explicitly dated inside it are suppressed.
+    spent = _round2(afterSpent + undSpent); visits = afterCount + undCount;
+    const supprSpent = _round2(inSpent - undSpent), supprCount = inCount - undCount;
+    if (supprCount > 0) {
+      return {
+        spent, visits, base,
+        inside: { spent: _round2(inSpent), count: inCount },
+        after: { spent: _round2(afterSpent), count: afterCount },
+        unitemised: { spent: 0, visits: 0 },
+        excess: { spent: 0, visits: 0 },
+        // Listed rows the original report already counted under some other
+        // record — shown in the modal so the card still reconciles to the list.
+        reportedInPeriod: { spent: supprSpent, visits: supprCount, cutoff: splitAt }
+      };
+    }
+  }
+  // No baseline and no report cut-off to compare against (e.g. a build with no
+  // seed report): the total is the plain sum of the history, as it always was.
   else { spent = _round2(inSpent + afterSpent); visits = inCount + afterCount; }
   return {
     spent, visits, base,
@@ -4042,7 +4092,9 @@ function customerTally(c, hist){
     // Listed rows inside the baseline period beyond what the baseline records
     // (duplicates / rows the report already counted) — shown so the listed
     // rows still reconcile to the card, never added to the total.
-    excess: { spent: _round2(Math.max(0, inSpent - base.spent)), visits: Math.max(0, inCount - base.visits) }
+    excess: { spent: _round2(Math.max(0, inSpent - base.spent)), visits: Math.max(0, inCount - base.visits) },
+    // Only set for baseline-less records whose rows predate the report cut-off.
+    reportedInPeriod: { spent: 0, visits: 0, cutoff: '' }
   };
 }
 // Writes the derived totals back onto the record. Idempotent. Returns true when
@@ -7951,6 +8003,16 @@ function showCustomerDetail(name){
     tallyNote += '<div style="display:flex;justify-content:space-between;padding:6px 10px;font-size:.78rem;color:var(--muted);" title="Listed rows dated inside the report / export period that its total already includes (e.g. a re-imported statement or a duplicate receipt). They are shown for reference but never counted twice.">' +
       '<span>− Already in the report total' + (asOf ? ' (up to ' + asOf + ')' : '') + '</span><span>' + ex.visits + ' visit' + (ex.visits===1?'':'s') + ' · ' + kes(ex.spent) + '</span></div>';
   }
+  // This record was created by an import (it carries no baseline of its own),
+  // but some of its rows are dated inside the original report period. That
+  // money is already counted in the report total under the name the report
+  // used, so it is listed here and never added again.
+  const rip = tally.reportedInPeriod || { spent: 0, visits: 0, cutoff: '' };
+  if(rip.spent > 0 || rip.visits > 0){
+    tallyNote += '<div style="display:flex;justify-content:space-between;padding:6px 10px;font-size:.78rem;color:var(--muted);" title="Listed rows dated on or before the original report cut-off. The report total already includes this money under the name the report used for this customer (statements often spell names differently or use a second phone number), so it is shown here but never counted twice.">' +
+      '<span>− Already in the report total' + (rip.cutoff ? ' (up to ' + rip.cutoff + ')' : '') + '</span><span>' + rip.visits + ' visit' + (rip.visits===1?'':'s') + ' · ' + kes(rip.spent) + '</span></div>';
+  }
+
   if(tallyNote){
     tallyNote += '<div style="display:flex;justify-content:space-between;padding:8px 10px;font-size:.82rem;font-weight:600;border-top:1px solid var(--border);">' +
       '<span>= Total</span><span>' + c.visits + ' visit' + (c.visits===1?'':'s') + ' · ' + kes(c.spent) + '</span></div>';

@@ -1,5 +1,5 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.0  (2026-09-03)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.1  (2026-09-05)
  * ─────────────────────────────────────────────────────────────────
  * MOBILE: can't edit script.google.com on your phone? Open
  *   https://savluz-code.github.io/SpaxButchery-Analytics/code.html
@@ -18,7 +18,9 @@
  * Paste the /exec URL into index.html as GAS_URL.
  *
  * ALREADY DEPLOYED? Re-deploy this version (Deploy → Manage deployments →
- * ✏️ edit → Version: New version → Deploy). v3.0 completes the chunked save
+ * ✏️ edit → Version: New version → Deploy). v3.1 adds the seedLastVisit
+ * customer column (baseline cut-off for the derived spent/visits tally; a
+ * v3.0 sheet keeps working — the client re-stamps it locally). v3.0 completed the chunked save
  * protocol the client has spoken since PR #41: large saves stop dying at the
  * client's one-shot timeout and no aborted save can truncate a live sheet
  * anymore. Clients that only know saveAll keep working unchanged.
@@ -50,6 +52,11 @@ var TABLE_HEADERS = {
   customers: [
     'name', 'contact', 'spent', 'visits', 'days',
     'firstVisit', 'lastVisit', 'masked', 'isNew', 'isSeed', 'seedSpent', 'seedVisits',
+    // seedLastVisit = the date the customer's baseline (report row / export
+    // aggregate) runs up to. The client derives spent/visits as
+    // max(baseline, history up to that date) + history after it, so this
+    // cut-off must survive the round-trip or totals would drift after a sync.
+    'seedLastVisit',
     // newBatch = the import batch that first created this customer. isNew is
     // an internal bookkeeping flag derived from it (newBatch ===
     // settings.importBatch) — it must survive the cloud round-trip because
@@ -153,6 +160,11 @@ function loadAll_() {
     c.seedVisits = Number(c.seedVisits) || 0;
     c.firstVisit = dateOnly_(c.firstVisit);
     c.lastVisit = dateOnly_(c.lastVisit);
+    // Legacy sheets have no seedLastVisit column: leave the field absent so
+    // the client stamps the baseline itself instead of reading an empty
+    // cut-off as "no baseline".
+    if (c.seedLastVisit === undefined || c.seedLastVisit === null || c.seedLastVisit === '') delete c.seedLastVisit;
+    else c.seedLastVisit = dateOnly_(c.seedLastVisit);
   });
 
   var monthlyRows = rowsToObjects_(ss.getSheetByName(SHEETS.monthly));

@@ -45,7 +45,7 @@ function makeElement(id) {
   return el;
 }
 
-function bootApp({ localStorageSeed = {} } = {}) {
+function bootApp({ localStorageSeed = {}, cloud = null } = {}) {
   const els = new Map();
   const store = new Map(Object.entries(localStorageSeed));
   const localStorage = {
@@ -70,7 +70,16 @@ function bootApp({ localStorageSeed = {} } = {}) {
     document, localStorage,
     navigator: { serviceWorker: { register: () => Promise.resolve({ pushManager: { getSubscription: () => Promise.resolve({}) } }) }, clipboard: {}, onLine: true, userAgent: 'node' },
     location: { href: 'http://localhost/', search: '', hostname: 'localhost', reload() {} },
-    fetch: async () => { throw new Error('offline'); },
+    // Offline by default. When `cloud` is supplied it stands in for the Google
+    // Sheet: loads return it, saves are accepted and discarded.
+    fetch: async (url, opts) => {
+      if (!cloud) throw new Error('offline');
+      const body = opts && opts.body ? String(opts.body) : '';
+      const payload = (/"action"\s*:\s*"save/.test(body) || /action=save/.test(String(url)))
+        ? { success: true }
+        : { success: true, ...cloud };
+      return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) };
+    },
     setTimeout, clearTimeout, setInterval, clearInterval, URL, Blob, AbortController, TextEncoder, TextDecoder,
     confirm: () => false, alert() {}, prompt: () => null, open() { return null; },
     Chart, Papa: { parse: () => ({ data: [] }) }, XLSX: {}, pdfjsLib: { GlobalWorkerOptions: {} }, Tesseract: {},
@@ -260,11 +269,16 @@ test('rollback debits importedRev and the monthly chart by the drop in derived t
   // rollback removes exactly one history copy each).
   ctx.DB.transactions.forEach(t => { if (t.receipt === 'UGA1ABCDEF1' || t.receipt === 'UGC1ABCDEF1') { const d = { ...t, importedAt: 'dup' }; ctx.DB.transactions.push(d); ctx.DB.customerTx['George Owiti'].push({ date: d.date, amount: d.amount, product: d.product, receipt: d.receipt, importedAt: 'dup' }); } });
   // Pretend the duplicates had been booked as the merged build would have
-  // (600 raw); the derived total only moved by 300 for the after-period row.
+  // (600 raw). The ledgers are DERIVED (REVENUE LEDGERS), so repairDates()
+  // simply corrects this hand-written inflation back to the truth — this is
+  // the leak PR #48 left open: it fixed the cards but never re-derived the
+  // money, so an inflated importedRev / monthly chart survived forever.
   ctx.DB.importedRev = imp1 + 300;
   const i8 = ctx.DB.monthly.labels.indexOf('2026-08'); ctx.DB.monthly.revenue[i8] += 300;
   ctx.repairDates();
   assert.equal(george.spent, 900, 'duplicate receipts are dropped from the history by repairDates');
+  assert.equal(ctx.DB.importedRev, imp1, 'the injected inflation is re-derived away');
+  assert.equal(monthOf(ctx, '2026-08'), aug1, 'so is the inflated August bucket');
 
   const res = ctx.reconcileImportedRevenue();
   assert.equal(res.removed, 2);
@@ -275,8 +289,8 @@ test('rollback debits importedRev and the monthly chart by the drop in derived t
   // drop when the transaction copies went, so nothing is debited: the raw 600
   // must NOT have been subtracted.
   assert.equal(res.rolledBack, 0);
-  assert.equal(ctx.DB.importedRev, imp1 + 300);
-  assert.equal(monthOf(ctx, '2026-08'), aug1 + 300);
+  assert.equal(ctx.DB.importedRev, imp1);
+  assert.equal(monthOf(ctx, '2026-08'), aug1);
   assert.equal(monthOf(ctx, '2026-07'), jul1);
 });
 
@@ -387,4 +401,162 @@ test('a dated customer-export aggregate newer than the report supersedes the bas
   // A row inside the new period is absorbed, one after it is added.
   ctx2.importTransactions([row('George Owiti', '0710428075', '2026-08-01', 300, 'UGF1ABCDEF1'), row('George Owiti', '0710428075', '2026-08-11', 300, 'UGG1ABCDEF1')]);
   assert.equal(g2.spent, 1500); assert.equal(g2.visits, 5);
+});
+
+/* ══════════ REVENUE LEDGERS — the leak PR #48 left open ══════════
+   PR #47 doubled the headline revenue. PR #48 fixed the customer tally, so
+   Σ spent came back to 1,250,341 — but importedRev, importedTx and the monthly
+   chart were STORED RUNNING COUNTERS that #47 had also inflated and nothing
+   ever re-derived. The header healed; the Overview chart, Settings' "Imported
+   Revenue" and the AI summary (REPORT.totalRevenue + importedRev) stayed
+   double. These tests pin the ledgers as derived quantities. */
+
+const SEED_MONTHLY_TOTAL = 1353769;
+
+test('a database PR #47 inflated heals its MONEY too, not just the customer cards', async () => {
+  const fresh = await bootLoaded();
+  const persisted = JSON.parse(JSON.stringify(fresh.DB));
+  // Exactly what the merged #47 build wrote: statement rows dated between each
+  // customer's own last purchase and the report date were booked on top of a
+  // baseline that already contained them, and that inflated delta went into
+  // importedRev / the monthly buckets as well.
+  const victims = persisted.customers.filter(c => c.contact && !c.masked).slice(0, 50);
+  let injected = 0;
+  victims.forEach((c, i) => {
+    c.seedLastVisit = c.lastVisit;             // #47's per-customer cut-off
+    c.spent = (Number(c.spent) || 0) + 800;    // double-booked
+    c.visits = (Number(c.visits) || 0) + 2;
+    persisted.customerTx[c.name] = (persisted.customerTx[c.name] || []).concat([
+      { date: '2026-06-10', amount: 400, product: 'meat', receipt: 'INF' + String(i).padStart(8, '0'), importedAt: 'x' },
+      { date: '2026-07-03', amount: 400, product: 'meat', receipt: 'ING' + String(i).padStart(8, '0'), importedAt: 'x' }
+    ]);
+    injected += 800;
+  });
+  persisted.importedRev = injected;
+  persisted.importedTx = victims.length * 2;
+  const jun = persisted.monthly.labels.indexOf('2026-06');
+  const jul = persisted.monthly.labels.indexOf('2026-07');
+  persisted.monthly.revenue[jun] += injected / 2;
+  persisted.monthly.revenue[jul] += injected / 2;
+
+  const ctx = await bootLoaded({ localStorageSeed: { spaxDB_v23: JSON.stringify(persisted) } });
+  // The cards heal (that was #48) …
+  assert.equal(sumSpent(ctx), 1250341);
+  // … and so does every money figure the user reads (this is the new part).
+  assert.equal(ctx.DB.importedRev, 0, 'Settings "Imported Revenue" must come back to 0');
+  assert.equal(ctx.DB.importedTx, 0);
+  assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL, 'the Overview chart must come back to the report months');
+  assert.equal(monthOf(ctx, '2026-06'), 90040);
+  assert.equal(monthOf(ctx, '2026-07'), 23315);
+  // The AI summary / chat total and the header now agree.
+  assert.equal(ctx.REPORT.totalRevenue + ctx.DB.importedRev, sumSpent(ctx));
+  // Stable: healing converges — a further pass changes nothing at all.
+  // (repairDates' own counter reports a few cosmetic date touches on this
+  // fixture, so compare the data itself rather than the counter.)
+  const settled = JSON.stringify(ctx.DB);
+  ctx.repairDates();
+  assert.equal(JSON.stringify(ctx.DB), settled, 'no endless re-healing');
+});
+
+test('the two revenue invariants hold across import, re-import, backfill and a daily ledger', async () => {
+  const ctx = await bootLoaded();
+  const targets = ctx.DB.customers.filter(c => c.contact && !c.masked).slice(0, 40);
+  const invariants = (label) => {
+    assert.equal(ctx.REPORT.totalRevenue + ctx.DB.importedRev, sumSpent(ctx), `header = REPORT + importedRev (${label})`);
+    assert.equal(Math.round(monthlyTotal(ctx)), Math.round(SEED_MONTHLY_TOTAL + ctx.DB.importedRev), `Σ monthly = seed + importedRev (${label})`);
+  };
+  invariants('fresh');
+  assert.equal(ctx.DB.importedRev, 0);
+
+  // Post-report rows are genuine new business.
+  const newBiz = targets.map((c, i) => row(c.name, c.contact, '2026-08-10', 500, 'N' + String(i).padStart(8, '0') + 'B'));
+  ctx.importTransactions(newBiz);
+  invariants('after a post-report statement');
+  assert.equal(ctx.DB.importedRev, 500 * targets.length);
+  assert.equal(monthOf(ctx, '2026-08'), 500 * targets.length);
+
+  // Rows dated inside the report period are already in the report total.
+  ctx.importTransactions(targets.map((c, i) => row(c.name, c.contact, '2026-06-10', 500, 'P' + String(i).padStart(8, '0') + 'C')));
+  invariants('after in-period rows');
+  assert.equal(ctx.DB.importedRev, 500 * targets.length, 'in-period rows add no revenue');
+  assert.equal(monthOf(ctx, '2026-06'), 90040, 'and do not touch their month');
+
+  // Re-importing the same file changes nothing.
+  const before = ctx.DB.importedRev;
+  ctx.importTransactions(newBiz);
+  invariants('after a re-import');
+  assert.equal(ctx.DB.importedRev, before);
+
+  // A backfill is history only — it must never create revenue.
+  ctx.backfillTransactions(targets.map((c, i) => row(c.name, c.contact, '2026-05-05', 300, 'F' + String(i).padStart(8, '0') + 'D')));
+  ctx.repairDates();
+  invariants('after a backfill');
+  assert.equal(ctx.DB.importedRev, before, 'backfill books no revenue');
+
+  // A daily ledger is till revenue, not attributable to a customer: it raises
+  // importedRev and its own month, but not Σ spent.
+  const spentBefore = sumSpent(ctx);
+  ctx.DB.dailyLedgers.push({ date: '2026-09-01', revenue: 12345, items: [] });
+  ctx.repairDates();
+  assert.equal(ctx.DB.importedRev, before + 12345);
+  assert.equal(monthOf(ctx, '2026-09'), 12345);
+  assert.equal(Math.round(monthlyTotal(ctx)), Math.round(SEED_MONTHLY_TOTAL + ctx.DB.importedRev));
+  assert.equal(sumSpent(ctx), spentBefore, 'till revenue does not belong to any customer card');
+  // Idempotent: another pass changes nothing.
+  const settled = JSON.stringify(ctx.DB);
+  ctx.repairDates();
+  assert.equal(JSON.stringify(ctx.DB), settled);
+});
+
+test('a stale cloud sheet written by the inflated build can no longer re-inflate the chart', async () => {
+  // The Google Sheet still holds the doubled figures PR #47 pushed to it.
+  const fresh = await bootLoaded();
+  const inflatedSheet = {
+    customers: fresh.DB.customers.map(c => ({ ...c })),
+    monthly: { labels: fresh.DB.monthly.labels.slice(), revenue: fresh.DB.monthly.revenue.map(v => (Number(v) || 0) * 2) },
+    settings: { importedRev: 999000, importedTx: 4321, resolved: 0, importBatch: 0 },
+    transactions: [], customerTx: {}, seen: {}
+  };
+
+  const ctx = await bootLoaded({ cloud: inflatedSheet });
+  assert.equal(await ctx.loadFromCloud(), true);
+  // Previously the merge took max(cloud, local) per month and for importedRev,
+  // so the stale sheet won and the chart was inflated again on every sync —
+  // even straight after a Full Rebuild had just cleaned it.
+  assert.equal(ctx.DB.importedRev, 0, 'a stale sheet cannot resurrect importedRev');
+  assert.equal(ctx.DB.importedTx, 0);
+  assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL, 'nor the monthly chart');
+  // Month labels are still preserved (the x-axis must not lose a month).
+  assert.deepEqual(ctx.DB.monthly.labels, fresh.DB.monthly.labels);
+});
+
+test('Full Rebuild followed by a cloud sync stays clean (the "48 tried to undo but did not succeed" loop)', async () => {
+  const fresh = await bootLoaded();
+  const persisted = JSON.parse(JSON.stringify(fresh.DB));
+  persisted.importedRev = 500000;
+  persisted.importedTx = 900;
+  persisted.monthly.revenue = persisted.monthly.revenue.map(v => (Number(v) || 0) * 2);
+  const inflatedSheet = {
+    customers: persisted.customers.map(c => ({ ...c })),
+    monthly: JSON.parse(JSON.stringify(persisted.monthly)),
+    settings: { importedRev: 500000, importedTx: 900, resolved: 0, importBatch: 0 },
+    transactions: [], customerTx: {}, seen: {}
+  };
+
+  const ctx = await bootLoaded({ localStorageSeed: { spaxDB_v23: JSON.stringify(persisted) }, cloud: inflatedSheet });
+  // Loading alone already re-derives the ledgers.
+  assert.equal(ctx.DB.importedRev, 0);
+  assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL);
+
+  // A Full Rebuild keeps them clean …
+  ctx.parseAnyFile = async () => [];
+  ctx.saveToCloud = async () => true;
+  await ctx.handleRebuild({ files: [{ name: 'statement.csv' }], value: '' });
+  assert.equal(ctx.DB.importedRev, 0);
+  assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL);
+
+  // … and the next sync with the still-stale sheet does NOT undo the cleanup.
+  assert.equal(await ctx.loadFromCloud(), true);
+  assert.equal(ctx.DB.importedRev, 0, 'the sheet must not re-inflate a cleaned database');
+  assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL);
 });

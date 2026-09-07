@@ -944,6 +944,24 @@ async function cloudLoad() {
   return cloudRequest(GAS_URL + (GAS_URL.includes('?') ? '&' : '?') + 'action=load', {}, CLOUD_TIMEOUT_LOAD);
 }
 
+// Identity of a customer RECORD for merge purposes: name + contact.
+//
+// Both cloud merges used to key by name alone, which silently destroyed data:
+// the report lists 41 names twice (and "Peris Wacera Waite" three times) with
+// DIFFERENT phone numbers — they are different people who happen to share a
+// name. `new Map(customers.map(c => [c.name, c]))` keeps only the last of each,
+// so every sync dropped 42 real customers worth KES 50,625 / 352 visits, and
+// the survivor kept the other twin's phone number, so the lost customer's
+// future M-Pesa payments could no longer be matched to them by phone.
+//
+// Contacts are normalised so the same number written '+254…' / '254…' / '07…'
+// is one key. Records with no contact at all fall back to name-only (there is
+// nothing else to tell them apart, and the seed report has none).
+function customerMergeKey(c) {
+  const name = String((c && c.name) || '').trim().toLowerCase();
+  const contact = normalizeContact((c && c.contact) || '');
+  return name + '|' + contact;
+}
 // A formatted but empty Sheet can produce object rows with blank values. Those
 // are not customers and must never be allowed to trigger a pull or overwrite.
 function validCloudCustomers(customers) {
@@ -966,14 +984,14 @@ async function loadFromCloud() {
     const hasCloudData = cloudCustomers.length > 0;
 
     if (hasCloudData) {
-      // Cloud has data — MERGE with local (never lose imported customers)
-      const cloudMap = new Map(cloudCustomers.map(c => [c.name, c]));
-      const localMap = new Map(DB.customers.map(c => [c.name, c]));
-
-      // Start with all local customers
+      // Cloud has data — MERGE with local (never lose imported customers).
+      // Keyed by name+contact (customerMergeKey): keying by name alone made
+      // every sync discard the 42 same-name-different-phone records.
+      const cloudMap = new Map(cloudCustomers.map(c => [customerMergeKey(c), c]));
       const merged = [];
-      localMap.forEach((localCust, name) => {
-        const cloudCust = cloudMap.get(name);
+      DB.customers.forEach(localCust => {
+        const key = customerMergeKey(localCust);
+        const cloudCust = cloudMap.get(key);
         if (cloudCust) {
           // Customer exists in both — use whichever has more visits/higher spent
           const useCloud = (cloudCust.visits || 0) > (localCust.visits || 0) || 
@@ -988,7 +1006,7 @@ async function loadFromCloud() {
             firstVisit: stripTime(useCloud ? (cloudCust.firstVisit || localCust.firstVisit) : (localCust.firstVisit || cloudCust.firstVisit)),
             lastVisit: stripTime(useCloud ? (cloudCust.lastVisit || localCust.lastVisit) : (localCust.lastVisit || cloudCust.lastVisit))
           });
-          cloudMap.delete(name);
+          cloudMap.delete(key);
         } else {
           // Only in local — keep it (imported customer!)
           merged.push(localCust);
@@ -7773,14 +7791,16 @@ async function smartMergeCloud(){
       return;
     }
 
-    const cloudMap = new Map(cloudCustomers.map(c => [c.name, c]));
-    const localMap = new Map(DB.customers.map(c => [c.name, c]));
+    // Keyed by name+contact (customerMergeKey) — see loadFromCloud: keying by
+    // name alone silently dropped the 42 same-name-different-phone records.
+    const cloudMap = new Map(cloudCustomers.map(c => [customerMergeKey(c), c]));
     const merged = [];
     let localOnly = 0, cloudOnly = 0, mergedCount = 0;
 
     // Merge locals
-    localMap.forEach((localCust, name) => {
-      const cloudCust = cloudMap.get(name);
+    DB.customers.forEach(localCust => {
+      const key = customerMergeKey(localCust);
+      const cloudCust = cloudMap.get(key);
       if(cloudCust){
         const useCloud = (cloudCust.visits||0) > (localCust.visits||0) || (cloudCust.spent||0) > (localCust.spent||0);
         merged.push({
@@ -7790,7 +7810,7 @@ async function smartMergeCloud(){
           firstVisit: (() => { const f1 = stripTime(cloudCust.firstVisit), f2 = stripTime(localCust.firstVisit); return (f1 && f2) ? (f1 < f2 ? f1 : f2) : (f1 || f2 || ""); })(),
           lastVisit: (() => { const l1 = stripTime(cloudCust.lastVisit), l2 = stripTime(localCust.lastVisit); return (l1 && l2) ? (l1 > l2 ? l1 : l2) : (l1 || l2 || ""); })()
         });
-        cloudMap.delete(name);
+        cloudMap.delete(key);
         mergedCount++;
       }else{
         merged.push(localCust);

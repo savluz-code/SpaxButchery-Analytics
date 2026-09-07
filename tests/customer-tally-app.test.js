@@ -47,6 +47,7 @@ function makeElement(id) {
 
 function bootApp({ localStorageSeed = {}, cloud = null } = {}) {
   const els = new Map();
+  const savedPayloads = [];   // every payload POSTed to the stand-in Sheet
   const store = new Map(Object.entries(localStorageSeed));
   const localStorage = {
     getItem: k => (store.has(k) ? store.get(k) : null),
@@ -75,9 +76,11 @@ function bootApp({ localStorageSeed = {}, cloud = null } = {}) {
     fetch: async (url, opts) => {
       if (!cloud) throw new Error('offline');
       const body = opts && opts.body ? String(opts.body) : '';
-      const payload = (/"action"\s*:\s*"save/.test(body) || /action=save/.test(String(url)))
-        ? { success: true }
-        : { success: true, ...cloud };
+      if (/"action"\s*:\s*"save/.test(body) || /action=save/.test(String(url))) {
+        try { savedPayloads.push(JSON.parse(body)); } catch (_) {}
+        return { ok: true, status: 200, json: async () => ({ success: true }), text: async () => '{"success":true}' };
+      }
+      const payload = { success: true, ...cloud };
       return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) };
     },
     setTimeout, clearTimeout, setInterval, clearInterval, URL, Blob, AbortController, TextEncoder, TextDecoder,
@@ -107,6 +110,7 @@ function bootApp({ localStorageSeed = {}, cloud = null } = {}) {
       if (typeof name !== 'string' || name === 'then' || name === 'constructor' || name === 'toJSON' || name === 'inspect') return undefined;
       if (name === 'ctx') return ctx;
       if (name === 'document') return document;
+      if (name === 'savedPayloads') return savedPayloads;
       if (name === 'set') return (n, v) => { ctx.__v = v; vm.runInContext(`${n} = __v;`, ctx); };
       return vm.runInContext(String(name), ctx);
     },
@@ -559,4 +563,103 @@ test('Full Rebuild followed by a cloud sync stays clean (the "48 tried to undo b
   assert.equal(await ctx.loadFromCloud(), true);
   assert.equal(ctx.DB.importedRev, 0, 'the sheet must not re-inflate a cleaned database');
   assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL);
+});
+
+/* ══════════ SAME-NAME RECORDS SURVIVE A CLOUD SYNC ══════════
+   Both cloud merges keyed customers by NAME alone
+   (`new Map(customers.map(c => [c.name, c]))`). The report lists 41 names
+   twice — and "Peris Wacera Waite" three times — with different phone numbers:
+   different people who happen to share a name. Keying by name kept only the
+   last of each, so every sync silently destroyed 42 real customers worth
+   KES 50,625 / 352 visits, and the survivor carried the other twin's phone, so
+   the lost customer's future payments could no longer be matched by phone.
+   Records are now keyed by name + normalised contact (customerMergeKey). */
+
+const cloudSheetOf = ctx => ({
+  customers: ctx.DB.customers.map(c => ({ ...c })),
+  monthly: { labels: ctx.DB.monthly.labels.slice(), revenue: ctx.DB.monthly.revenue.slice() },
+  settings: { importedRev: ctx.DB.importedRev, importedTx: ctx.DB.importedTx, resolved: ctx.DB.resolved, importBatch: ctx.DB.importBatch },
+  transactions: ctx.DB.transactions.map(t => ({ ...t })),
+  customerTx: JSON.parse(JSON.stringify(ctx.DB.customerTx)),
+  seen: { ...ctx.DB.seen }
+});
+
+test('the 41 same-name pairs (and the one triple) survive repeated cloud syncs', async () => {
+  const local = await bootLoaded();
+  assert.equal(local.DB.customers.length, 1669);
+  // The fixture really does contain same-name records with different phones.
+  const names = new Map();
+  local.DB.customers.forEach(c => names.set(c.name, (names.get(c.name) || 0) + 1));
+  const dupNames = [...names.entries()].filter(([, n]) => n > 1);
+  assert.equal(dupNames.length, 41, '41 names appear more than once');
+  assert.equal(dupNames.reduce((s, [, n]) => s + (n - 1), 0), 42, 'holding 42 extra records');
+  assert.equal(names.get('Peris Wacera Waite'), 3, 'and one name appears three times');
+
+  const ctx = await bootLoaded({ cloud: cloudSheetOf(local) });
+  // Syncing must be lossless, and stay lossless however many times it runs.
+  for (let i = 0; i < 3; i++) {
+    assert.equal(await ctx.loadFromCloud(), true);
+    assert.equal(ctx.DB.customers.length, 1669, `customer count after sync ${i + 1}`);
+    assert.equal(sumSpent(ctx), 1250341, `Σ spent after sync ${i + 1}`);
+    assert.equal(sumVisits(ctx), 5519, `Σ visits after sync ${i + 1}`);
+  }
+  // Every distinct phone is still present for the duplicated names.
+  const tobias = ctx.DB.customers.filter(c => c.name === 'Tobias Odipo');
+  assert.equal(tobias.length, 2);
+  assert.equal(tobias.map(c => c.contact).sort().join(','), '0720208056,0720964081');
+  assert.equal(ctx.DB.customers.filter(c => c.name === 'Peris Wacera Waite').length, 3);
+});
+
+test('Smart Merge is lossless for same-name records too', async () => {
+  const local = await bootLoaded();
+  const ctx = await bootLoaded({ cloud: cloudSheetOf(local) });
+  ctx.saveToCloud = async () => true;
+  await ctx.smartMergeCloud();
+  assert.equal(ctx.DB.customers.length, 1669);
+  assert.equal(sumSpent(ctx), 1250341);
+  assert.equal(ctx.DB.customers.filter(c => c.name === 'Peris Wacera Waite').length, 3);
+});
+
+test('a sheet already damaged by the old build is repaired, not propagated', async () => {
+  const local = await bootLoaded();
+  // The Google Sheet was written by the name-keyed build, so 42 records are
+  // already missing up there.
+  const collapsed = new Map();
+  local.DB.customers.forEach(c => collapsed.set(c.name, c));
+  const damaged = cloudSheetOf(local);
+  damaged.customers = [...collapsed.values()].map(c => ({ ...c }));
+  assert.equal(damaged.customers.length, 1627, 'the damaged sheet is short 42 records');
+
+  const ctx = await bootLoaded({ cloud: damaged });
+  assert.equal(await ctx.loadFromCloud(), true);
+  // The local copy still has them, and the merge must not delete them again.
+  assert.equal(ctx.DB.customers.length, 1669, 'local twins survive a damaged sheet');
+  assert.equal(sumSpent(ctx), 1250341);
+  // And the repaired client pushes the full set back up, healing the sheet.
+  const pushed = [];
+  await ctx.saveToCloud(true);
+  ctx.savedPayloads.forEach(p => { if (p && Array.isArray(p.customers)) pushed.push(p.customers.length); });
+  assert.ok(pushed.length > 0, 'a save payload was sent');
+  assert.equal(pushed[pushed.length - 1], 1669, 'the sheet is healed with all 1,669 records');
+});
+
+test('same-name twins stay independent across a sync, and the revenue invariant holds', async () => {
+  const ctx = await bootLoaded();
+  const [first, second] = ctx.DB.customers.filter(c => c.name === 'Tobias Odipo');
+  assert.equal(first.spent, 2900);
+  assert.equal(second.spent, 500);
+  // A post-report payment from the SECOND twin's phone.
+  ctx.importTransactions([row('Tobias Odipo', second.contact, '2026-08-25', 700, 'UTB1ABCDEF1')]);
+  assert.equal(ctx.DB.importedRev, 700);
+
+  // Round-trip the whole database through the cloud.
+  const after = await bootLoaded({ cloud: cloudSheetOf(ctx), localStorageSeed: { spaxDB_v23: JSON.stringify(ctx.DB) } });
+  assert.equal(await after.loadFromCloud(), true);
+  const pair = after.DB.customers.filter(c => c.name === 'Tobias Odipo');
+  assert.equal(pair.length, 2, 'both twins survive');
+  assert.equal(after.DB.customers.length, 1669);
+  assert.equal(sumSpent(after), 1250341 + 700);
+  assert.equal(after.DB.importedRev, 700, 'the payment is not double counted by the sync');
+  assert.equal(after.REPORT.totalRevenue + after.DB.importedRev, sumSpent(after));
+  assert.equal(monthlyTotal(after), SEED_MONTHLY_TOTAL + 700);
 });

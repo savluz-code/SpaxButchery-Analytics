@@ -10,8 +10,12 @@
 //   • A fresh seed load: Σ spent = 1,250,341 = REPORT.totalRevenue exactly.
 //   • Every seed customer's cut-off is the REPORT date (Last Visit + Days
 //     Since, 2026-07-12 for the report as a whole), not their own Last Visit.
-//   • A statement row dated inside the report period never moves a seed
-//     customer's total; a row dated after it is added on top — and the
+//   • An ITEMISED document is preferred over the seed data: a statement that
+//     reaches past a customer's report aggregate replaces it (and the extra is
+//     dated to the receipts' own months). A statement that falls short leaves
+//     the aggregate as the floor for the part of the period it does not cover —
+//     the report counts cash too, a statement only ever shows the M-Pesa side.
+//   • A row dated after the report cut-off is always added on top — and the
 //     Overview, importedRev and the monthly chart move by the same amount.
 //   • A phone whose history holds every report receipt twice comes back to
 //     exactly the report total plus the post-report rows.
@@ -207,33 +211,92 @@ test('a statement row dated inside the report period never moves the total; a ro
   assert.equal(ctx.DB.importedRev, imp0 + 300);
 });
 
-test('George from the screenshots: 4 April rows + 3 September rows of 300 = 1500/5, and the modal footer reconciles', async () => {
+test('George from the screenshots: his April statement supersedes the report row — 7 receipts = 2100/7, and the modal footer reconciles', async () => {
   const ctx = await bootLoaded();
   const george = byName(ctx, 'George Owiti');
+  const apr0 = monthOf(ctx, '2026-04');
+  // The report row says 600 / 2 visits; the statement covering the same period
+  // shows four dated receipts worth 1,200 — including purchases in April,
+  // before the report's own first visit for him. An itemised document is
+  // preferred over the seed data (see CUSTOMER TALLY), so it takes over
+  // instead of being hidden behind the aggregate.
   const rows = [
     row('George Owiti', '0710428075', '2026-04-17', 300, 'UDA1ABCDEF1'), row('George Owiti', '0710428075', '2026-04-18', 300, 'UDA2ABCDEF1'),
     row('George Owiti', '0710428075', '2026-04-19', 300, 'UDA3ABCDEF1'), row('George Owiti', '0710428075', '2026-04-20', 300, 'UDA4ABCDEF1')
   ];
   ctx.backfillTransactions(rows);
   ctx.repairDates();
-  assert.equal(george.spent, 600); assert.equal(george.visits, 2);
+  assert.equal(george.spent, 1200); assert.equal(george.visits, 4);
+  assert.equal(ctx.DB.importedRev, 600, 'the 600 the report never carried is imported revenue now');
+  assert.equal(monthOf(ctx, '2026-04'), apr0 + 600, 'and it lands in the month those receipts belong to');
+  assert.equal(sumSpent(ctx), 1250341 + 600);
   ctx.importTransactions([
     row('George Owiti', '0710428075', '2026-09-01', 300, 'UIA1ABCDEF1'), row('George Owiti', '0710428075', '2026-09-02', 300, 'UIA2ABCDEF1'),
     row('George Owiti', '0710428075', '2026-09-03', 300, 'UIA3ABCDEF1')
   ]);
-  assert.equal(george.spent, 1500); assert.equal(george.visits, 5);
-  assert.equal(ctx.DB.importedRev, 900);
-  assert.equal(sumSpent(ctx), 1250341 + 900);
+  assert.equal(george.spent, 2100); assert.equal(george.visits, 7);
+  assert.equal(ctx.DB.importedRev, 1500);
+  assert.equal(sumSpent(ctx), 1250341 + 1500);
+  assert.equal(ctx.REPORT.totalRevenue + ctx.DB.importedRev, sumSpent(ctx), 'header invariant');
+  assert.equal(Math.round(monthlyTotal(ctx)), Math.round(SEED_MONTHLY_TOTAL + ctx.DB.importedRev), 'monthly invariant');
 
   ctx.showCustomerDetail('George Owiti');
   const html = ctx.document.getElementById('modalTxList').innerHTML;
   const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
   assert.match(text, /Listed above 7 tx · KES 2,100/);
-  assert.match(text, new RegExp(`− Already in the report total \\(up to ${REPORT_DATE}\\) 2 visits · KES 600`));
-  assert.match(text, /= Total 5 visits · KES 1,500/);
+  assert.match(text, new RegExp(`Statement supersedes the report total \\(up to ${REPORT_DATE}\\) \\+2 visits · KES 600`));
+  assert.match(text, /= Total 7 visits · KES 2,100/);
   assert.doesNotMatch(text, /not itemised/);
-  assert.equal(ctx.document.getElementById('modalTotal').textContent, kesText(ctx, 1500));
-  assert.equal(ctx.document.getElementById('modalVisits').textContent, 5);
+  assert.doesNotMatch(text, /Already in the report total/);
+  assert.equal(ctx.document.getElementById('modalTotal').textContent, kesText(ctx, 2100));
+  assert.equal(ctx.document.getElementById('modalVisits').textContent, 7);
+});
+
+test('a statement that reaches past the report aggregate supersedes it — card, header and the receipts\' own months', async () => {
+  const ctx = await bootLoaded();
+  const florah = byName(ctx, 'Florah Olisa Esikuri');   // report row: KES 20 / 1 visit
+  assert.equal(florah.spent, 20); assert.equal(florah.visits, 1);
+  const oct0 = monthOf(ctx, '2025-10'), nov0 = monthOf(ctx, '2025-11');
+
+  // A partial statement (one receipt) does NOT displace the aggregate: it says
+  // nothing about the rest of the period, so the aggregate stays the floor.
+  ctx.backfillTransactions([row('Florah Olisa Esikuri', '0714445070', '2025-10-05', 20, 'UFL0ABCDEF0')]);
+  ctx.repairDates();
+  assert.equal(florah.spent, 20); assert.equal(florah.visits, 1);
+  assert.equal(ctx.DB.importedRev, 0);
+  assert.equal(monthOf(ctx, '2025-10'), oct0, 'a statement under the aggregate moves no month');
+
+  // The full statement: five dated receipts worth 1,000 against the report's
+  // 20. The itemised document wins, and the 980 the report never carried is
+  // credited to the months those receipts belong to — in proportion, not
+  // dumped on the cut-off month the way the un-itemised surplus has to be.
+  const stmt = [
+    row('Florah Olisa Esikuri', '0714445070', '2025-10-05', 20, 'UFL0ABCDEF0'),
+    row('Florah Olisa Esikuri', '0714445070', '2025-10-12', 300, 'UFL1ABCDEF1'),
+    row('Florah Olisa Esikuri', '0714445070', '2025-10-20', 180, 'UFL2ABCDEF2'),
+    row('Florah Olisa Esikuri', '0714445070', '2025-11-03', 300, 'UFL3ABCDEF3'),
+    row('Florah Olisa Esikuri', '0714445070', '2025-11-19', 200, 'UFL4ABCDEF4')
+  ];
+  ctx.backfillTransactions(stmt);
+  ctx.repairDates();
+  assert.equal(florah.spent, 1000); assert.equal(florah.visits, 5);
+  assert.equal(ctx.DB.importedRev, 980);
+  assert.equal(sumSpent(ctx), 1250341 + 980);
+  assert.equal(ctx.REPORT.totalRevenue + ctx.DB.importedRev, sumSpent(ctx), 'header invariant');
+  assert.equal(Math.round(monthlyTotal(ctx)), Math.round(SEED_MONTHLY_TOTAL + ctx.DB.importedRev), 'monthly invariant');
+  // KES 500 of the statement sits in each month, so the 980 splits evenly.
+  assert.equal(monthOf(ctx, '2025-10'), oct0 + 490);
+  assert.equal(monthOf(ctx, '2025-11'), nov0 + 490);
+
+  // Re-importing the same statement changes nothing: the receipt dedupe runs
+  // before the tally, so a supersede can never be manufactured by re-importing.
+  ctx.importTransactions(stmt);
+  assert.equal(florah.spent, 1000, 'a re-imported statement must not raise the supersede');
+  assert.equal(florah.visits, 5);
+  assert.equal(ctx.DB.importedRev, 980);
+  const settled = JSON.stringify(ctx.DB);
+  ctx.repairDates();
+  assert.equal(JSON.stringify(ctx.DB), settled, 'idempotent');
 });
 
 test('a phone whose history holds every report receipt twice comes back to exactly the report total plus post-report rows', async () => {
@@ -408,8 +471,9 @@ test('a Full Rebuild overlapping the baseline that the user keeps absorbs the ro
   // User continues past the warning (keep baseline).
   ctx.showConfirm = async () => true;
   await ctx.handleRebuild({ files: [{ name: 'may.csv' }], value: '' });
-  // The row is dated inside George's report period → absorbed, never counted.
-  assert.equal(sumSpent(ctx), sum0, 'an in-baseline row does not inflate revenue');
+  // The row is dated inside George's report period and KES 50 is far under his
+  // 600 aggregate, so the aggregate stays the floor and nothing is counted.
+  assert.equal(sumSpent(ctx), sum0, 'an in-baseline row under the aggregate does not inflate revenue');
   assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL, 'seed monthly unchanged');
   assert.equal(ctx.DB.importedRev, 0, 'no new revenue from an in-baseline row');
 });
@@ -525,7 +589,13 @@ test('a database PR #47 inflated heals its MONEY too, not just the customer card
   assert.equal(sumSpent(ctx), 1250341);
   // … and so does every money figure the user reads (this is the new part).
   assert.equal(ctx.DB.importedRev, 0, 'Settings "Imported Revenue" must come back to 0');
-  assert.equal(ctx.DB.importedTx, 0);
+  // Not zero on VISITS: two of these 50 customers have a single visit in the
+  // report while the injected statement shows them two dated receipts, and an
+  // itemised document is preferred over the seed data — so those two visits are
+  // real and importedTx reports them. No money moved (800 is under every
+  // victim's report total), which is why Σ spent and importedRev are unchanged.
+  assert.equal(ctx.DB.importedTx, 2);
+  assert.equal(sumVisits(ctx), ctx.REPORT.totalTxns + ctx.DB.importedTx, 'visit invariant');
   assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL, 'the Overview chart must come back to the report months');
   assert.equal(monthOf(ctx, '2026-06'), 90040);
   assert.equal(monthOf(ctx, '2026-07'), 23315);
@@ -556,10 +626,13 @@ test('the two revenue invariants hold across import, re-import, backfill and a d
   assert.equal(ctx.DB.importedRev, 500 * targets.length);
   assert.equal(monthOf(ctx, '2026-08'), 500 * targets.length);
 
-  // Rows dated inside the report period are already in the report total.
+  // Rows dated inside the report period are already in the report total —
+  // KES 500 is under every one of these customers' report figure, so the
+  // aggregate stays as the floor for the part of the period this one receipt
+  // does not cover (the supersede case is its own test below).
   ctx.importTransactions(targets.map((c, i) => row(c.name, c.contact, '2026-06-10', 500, 'P' + String(i).padStart(8, '0') + 'C')));
   invariants('after in-period rows');
-  assert.equal(ctx.DB.importedRev, 500 * targets.length, 'in-period rows add no revenue');
+  assert.equal(ctx.DB.importedRev, 500 * targets.length, 'in-period rows under the aggregate add no revenue');
   assert.equal(monthOf(ctx, '2026-06'), 90040, 'and do not touch their month');
 
   // Re-importing the same file changes nothing.

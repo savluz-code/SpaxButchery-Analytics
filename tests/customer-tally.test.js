@@ -16,8 +16,9 @@
 // Fix: every customer carries an explicit BASELINE (seedSpent / seedVisits /
 // seedLastVisit) and the totals are DERIVED:
 //
-//   spent  = baseline.spent  + Σ rows dated after baseline.lastVisit
-//   visits = baseline.visits + count(rows after cutoff)
+//   spent  = max(baseline.spent, Σ rows dated inside the period)
+//            + Σ rows dated after baseline.lastVisit
+//   visits = max(baseline.visits, count(rows inside)) + count(rows after)
 //
 // PR #47 first shipped this with two mistakes that DOUBLED the header revenue
 // (KES 4,075K): (a) a seed customer's cut-off was their own Last Visit rather
@@ -25,9 +26,20 @@
 // export: 2026-06-24, and 2026-07-12 for the later export), so statement rows
 // dated between their last purchase and the report date were booked on top
 // of a total that already included them; (b) inside the period the formula
-// took max(baseline, Σ rows), so duplicate rows raised the total further. The
-// baseline is now authoritative for its period and the cut-off is the report
-// date for every seed row.
+// took max(baseline, Σ rows) over a history that still held DUPLICATE
+// receipts, so a re-imported statement raised the total further.
+//
+// (a) still stands: the cut-off is the report date for every seed row.
+// (b) was the symptom, not the max() — repairDates() now collapses duplicate
+// receipts BEFORE the tally runs, so what is left above the baseline is
+// genuine. The rule today is: WHERE AN ITEMISED DOCUMENT IS AVAILABLE IT IS
+// PREFERRED OVER THE SEED DATA. A statement is one dated, receipt-numbered row
+// per payment; the baseline is one undated total. When the itemised rows for
+// the period add up to more than the aggregate, the aggregate missed purchases
+// and the rows take over. It only ever RAISES a total — the report counts
+// every payment channel while a statement can only show the M-Pesa ones, so a
+// smaller itemised total is incomplete coverage and the aggregate stays as the
+// floor for the part of the period no statement reaches.
 //
 // These tests run the REAL functions from index.html inside a vm sandbox.
 
@@ -171,72 +183,94 @@ test('the three customers from the screenshots come back into tally with their h
   const fixed = ctx.repairDates();
   assert.ok(fixed >= 3, 'repairDates must report the three repaired customers');
 
-  // Card = report baseline (authoritative for everything up to 2026-06-24)
-  // + this month's rows. The backfilled April/July/December rows are already
-  // part of the report total and are NOT added again.
-  assert.equal(eunice.spent, 100 + 120); assert.equal(eunice.visits, 1 + 3);
-  assert.equal(diana.spent, 150 + 240); assert.equal(diana.visits, 1 + 3);
-  assert.equal(george.spent, 1500); assert.equal(george.visits, 5);
+  // Card = the ITEMISED history where one exists. Every one of these three has
+  // a statement for the report period, and each statement reaches past the
+  // report aggregate, so the aggregate gives way to it: the card is now exactly
+  // the sum of the receipts listed under it — the "history" column the original
+  // screenshots disagreed with.
+  assert.equal(eunice.spent, 400 + 120); assert.equal(eunice.visits, 4 + 3);
+  assert.equal(diana.spent, 600 + 240); assert.equal(diana.visits, 4 + 3);
+  assert.equal(george.spent, 2100); assert.equal(george.visits, 7);
 
   // The modal footer reconciles the list to the card:
   //   Listed above 7 tx · KES 2,100
-  //   + Earlier purchases up to 2026-06-24 (not itemised)   0 (all itemised — and then some)
-  //   − Already in the report total (up to 2026-06-24)      2 visits · KES 600
-  //   = Total 5 visits · KES 1,500
+  //   ↳ Statement supersedes the report total (up to 2026-06-24)  +2 visits · KES 600
+  //     (a note — that money is already inside "Listed above")
+  //   = Total 7 visits · KES 2,100
   const t = ctx.customerTally(george);
   const listed = ctx.customerHistoryFor(george);
   assert.equal(listed.length, 7);
   assert.equal(listed.reduce((s, r) => s + r.amount, 0), 2100);
   assert.equal(t.unitemised.spent, 0); assert.equal(t.unitemised.visits, 0);
-  assert.equal(t.excess.spent, 600); assert.equal(t.excess.visits, 2);
+  assert.equal(t.supersedes.spent, 600); assert.equal(t.supersedes.visits, 2);
   assert.equal(t.base.lastVisit, REPORT_DATE);
-  assert.equal(listed.reduce((s, r) => s + r.amount, 0) + t.unitemised.spent - t.excess.spent, george.spent);
-  assert.equal(listed.length + t.unitemised.visits - t.excess.visits, george.visits);
+  assert.equal(listed.reduce((s, r) => s + r.amount, 0) + t.unitemised.spent, george.spent);
+  assert.equal(listed.length + t.unitemised.visits, george.visits);
 
   // Idempotent — a second pass changes nothing.
   assert.equal(ctx.repairDates(), 0);
-  assert.equal(eunice.spent, 220);
-  assert.equal(george.visits, 5);
+  assert.equal(eunice.spent, 520);
+  assert.equal(george.visits, 7);
 });
 
-test('the baseline is authoritative for its period: rows up to the report date never move the total, rows after it are added on top', () => {
+test('an itemised statement is preferred over the seed aggregate: it raises the total, and never lowers it', () => {
   const ctx = makeContext();
-  // Report (generated 2026-06-24) says KES 600 over 2 visits.
+  // Report (generated 2026-06-24) says KES 600 over 2 visits — one undated
+  // total. Every history() row below is a dated receipt from a statement.
   const george = seedCustomer(ctx, SEED_ROWS[0]);
 
-  // Backfilling ONE of the two report-period purchases must not change the total.
+  // ONE statement receipt inside the period: coverage is partial, so the
+  // aggregate is still the better figure for the part no statement reaches.
   history(ctx, 'George Owiti', [['2026-05-20', 300]]);
   ctx.repairDates();
   assert.equal(george.spent, 600);
   assert.equal(george.visits, 2);
+  assert.equal(ctx.customerTally(george).unitemised.spent, 300);
+  assert.equal(ctx.customerTally(george).supersedes.spent, 0);
 
-  // Backfilling BOTH: still 600 / 2 (the baseline already covered them).
+  // BOTH report-period receipts: the itemised total meets the aggregate, so
+  // there is nothing left un-itemised — and nothing extra to book.
   history(ctx, 'George Owiti', [['2026-05-20', 300], ['2026-06-01', 300]]);
   ctx.repairDates();
   assert.equal(george.spent, 600);
   assert.equal(george.visits, 2);
+  assert.equal(ctx.customerTally(george).unitemised.spent, 0);
 
-  // A statement row dated between his last purchase (2026-06-01) and the
-  // report date (2026-06-24) is ALREADY in the report total — this is the row
-  // the merged build double counted (its cut-off was his own Last Visit).
+  // A THIRD receipt the report never carried — including one dated between his
+  // last purchase (2026-06-01) and the report date, the row the merged build
+  // double counted. It is real, deduped money, so the statement takes over.
   history(ctx, 'George Owiti', [['2026-05-20', 300], ['2026-06-01', 300], ['2026-06-15', 300]]);
   ctx.repairDates();
-  assert.equal(george.spent, 600);
-  assert.equal(george.visits, 2);
+  assert.equal(george.spent, 900);
+  assert.equal(george.visits, 3);
   assert.equal(george.seedLastVisit, REPORT_DATE);
+  assert.equal(ctx.customerTally(george).supersedes.spent, 300);
+  assert.equal(ctx.customerTally(george).supersedes.visits, 1);
 
-  // More rows inside the period than the report recorded (a re-imported or
-  // duplicated statement) do not raise it either — the report is the
-  // authority for its own period.
+  // A different statement that only reaches 850: still above the aggregate, so
+  // it still wins — but only by what it actually shows.
   history(ctx, 'George Owiti', [['2026-05-20', 300], ['2026-06-01', 300], ['2026-05-01', 250]]);
   ctx.repairDates();
-  assert.equal(george.spent, 600);
-  assert.equal(george.visits, 2);
-  assert.equal(ctx.customerTally(george).excess.spent, 250);
-  assert.equal(ctx.customerTally(george).excess.visits, 1);
+  assert.equal(george.spent, 850);
+  assert.equal(george.visits, 3);
+  assert.equal(ctx.customerTally(george).supersedes.spent, 250);
+  assert.equal(ctx.customerTally(george).supersedes.visits, 1);
 
-  // The report is dated 2026-06-24 for the seed rows in this fixture: the day
-  // after the cut-off is new business.
+  // And a statement SMALLER than the aggregate never erases the difference:
+  // the report counts cash too, a statement only ever shows the M-Pesa side.
+  history(ctx, 'George Owiti', [['2026-05-20', 100]]);
+  ctx.repairDates();
+  assert.equal(george.spent, 600, 'the aggregate is the floor for the un-itemised part');
+  assert.equal(george.visits, 2);
+  assert.equal(ctx.customerTally(george).unitemised.spent, 500);
+});
+
+test('rows after the report cut-off are always added on top, whatever the baseline says', () => {
+  const ctx = makeContext();
+  const george = seedCustomer(ctx, SEED_ROWS[0]);
+
+  // The report is dated 2026-06-24 for the seed rows in this fixture: a row on
+  // the cut-off is inside the period, the day after it is new business.
   history(ctx, 'George Owiti', [['2026-06-24', 300], ['2026-06-25', 300]]);
   ctx.repairDates();
   assert.equal(george.spent, 900);
@@ -379,8 +413,9 @@ test('the modal renders card figures from the same tally it lists — with a rec
   assert.match(body, /customerHistoryFor\(c\)/, 'history must come from the owning record');
   assert.match(body, /Listed above/);
   assert.match(body, /not itemised/);
-  assert.match(body, /Already in the report total/);
-  assert.match(body, /tally\.excess/);
+  assert.match(body, /Already in the report total/, 'the baseline-less suppression line stays');
+  assert.match(body, /tally\.supersedes/);
+  assert.match(body, /Statement supersedes the report total/);
   assert.match(body, /= Total/);
 });
 
@@ -388,7 +423,7 @@ test('seedDB stamps the report date, and the service worker cache was bumped', (
   const seed = slice('function seedDB(){', 'function load(){');
   assert.match(seed, /seedLastVisit:\s*\(lastVisit && days < 999\) \? _addDays\(lastVisit, days\) : lastVisit/);
   const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
-  assert.match(sw, /const CACHE_NAME = 'spax-v16';/);
+  assert.match(sw, /const CACHE_NAME = 'spax-v17';/);
 });
 
 test('every mutation path re-derives the totals instead of hand-adjusting them', () => {

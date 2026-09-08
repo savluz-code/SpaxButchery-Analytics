@@ -248,7 +248,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         <input type="file" id="rebuildFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleRebuild(this)">
       </div>
       <div style="font-size:.7rem;color:var(--muted);margin-top:8px;">
-        <b>Backfill</b> = add history only, keep summary stats · <b>Rebuild</b> = clear just the selected statement period and recalculate
+        <b>Backfill</b> = add history; totals only ever move up, never down · <b>Rebuild</b> = clear just the selected statement period and recalculate
       </div>
     </div>
     <div class="hint">Hybrid engine: embedded-text parsing + Tesseract OCR fallback for scanned/image PDFs</div>
@@ -813,11 +813,14 @@ function doPost(e) {
     <div style="font-size:3rem;margin-bottom:8px">📥</div>
     <h3 style="margin-bottom:6px">Backfill Transaction History</h3>
     <div style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">
-      Import past M-Pesa statements to fill in each customer's history <b>without booking new revenue</b>.<br><br>
+      Import past M-Pesa statements to fill in each customer's history. Where a
+      statement shows receipts the original report missed, the <b>statement
+      wins</b> — it is the itemised record.<br><br>
       ✓ Adds transactions to per-customer history<br>
       ✓ Skips duplicates automatically<br>
       ✓ Keeps Total Spent / Visits in tally with that history<br>
-      ✓ Overview revenue &amp; monthly totals are not changed
+      ✓ A statement can only correct a total <b>upward</b> — never below the
+        report figure, which counts cash a statement cannot show
     </div>
     <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
       <button class="btn ghost" onclick="closeBackfillModal()">Cancel</button>
@@ -3871,15 +3874,17 @@ function getProductStats(){
                   as of its Last_Visit
                 • legacy records: whatever stored total the history can't
                   explain, stamped once (see ensureBaselineFields)
-     inside   = history rows dated on/before seedLastVisit — the baseline is
-                AUTHORITATIVE for this period: it already includes these
-                purchases, so backfilling an old statement, re-importing it,
-                or a duplicate receipt can never inflate a total
+     inside   = history rows dated on/before seedLastVisit — the ITEMISED
+                record of the baseline period. Where it exists it is the
+                better document (one dated, receipt-numbered row per payment
+                against the baseline's single undated total), so it takes
+                over from the baseline for that period — see the max() rule
+                in customerTally for the one direction it never moves
      after    = history rows dated after seedLastVisit — new business, always
                 added ON TOP of the baseline (never absorbed by it)
 
-     spent  = baseline.spent  + Σ after.amount   (baseline present)
-     visits = baseline.visits + after.count
+     spent  = max(baseline.spent, Σ inside.amount) + Σ after.amount   (baseline)
+     visits = max(baseline.visits, inside.count)   + after.count
      spent  = Σ inside.amount + Σ after.amount   (no baseline: pure history)
      visits = inside.count    + after.count
 
@@ -4063,11 +4068,34 @@ function customerTally(c, hist){
   });
   let spent, visits;
   if (!rows.length && !hasBaseline) { spent = _round2(Math.max(0, Number(c.spent) || 0)); visits = Math.max(0, Number(c.visits) || 0); }
-  // The baseline is AUTHORITATIVE for its period: the report / export total
-  // already includes every purchase up to its cut-off, so rows dated inside
-  // that period (backfilled statements, re-imports, duplicate receipts) can
-  // never raise it. Only rows dated after the cut-off add to the total.
-  else if (hasBaseline) { spent = _round2(base.spent + afterSpent); visits = base.visits + afterCount; }
+  // WHERE AN ITEMISED DOCUMENT EXISTS IT IS PREFERRED OVER THE SEED DATA.
+  // A statement / receipt export is primary evidence: one row per payment,
+  // each with its own date and receipt number. The baseline is a single
+  // undated aggregate for the whole period. So when the itemised rows for the
+  // baseline period add up to MORE than the aggregate, the aggregate is simply
+  // missing purchases and the rows take over — George's report row says
+  // 600 / 2 visits while his statement shows four April receipts worth 1,200,
+  // so 1,200 / 4 is the truth for that period and the extra 600 / 2 is real
+  // revenue the report never carried.
+  //
+  // It can only ever RAISE the figure, never lower it. The report counts
+  // every payment channel; an M-Pesa statement can only ever show the M-Pesa
+  // ones (the daily sheets reconcile cash + M-Pesa against declared sales, and
+  // 623 of the report's 1,669 customers carry a masked number, so they cannot
+  // appear in any statement at all). A smaller itemised total therefore means
+  // incomplete coverage, not a correction: the aggregate stays as the floor
+  // for the part of the period no statement reaches, and that remainder is
+  // what the modal shows as "Earlier purchases … (not itemised)".
+  //
+  // max() rather than a sum is what keeps this safe against the doubling PRs
+  // #47-#52 chased: rows that ARE the baseline's money can never be stacked on
+  // top of it, whichever way the two compare. And duplicate receipts are
+  // already collapsed by repairDates() before this runs, so what survives here
+  // above the aggregate is genuinely extra money, not a re-imported statement.
+  else if (hasBaseline) {
+    spent = _round2(Math.max(base.spent, inSpent) + afterSpent);
+    visits = Math.max(base.visits, inCount) + afterCount;
+  }
   // No baseline at all — a record an import CREATED. The report is complete
   // for its own period (Σ seed spent === REPORT.totalRevenue, Σ seed visits
   // === REPORT.totalTxns), so every shilling taken up to the report cut-off is
@@ -4097,7 +4125,7 @@ function customerTally(c, hist){
         inside: { spent: _round2(inSpent), count: inCount },
         after: { spent: _round2(afterSpent), count: afterCount },
         unitemised: { spent: 0, visits: 0 },
-        excess: { spent: 0, visits: 0 },
+        supersedes: { spent: 0, visits: 0 },
         // Listed rows the original report already counted under some other
         // record — shown in the modal so the card still reconciles to the list.
         reportedInPeriod: { spent: supprSpent, visits: supprCount, cutoff: splitAt }
@@ -4113,10 +4141,11 @@ function customerTally(c, hist){
     after: { spent: _round2(afterSpent), count: afterCount },
     // The part of the baseline that no listed transaction accounts for.
     unitemised: { spent: _round2(Math.max(0, base.spent - inSpent)), visits: Math.max(0, base.visits - inCount) },
-    // Listed rows inside the baseline period beyond what the baseline records
-    // (duplicates / rows the report already counted) — shown so the listed
-    // rows still reconcile to the card, never added to the total.
-    excess: { spent: _round2(Math.max(0, inSpent - base.spent)), visits: Math.max(0, inCount - base.visits) },
+    // The part of the itemised rows the baseline does not reach. Unlike the
+    // old `excess` — which was listed but dropped — this money IS in the
+    // total: the itemised document superseded the aggregate. Kept as a field
+    // so the modal can say so and the revenue ledgers can put it in a month.
+    supersedes: { spent: _round2(Math.max(0, inSpent - base.spent)), visits: Math.max(0, inCount - base.visits) },
     // Only set for baseline-less records whose rows predate the report cut-off.
     reportedInPeriod: { spent: 0, visits: 0, cutoff: '' }
   };
@@ -4162,6 +4191,9 @@ function reconcileCustomerAggregates(c, hist){
                    + the part of a baseline that exceeds the report row (a dated
                      export aggregate / a legacy frozen surplus — no itemised
                      dates, so it is credited to the cut-off's month)
+                   + the part of the baseline period's ITEMISED rows that
+                     exceeds that baseline (the statement supersedes the
+                     aggregate — see customerTally), in those rows' own months
                    + each daily ledger, credited to its own month
 
    Which makes the invariant the UI depends on true by construction:
@@ -4202,19 +4234,53 @@ function deriveRevenueLedgers(){
     const reportSpent = report ? Math.max(0, Number(report.spent) || 0) : 0;
     const reportVisits = report ? Math.max(0, Number(report.visits) || 0) : 0;
     // Everything this customer has above what the original report recorded is
-    // revenue the report did not already count.
-    importedRev = _round2(importedRev + Math.max(0, _round2((Number(c.spent) || 0) - reportSpent)));
+    // revenue the report did not already count. `cap` is also the ceiling for
+    // what this customer may add to the monthly chart, so Σ monthly can never
+    // outrun importedRev however the baseline and the rows compare.
+    const cap = Math.max(0, _round2((Number(c.spent) || 0) - reportSpent));
+    importedRev = _round2(importedRev + cap);
     importedTx += Math.max(0, (Number(c.visits) || 0) - reportVisits);
     // Itemised: rows after the cut-off carry their own dates.
     const cutoff = t.base.lastVisit;
+    const cutoffMonth = _ledgerMonthOf(cutoff || c.lastVisit);
+    const inMonths = new Map();
+    let placed = 0;
     rows.forEach(r => {
       const d = _dateOnly(r.date);
-      if (!cutoff || (d && d > cutoff)) addMonth(_ledgerMonthOf(d), Math.max(0, Number(r.amount) || 0));
+      const a = Math.max(0, Number(r.amount) || 0);
+      if (!cutoff || (d && d > cutoff)) {
+        const mk = _ledgerMonthOf(d);
+        if (mk) { addMonth(mk, a); placed = _round2(placed + a); }
+      } else {
+        // In-period rows are the candidates for the supersede split below; an
+        // undated one can only belong to the period it was booked against.
+        const mk = _ledgerMonthOf(d) || cutoffMonth;
+        if (mk) inMonths.set(mk, _round2((inMonths.get(mk) || 0) + a));
+      }
     });
     // Un-itemised: a baseline bigger than the report row (dated export
     // aggregate, legacy frozen surplus) has no rows behind it.
-    const surplus = Math.max(0, _round2(t.base.spent - reportSpent));
-    if (surplus > 0) addMonth(_ledgerMonthOf(cutoff || c.lastVisit), surplus);
+    let room = Math.max(0, _round2(cap - placed));
+    const surplus = Math.min(Math.max(0, _round2(t.base.spent - reportSpent)), room);
+    if (surplus > 0) { addMonth(cutoffMonth, surplus); room = _round2(room - surplus); }
+    // Superseded: the part of the baseline period's itemised rows the aggregate
+    // did not reach (customerTally — an itemised document is preferred over the
+    // seed data). Those rows are dated, so unlike the surplus they go to their
+    // OWN months, spread in proportion to what each month holds.
+    const over = Math.min(Math.max(0, _round2(t.inside.spent - t.base.spent)), room);
+    if (over > 0) {
+      const entries = [...inMonths.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+      const inTotal = _round2(entries.reduce((s, e) => s + e[1], 0));
+      if (inTotal > 0) {
+        let left = over;
+        entries.forEach(([mk, v], i) => {
+          // Last month takes the rounding remainder so the split sums to `over`.
+          const share = (i === entries.length - 1) ? left : _round2(over * (v / inTotal));
+          const give = Math.min(Math.max(0, _round2(share)), left);
+          if (give > 0) { addMonth(mk, give); left = _round2(left - give); }
+        });
+      }
+    }
   });
   (DB.dailyLedgers || []).forEach(l => {
     const rev = Math.max(0, Number(l && l.revenue) || 0);
@@ -8178,16 +8244,18 @@ function showCustomerDetail(name){
   }
   const asOf = tally.base.lastVisit;
   if(un.spent > 0 || un.visits > 0){
-    tallyNote += '<div style="display:flex;justify-content:space-between;padding:6px 10px;font-size:.78rem;color:var(--muted);" title="Part of the baseline total (original report / customer export) that has no itemised M-Pesa row yet. Backfill the matching statement to itemise it.">' +
+    tallyNote += '<div style="display:flex;justify-content:space-between;padding:6px 10px;font-size:.78rem;color:var(--muted);" title="Part of the report / customer-export total that no itemised statement row accounts for — usually cash sales, which no M-Pesa statement can show. Backfilling the matching statement brings this down to whatever is genuinely left.">' +
       '<span>+ Earlier purchases' + (asOf ? ' up to ' + asOf : '') + ' (not itemised)</span><span>' + un.visits + ' visit' + (un.visits===1?'':'s') + ' · ' + kes(un.spent) + '</span></div>';
   }
-  // Rows dated inside the report / export period beyond what that total
-  // records (a re-imported statement, duplicate receipts): the baseline is
-  // authoritative for its period, so they are listed but not added again.
-  const ex = tally.excess || { spent: 0, visits: 0 };
-  if(ex.spent > 0 || ex.visits > 0){
-    tallyNote += '<div style="display:flex;justify-content:space-between;padding:6px 10px;font-size:.78rem;color:var(--muted);" title="Listed rows dated inside the report / export period that its total already includes (e.g. a re-imported statement or a duplicate receipt). They are shown for reference but never counted twice.">' +
-      '<span>− Already in the report total' + (asOf ? ' (up to ' + asOf + ')' : '') + '</span><span>' + ex.visits + ' visit' + (ex.visits===1?'':'s') + ' · ' + kes(ex.spent) + '</span></div>';
+  // The itemised rows for the report / export period reached past what that
+  // aggregate recorded, so the aggregate gave way to them (an itemised
+  // document is preferred over the seed data — see CUSTOMER TALLY). This is a
+  // note, not a line of the arithmetic: that money is already inside "Listed
+  // above", so the footer still adds up without it.
+  const sup = tally.supersedes || { spent: 0, visits: 0 };
+  if(sup.spent > 0 || sup.visits > 0){
+    tallyNote += '<div style="display:flex;justify-content:space-between;padding:6px 10px;font-size:.78rem;color:var(--blue);" title="The itemised statement for this period is the better record, so it replaced the report / export aggregate instead of being hidden behind it. These visits and this money are already included in “Listed above” — this line only explains why the total is higher than the report figure.">' +
+      '<span>↳ Statement supersedes the report total' + (asOf ? ' (up to ' + asOf + ')' : '') + '</span><span>+' + sup.visits + ' visit' + (sup.visits===1?'':'s') + ' · ' + kes(sup.spent) + '</span></div>';
   }
   // This record was created by an import (it carries no baseline of its own),
   // but some of its rows are dated inside the original report period. That
@@ -8273,7 +8341,11 @@ function backfillTransactions(txs){
       phone: normalizeContact(tx.phone || tx.contact || ''),
       product: product,
       receipt: tx.receipt || '',
-      backfillOnly: true, // excluded from every revenue/visit/customer aggregate — history only
+      // Marks a history-only row: under storage pressure the quota path sheds
+      // these global copies first (the per-customer history keeps them). It is
+      // NOT an exclusion from the aggregates — the tally reads customerTx, so a
+      // backfilled statement still supersedes the seed baseline like any other.
+      backfillOnly: true,
       source: tx.source || '',
       importedAt: new Date().toISOString()
     };
@@ -8324,12 +8396,14 @@ function backfillTransactions(txs){
   });
 
   // Deliberately no DB.monthly / DB.importedRev / DB.importedTx updates here —
-  // backfill captures transaction history for a period the report (or a later
-  // import) already booked as revenue. The customer's own card, however, must
-  // stay in tally with the history listed under it, so each touched customer's
-  // spent/visits are re-derived from baseline + history (CUSTOMER TALLY): rows
-  // dated inside the baseline period are absorbed by the baseline (never
-  // inflating it), rows dated after it are added on top.
+  // those are DERIVED, and repairDates() (which the caller runs next) re-derives
+  // them from the customers. The customer's own card must stay in tally with the
+  // history listed under it, so each touched customer's spent/visits are
+  // re-derived from baseline + history (CUSTOMER TALLY): rows dated inside the
+  // baseline period take over from the baseline where they add up to more than
+  // it — the backfilled statement is the itemised record — and rows dated after
+  // it are added on top. A statement that falls short leaves the baseline
+  // standing, so a backfill can only ever move a total up.
   touchedCustomers.forEach(c => reconcileCustomerAggregates(c));
 
   if(comebacks.length) triggerComebackMessages(comebacks);
@@ -8471,8 +8545,10 @@ async function handleRebuild(input){
       const ok = await showConfirm('⚠️','Statements overlap your report baseline',
         'Your selected statements include dates on or before <b>' + escHtml(cutoff) + '</b>, ' +
         'which fall inside your existing <b>report baseline period</b>.<br><br>' +
-        'Those rows are <b>already counted</b> in your seed totals and will be treated as ' +
-        'already-reported — revenue is <b>not</b> doubled, and your <b>seed data is not touched</b>.<br><br>' +
+        'Those rows are <b>already counted</b> in your seed totals, so they are never added on top of ' +
+        'them — revenue is <b>not</b> doubled, and your <b>seed data is not touched</b>. Where a ' +
+        'statement shows receipts your report missed, the statement takes over for that period and the ' +
+        'difference is booked as imported revenue.<br><br>' +
         'If you only want to add or replace history without rebuilding, use <b>📥 Backfill</b> instead.',
         [
           { label: 'Continue (keep baseline)', primary: true, value: true },

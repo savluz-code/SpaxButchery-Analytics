@@ -35,7 +35,7 @@ a{color:var(--blue)}
 </head>
 <body>
 <header>
-  <h1>📋 SpaxButchery — <code>Code.gs</code> <span class="badge">v2.5 • 2026-08-18</span></h1>
+  <h1>📋 SpaxButchery — <code>Code.gs</code> <span class="badge" id="verBadge">loading version…</span></h1>
   <p>Mobile-friendly copy page. Tap <b>Copy All</b> → open <a href="https://script.google.com" target="_blank">script.google.com</a> (use <b>⋮ → Desktop site</b> on phone) → paste → Save.</p>
 </header>
 
@@ -49,7 +49,7 @@ a{color:var(--blue)}
       <li>Open your SpaxButchery project → click <code>Code.gs</code> on the left → <b>Select All</b> → <b>Paste</b> → <b>💾 Save</b> (Ctrl+S).</li>
       <li>If you changed keys, set <code>GEMINI_API_KEY</code> / <code>MOONSHOT_API_KEY</code> at the top, then <b>Deploy → Manage deployments → ✏️ Edit → Deploy</b> (or New deployment).</li>
     </ol>
-    <div class="meta">Same file as <code>google-apps-script.gs</code> in the repo · Updated 2026-09-05 (v3.1 — seedLastVisit column; v3.0 chunked saves) · Works with <code>index.html</code> GAS_URL</div>
+    <div class="meta">Same file as <code>google-apps-script.gs</code> in the repo · <b id="verNote">version read from the file itself</b> · Works with <code>index.html</code> GAS_URL</div>
   </div>
 
   <button class="btn primary" id="copyBtn">📋 Copy Entire Code.gs</button>
@@ -83,6 +83,20 @@ function toast(msg, ok=true){
   const t=$('toast'); t.textContent=msg; t.style.background = ok ? 'var(--green)' : '#e63946'; t.style.color = ok ? '#04292a' : '#fff';
   t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), 2800);
 }
+// Read the version out of the fetched file rather than repeating it in the
+// markup: a hard-coded label here silently goes stale, and then this page
+// tells you that you have deployed a version you have not.
+function versionOf(txt){
+  const m = /backend\s+(v[\d.]+)\s+\(([\d-]+)\)/.exec(txt || '');
+  return m ? { ver: m[1], date: m[2] } : null;
+}
+function showVersion(txt){
+  const v = versionOf(txt);
+  if(!v) return null;
+  $('verBadge').textContent = v.ver + ' • ' + v.date;
+  $('verNote').textContent = 'Backend ' + v.ver + ' (' + v.date + ')';
+  return v;
+}
 async function loadCode(){
   try{
     const res = await fetch('google-apps-script.gs?_=' + Date.now());
@@ -90,22 +104,28 @@ async function loadCode(){
     const txt = await res.text();
     $('codeEl').textContent = txt;
     $('chars').textContent = txt.length.toLocaleString() + ' chars • ' + txt.split('\n').length + ' lines';
+    showVersion(txt);
     return txt;
   }catch(e){
     $('codeEl').textContent = 'Failed to load google-apps-script.gs: ' + e.message + '\nTry the raw link above.';
     $('chars').textContent = 'error';
+    $('verBadge').textContent = 'not loaded';
+    $('verNote').textContent = 'could not load the file';
     return '';
   }
 }
 let cached = '';
-loadCode().then(t=> cached=t);
+let cachedVer = null;
+// So the confirmation names the version that is actually on the clipboard.
+function verSuffix(){ return cachedVer ? ' ' + cachedVer.ver : ''; }
+loadCode().then(t=>{ cached=t; cachedVer=versionOf(t); });
 
 $('copyBtn').onclick = async () => {
   if(!cached) cached = $('codeEl').textContent;
   if(!cached || cached.startsWith('Loading') || cached.startsWith('Failed')){ toast('Still loading — try again in a second', false); return; }
   try{
     await navigator.clipboard.writeText(cached);
-    toast('✅ Copied! Now paste into script.google.com → Code.gs → Save');
+    toast('✅ Copied' + verSuffix() + '! Now paste into script.google.com → Code.gs → Save');
   }catch(e){
     // Fallback: select
     const range = document.createRange();
@@ -113,7 +133,7 @@ $('copyBtn').onclick = async () => {
     const sel = window.getSelection();
     sel.removeAllRanges(); sel.addRange(range);
     // Try execCommand
-    try{ document.execCommand('copy'); toast('✅ Copied (fallback)! Paste into Code.gs'); }
+    try{ document.execCommand('copy'); toast('✅ Copied' + verSuffix() + ' (fallback)! Paste into Code.gs'); }
     catch(_){ toast('Selected — now long-press → Copy', true); }
   }
 };

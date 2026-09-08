@@ -21,6 +21,16 @@
  *      chunks are rejected; legacy clients without an uploadId still work.
  *   6. Recovery when an execution died mid-swap (live sheet left renamed).
  *   7. Unknown actions still answer "unknown action" (the client's probe).
+ *
+ * v3.2 additions, pinned at the bottom of this file: a slice delivered TWICE
+ * must not fail the save it belongs to. A row count can only be compared to a
+ * promise, so the check used to treat a repeated slice exactly like a lost one
+ * and refuse an otherwise complete save — that was the reported
+ * "chunk mismatch on seen: staged 5344 rows, expected 3672". Slices are now
+ * recorded per session and a replay is skipped; `seen` (a set of dedup keys,
+ * not records) is verified by distinct keys and de-duplicated before the swap,
+ * while transactions/customerTx keep the strict count because a duplicate
+ * there would double-count revenue.
  */
 const test = require('node:test');
 const assert = require('node:assert');
@@ -59,6 +69,18 @@ function makeSheet(name, sheets) {
             const target = sheet.rows[row - 1 + i] || (sheet.rows[row - 1 + i] = []);
             for (let j = 0; j < numCols; j++) target[col - 1 + j] = data[i][j];
           }
+        },
+        // Apps Script returns the rectangular block, padded with '' where the
+        // sheet has no cell yet.
+        getValues() {
+          const out = [];
+          for (let i = 0; i < numRows; i++) {
+            const r = sheet.rows[row - 1 + i] || [];
+            out.push(Array.from({ length: numCols }, (_, j) => (
+              r[col - 1 + j] === undefined || r[col - 1 + j] === null ? '' : r[col - 1 + j]
+            )));
+          }
+          return out;
         }
       };
     },
@@ -81,7 +103,7 @@ function makeSheet(name, sheets) {
   return sheet;
 }
 
-function makeEnv() {
+function makeEnv({ lockBusy = false } = {}) {
   const sheets = new Map();
   const props = {};
   const cache = {};
@@ -111,10 +133,12 @@ function makeEnv() {
       })
     },
     LockService: {
+      // Apps Script's waitLock returns a boolean: false means another writer
+      // still holds the lock and this execution must NOT proceed.
       getScriptLock: () => ({
-        waitLock: () => {},
+        waitLock: () => !lockBusy,
         releaseLock: () => {},
-        hasLock: () => true
+        hasLock: () => !lockBusy
       })
     },
     CacheService: {
@@ -365,4 +389,241 @@ test('ensureSheets_ recovers a live sheet left renamed by a commit that died mid
   assert.strictEqual(loaded.transactions.length, 5);
   assert.ok(loaded.transactions.every((t) => t.receipt.endsWith('X')), 'staged (newer) data must win the recovery');
   assert.ok(env.sheet('Transactions'), 'live sheet must exist again');
+});
+
+/* ── repeated chunk delivery (the "staged 5344 rows, expected 3672" failure) ──
+ *
+ * A row count can only be compared to a promise, so the check could not tell a
+ * LOST slice (dangerous — abort) from a slice delivered TWICE (harmless — the
+ * data is all there). Any duplicate delivery — a client retry, a proxy replay,
+ * the app open in two tabs — appended its rows a second time and failed an
+ * otherwise complete save. The reported case was `seen`, the last table up:
+ * 3672 dedup keys chunk as [2000, 1672], the final slice landed twice, and the
+ * commit refused at 5344 staged rows.
+ */
+
+// The client's exact slicing: CHUNK_ROWS is 2000 in index.html.
+const CHUNK_ROWS = 2000;
+function sliceRows(rows) {
+  const out = [];
+  for (let i = 0; i < rows.length; i += CHUNK_ROWS) out.push(rows.slice(i, i + CHUNK_ROWS));
+  return out;
+}
+
+test('a repeated `seen` slice no longer fails the commit — the set is de-duplicated', async () => {
+  const env = makeEnv();
+  // The reported shape: 3672 dedup keys → slices of [2000, 1672].
+  const seenRows = [];
+  for (let i = 0; i < 3672; i++) seenRows.push({ key: 'receipt|R' + i + '|2026-09-01|', value: 1 });
+  const slices = sliceRows(seenRows);
+  assert.deepStrictEqual(slices.map((s) => s.length), [2000, 1672], 'fixture must reproduce the reported slicing');
+
+  const begin = await env.post({ action: 'saveBegin', customers: [], monthly: { labels: [], revenue: [] }, settings: {} });
+  for (const s of slices) {
+    await env.post({ action: 'saveChunk', table: 'seen', rows: s, uploadId: begin.uploadId });
+  }
+  // The final slice is delivered a second time by a client that predates `seq`
+  // (it echoes no seq, so nothing can prove it is a replay).
+  const replay = await env.post({ action: 'saveChunk', table: 'seen', rows: slices[1], uploadId: begin.uploadId });
+  assert.strictEqual(replay.success, true);
+
+  const commit = await env.post({
+    action: 'saveCommit',
+    expect: { transactions: 0, customerTx: 0, seen: seenRows.length },
+    uploadId: begin.uploadId
+  });
+  assert.deepStrictEqual(commit, { success: true }, 'a duplicate `seen` slice must not fail the save');
+
+  // What actually landed: one row per key, not 5344 rows.
+  assert.strictEqual(env.sheet('Seen').getLastRow(), seenRows.length + 1, 'live Seen must hold one row per key plus the header');
+  const loaded = await env.load();
+  assert.strictEqual(Object.keys(loaded.seen).length, seenRows.length);
+});
+
+test('de-duplication collapses repeated keys only — a keyless row still counts', async () => {
+  const env = makeEnv();
+  const begin = await env.post({ action: 'saveBegin', customers: [], monthly: { labels: [], revenue: [] }, settings: {} });
+  // Two copies of one key (a replayed slice) plus a row with no key at all.
+  // Only the repeated key may be collapsed: dropping the keyless row too would
+  // change the count for something that is not a duplicate.
+  const rows = [{ key: 'a', value: 1 }, { key: '', value: 1 }, { key: 'a', value: 1 }];
+  await env.post({ action: 'saveChunk', table: 'seen', rows, uploadId: begin.uploadId });
+
+  const commit = await env.post({
+    action: 'saveCommit', expect: { transactions: 0, customerTx: 0, seen: 2 }, uploadId: begin.uploadId
+  });
+  assert.deepStrictEqual(commit, { success: true });
+  assert.strictEqual(env.sheet('Seen').getLastRow(), 3, 'header + the one key + the keyless row');
+});
+
+test('a `seen` slice that is genuinely short still aborts the commit', async () => {
+  const env = makeEnv();
+  const begin = await env.post({ action: 'saveBegin', customers: [], monthly: { labels: [], revenue: [] }, settings: {} });
+  // Only 20 of 50 promised keys arrive — de-duplication must not paper over a
+  // real loss.
+  const rows = [];
+  for (let i = 0; i < 20; i++) rows.push({ key: 'k' + i, value: 1 });
+  await env.post({ action: 'saveChunk', table: 'seen', rows, uploadId: begin.uploadId });
+
+  const commit = await env.post({
+    action: 'saveCommit', expect: { transactions: 0, customerTx: 0, seen: 50 }, uploadId: begin.uploadId
+  });
+  assert.strictEqual(commit.success, false);
+  assert.match(commit.error, /chunk mismatch on seen: staged 20 rows, expected 50/);
+});
+
+test('a slice that repeats with its seq is skipped — a record table is never appended twice', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  const begin = await env.post({ action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings });
+
+  const first = await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: begin.uploadId, seq: 0 });
+  assert.deepStrictEqual(first, { success: true, written: 5 });
+
+  // The same slice arrives again (retry / proxy replay / second tab).
+  const again = await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: begin.uploadId, seq: 0 });
+  assert.deepStrictEqual(again, { success: true, written: 0, duplicate: true });
+  assert.strictEqual(env.sheet('Transactions_Staging').getLastRow(), 6, 'the replay must not stage a second copy');
+
+  const commit = await env.post({
+    action: 'saveCommit', expect: { transactions: 5, customerTx: 0, seen: 0 }, uploadId: begin.uploadId
+  });
+  assert.deepStrictEqual(commit, { success: true });
+  const loaded = await env.load();
+  assert.strictEqual(loaded.transactions.length, 5, 'revenue rows must not be doubled by a replayed slice');
+});
+
+test('seq numbers are per upload session — a new save starts counting from scratch', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+
+  const one = await env.post({ action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings });
+  await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: one.uploadId, seq: 0 });
+
+  const two = await env.post({ action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings });
+  // seq 0 again, but for the NEW session: it must stage, not be skipped.
+  const res = await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: two.uploadId, seq: 0 });
+  assert.deepStrictEqual(res, { success: true, written: 5 });
+
+  const commit = await env.post({
+    action: 'saveCommit', expect: { transactions: 5, customerTx: 0, seen: 0 }, uploadId: two.uploadId
+  });
+  assert.deepStrictEqual(commit, { success: true });
+});
+
+test('a repeated record-table slice with no seq still refuses — a duplicate would double revenue', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  assert.deepStrictEqual(await env.post({ action: 'saveAll', ...db }), { success: true });
+
+  const begin = await env.post({ action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings });
+  // A pre-seq client replays a slice: nothing can prove it is a replay, so the
+  // strict count must still catch it rather than stage two of every row.
+  await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: begin.uploadId });
+  await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: begin.uploadId });
+
+  const commit = await env.post({
+    action: 'saveCommit', expect: { transactions: 5, customerTx: 0, seen: 0 }, uploadId: begin.uploadId
+  });
+  assert.strictEqual(commit.success, false);
+  assert.match(commit.error, /chunk mismatch on transactions: staged 10 rows, expected 5/);
+  assert.strictEqual((await env.load()).transactions.length, 5, 'live data must be untouched');
+});
+
+test('a refused commit clears the staging sheets, so the retry starts clean', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  const begin = await env.post({ action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings });
+  await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: begin.uploadId });
+  const refused = await env.post({
+    action: 'saveCommit', expect: { transactions: 99, customerTx: 0, seen: 0 }, uploadId: begin.uploadId
+  });
+  assert.strictEqual(refused.success, false);
+  assert.strictEqual(env.sheet('Transactions_Staging').getLastRow(), 1, 'only the header row may be left staged');
+
+  // The retry the message asks for now stages from empty.
+  const retry = await env.post({ action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings });
+  await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: retry.uploadId });
+  assert.deepStrictEqual(
+    await env.post({ action: 'saveCommit', expect: { transactions: 5, customerTx: 0, seen: 0 }, uploadId: retry.uploadId }),
+    { success: true }
+  );
+});
+
+test('a commit from a superseded session is refused — it cannot swap another device\'s staged rows', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  const first = await env.post({ action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings });
+  const second = await env.post({ action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings });
+  assert.notStrictEqual(first.uploadId, second.uploadId);
+
+  await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: second.uploadId });
+  // The stale device comes back and asks to commit counts for slices that are
+  // no longer staged.
+  const stale = await env.post({
+    action: 'saveCommit', expect: { transactions: 5, customerTx: 0, seen: 0 }, uploadId: first.uploadId
+  });
+  assert.strictEqual(stale.success, false);
+  assert.match(stale.error, /upload superseded/);
+
+  // The current session still commits normally.
+  const ok = await env.post({
+    action: 'saveCommit', expect: { transactions: 5, customerTx: 0, seen: 0 }, uploadId: second.uploadId
+  });
+  assert.deepStrictEqual(ok, { success: true });
+});
+
+/* ── script lock ───────────────────────────────────────────────────────────── */
+
+test('a save that cannot get the script lock is refused, not run alongside the other writer', async () => {
+  const env = makeEnv({ lockBusy: true });
+  const db = dbFixture();
+
+  for (const body of [
+    { action: 'saveAll', ...db },
+    { action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings },
+    { action: 'saveChunk', table: 'seen', rows: [{ key: 'k', value: 1 }] },
+    { action: 'saveCommit', expect: { transactions: 0, customerTx: 0, seen: 0 } }
+  ]) {
+    const res = await env.post(body);
+    assert.strictEqual(res.success, false, body.action + ' must not proceed without the lock');
+    assert.match(res.error, /backend busy/, body.action);
+  }
+  // Nothing was staged or swapped while the lock was held elsewhere.
+  assert.strictEqual(env.sheet('Transactions'), null, 'no sheet may be touched without the lock');
+});
+
+/* ── the deploy page must not lie about the version ──────────────────────────
+ *
+ * Merging to GitHub updates the Pages-hosted app but NOT the Apps Script
+ * backend — that only changes when Code.gs is pasted and redeployed. code.html
+ * is the page you copy from, so a stale version label on it tells you that you
+ * have deployed a version you have not. It now reads the version out of the
+ * file it is about to put on your clipboard.
+ */
+
+test('code.html reads the backend version from the file, not from hard-coded markup', () => {
+  const html = fs.readFileSync(path.join(ROOT, 'code.html'), 'utf8');
+
+  // The badge and the note are filled in at load time, not written as a
+  // version string in the markup.
+  assert.match(html, /<span class="badge" id="verBadge">/);
+  assert.match(html, /<b id="verNote">/);
+  assert.ok(!/class="badge">v\d+\.\d+/.test(html), 'the badge must not carry a hard-coded version');
+
+  // The regex it parses with, lifted from the page.
+  const fn = /function versionOf\(txt\)\{[\s\S]*?\n\}/.exec(html);
+  assert.ok(fn, 'versionOf must exist in code.html');
+  const versionOf = vm.runInContext('(' + fn[0].replace('function versionOf', 'function') + ')', vm.createContext({}));
+
+  // It must read the real file correctly — including the release before this
+  // one, which is what proves it is parsing rather than guessing.
+  const current = versionOf(GAS);
+  assert.ok(current, 'versionOf must match the header of google-apps-script.gs');
+  const header = /backend\s+(v[\d.]+)\s+\(([\d-]+)\)/.exec(GAS);
+  assert.strictEqual(current.ver, header[1]);
+  assert.strictEqual(current.date, header[2]);
+
+  // …and the version it reports is the one that fixes the chunk mismatch.
+  assert.strictEqual(current.ver, 'v3.2', 'code.html must be offering the fixed backend');
 });

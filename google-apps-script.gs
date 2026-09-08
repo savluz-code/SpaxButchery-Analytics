@@ -1,5 +1,5 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.1  (2026-09-05)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.2  (2026-09-08)
  * ─────────────────────────────────────────────────────────────────
  * MOBILE: can't edit script.google.com on your phone? Open
  *   https://savluz-code.github.io/SpaxButchery-Analytics/code.html
@@ -87,12 +87,37 @@ var TABLE_HEADERS = {
 
    Live sheets are only ever replaced after the staged row counts verify, so a
    dropped connection costs a retry — never a truncated sheet. saveAll now
-   stages and swaps too, so even one-shot saves are atomic for readers. */
+   stages and swaps too, so even one-shot saves are atomic for readers.
+
+   v3.2 makes the count check tell a LOST slice from a REPEATED one. A row
+   count can only be compared to a promise, so a slice delivered twice (a
+   client retry, a proxy replay, the app open in two tabs) used to stage its
+   rows twice and fail the commit with "chunk mismatch … staged 5344 rows,
+   expected 3672" — a save refused over data that was perfectly fine:
+     • saveChunk records each slice's `seq` per session and skips one it has
+       already staged, so no table can be appended twice.
+     • `seen` is a set of dedup keys, not records, so it is verified by
+       DISTINCT keys and de-duplicated before the swap; a repeated slice there
+       is harmless. transactions/customerTx are records — a duplicate would
+       double-count revenue — so they keep the strict row count.
+     • saveCommit checks the uploadId too (it only checked saveChunk before),
+       and a refused commit clears the staging sheets so the retry it asks for
+       starts from an empty staging area.
+     • waitLock's answer is honoured: a save that cannot get the script lock is
+       refused instead of running alongside the writer that holds it. */
 
 var STAGE_SUFFIX = '_Staging';
 var SWAP_TMP_SUFFIX = '_SwapTmp';
 var UPLOAD_KEY = 'spaxUploadSession';
+var CHUNK_SEQ_KEY = 'spaxChunkSeqs';
 var BIG_TABLES = { transactions: 1, customerTx: 1, seen: 1 };
+/* `seen` is a SET of dedup keys, not a list of records: the same key staged
+   twice is still one key (loadAll_ collapses it with seen[key] = 1). It is
+   therefore verified by DISTINCT keys and de-duplicated before the swap, so a
+   chunk delivered twice cannot fail an otherwise complete save. The other big
+   tables are records — a duplicate there would double-count revenue — so they
+   keep the strict row count. */
+var IDEMPOTENT_TABLES = { seen: 1 };
 
 function doGet(e) {
   var action = (e && e.parameter && e.parameter.action) || 'load';
@@ -113,8 +138,9 @@ function doPost(e) {
     var action = body.action || '';
 
     if (action === 'saveAll') {
-      saveAll_(body);
-      return json_({ success: true });
+      // saveAll_ returns a failure object when it could not take the script
+      // lock; anything else means the stage-and-swap completed.
+      return json_(saveAll_(body) || { success: true });
     }
 
     if (action === 'saveBegin') {
@@ -224,7 +250,7 @@ function loadAll_() {
 // the live database at its previous, complete state instead of truncating it.
 function saveAll_(body) {
   var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  if (!lock.waitLock(30000)) return backendBusy_();
   try {
     prepareStaging_();
     stageSmallTables_(body);
@@ -241,18 +267,17 @@ function saveAll_(body) {
 
 function saveBegin_(body) {
   var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  if (!lock.waitLock(30000)) return backendBusy_();
   try {
     prepareStaging_();
     stageSmallTables_(body);
     // Big staging sheets are reset to header-only and filled by saveChunk.
-    Object.keys(BIG_TABLES).forEach(function (table) {
-      writeObjects_(stagingSheet_(SHEETS[table]), [], TABLE_HEADERS[table]);
-    });
+    resetStaging_();
     var uploadId = Utilities.getUuid();
     try {
       CacheService.getScriptCache().put(UPLOAD_KEY, uploadId, 3600);
     } catch (cacheErr) { /* best-effort session guard only */ }
+    resetChunkSeqs_(uploadId);
     return { success: true, uploadId: uploadId };
   } finally {
     lock.releaseLock();
@@ -268,15 +293,27 @@ function saveChunk_(body) {
     return { success: false, error: 'upload superseded by a newer save — please retry the whole save' };
   }
   var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  if (!lock.waitLock(30000)) return backendBusy_();
   try {
     var sheet = stagingSheet_(SHEETS[table]);
     if (!sheet) {
       return { success: false, error: 'no upload in progress — saveBegin must run before saveChunk' };
     }
+    var seq = body.seq;
+    var hasSeq = seq !== undefined && seq !== null && seq !== '';
+    // A slice this session already staged is a no-op the second time it
+    // arrives (a client retry, a proxy replay, a second tab). Appending it
+    // again is what produced "staged 5344 rows, expected 3672".
+    if (hasSeq && chunkAlreadyStaged_(body.uploadId, table, seq)) {
+      return { success: true, written: 0, duplicate: true };
+    }
     var rows = body.rows || [];
-    if (!rows.length) return { success: true, written: 0 };
+    if (!rows.length) {
+      if (hasSeq) recordChunkSeq_(body.uploadId, table, seq);
+      return { success: true, written: 0 };
+    }
     appendObjects_(sheet, rows, TABLE_HEADERS[table]);
+    if (hasSeq) recordChunkSeq_(body.uploadId, table, seq);
     return { success: true, written: rows.length };
   } finally {
     lock.releaseLock();
@@ -284,8 +321,13 @@ function saveChunk_(body) {
 }
 
 function saveCommit_(body) {
+  // A commit from a superseded session must not swap in another device's
+  // staged rows — it promised counts for slices that are no longer there.
+  if (!uploadSessionValid_(body.uploadId)) {
+    return { success: false, error: 'upload superseded by a newer save — please retry the whole save' };
+  }
   var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  if (!lock.waitLock(30000)) return backendBusy_();
   try {
     // 1) Verify every promised row landed BEFORE touching any live sheet.
     var expect = body.expect || {};
@@ -293,8 +335,12 @@ function saveCommit_(body) {
     for (var i = 0; i < tables.length; i++) {
       var table = tables[i];
       var want = Number(expect[table] || 0);
+      if (IDEMPOTENT_TABLES[table]) dedupeStaged_(table);
       var staged = stagedRowCount_(table);
       if (staged !== want) {
+        // Leave nothing stale behind: the retry starts from an empty staging
+        // area instead of inheriting the rows this attempt left lying around.
+        resetStaging_();
         return {
           success: false,
           error: 'chunk mismatch on ' + table + ': staged ' + staged + ' rows, expected ' + want +
@@ -309,6 +355,13 @@ function saveCommit_(body) {
   } finally {
     lock.releaseLock();
   }
+}
+
+// waitLock returning false means another writer still holds the script lock.
+// Proceeding anyway is how two saves interleave their renames, so refuse the
+// request instead — the client's next save retries with the latest data.
+function backendBusy_() {
+  return { success: false, error: 'backend busy with another save — please retry the save' };
 }
 
 /* ── staging helpers ── */
@@ -389,6 +442,87 @@ function stagedRowCount_(table) {
   var sheet = stagingSheet_(SHEETS[table]);
   if (!sheet) return -1;
   return Math.max(0, sheet.getLastRow() - 1);
+}
+
+// Back to header-only. Used at saveBegin (a fresh upload session) and after a
+// refused commit, so a retry never inherits rows from the attempt before it.
+function resetStaging_() {
+  Object.keys(BIG_TABLES).forEach(function (table) {
+    var sheet = stagingSheet_(SHEETS[table]);
+    if (sheet) writeObjects_(sheet, [], TABLE_HEADERS[table]);
+  });
+}
+
+// Collapse repeated keys in a staged set-table down to one row each. A chunk
+// that lands twice stages its rows twice; for `seen` those copies are the same
+// keys, so dropping them leaves exactly the data the client promised instead
+// of failing the commit. Returns the number of duplicate rows removed.
+function dedupeStaged_(table) {
+  var sheet = stagingSheet_(SHEETS[table]);
+  if (!sheet) return 0;
+  var headers = TABLE_HEADERS[table];
+  var last = sheet.getLastRow();
+  if (last <= 2) return 0; // header alone, or header + a single row
+  var values = sheet.getRange(2, 1, last - 1, headers.length).getValues();
+  var kept = [];
+  var keys = {};
+  for (var i = 0; i < values.length; i++) {
+    var first = values[i][0];
+    var key = String(first === undefined || first === null ? '' : first);
+    // Only a REPEATED key is dropped. A row with no key at all is kept as-is so
+    // this cannot change the staged count for anything but genuine duplicates.
+    if (key !== '') {
+      if (keys[key]) continue; // this key is already staged — drop the copy
+      keys[key] = 1;
+    }
+    kept.push(values[i]);
+  }
+  if (kept.length === values.length) return 0; // nothing duplicated
+  writeValueRows_(sheet, kept, headers);
+  return values.length - kept.length;
+}
+
+/* ── chunk sequence bookkeeping ──
+   Which slices of this upload session have already been staged, so a slice
+   delivered twice is recognised and skipped rather than appended again. Kept
+   in Script Properties (a few dozen bytes — one entry per chunk, not per row)
+   and scoped to the uploadId, so a new session starts clean. Clients that
+   predate `seq` send none: they are appended as before and the commit's row
+   count stays the safety net. */
+
+function chunkSeqState_(uploadId) {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(CHUNK_SEQ_KEY);
+    if (raw) {
+      var state = JSON.parse(raw);
+      if (state && String(state.uploadId) === String(uploadId || '')) return state.seqs || {};
+    }
+  } catch (err) { /* unreadable state — treat as nothing staged yet */ }
+  return {};
+}
+
+function chunkAlreadyStaged_(uploadId, table, seq) {
+  var list = chunkSeqState_(uploadId)[table] || [];
+  return list.indexOf(String(seq)) !== -1;
+}
+
+function recordChunkSeq_(uploadId, table, seq) {
+  var seqs = chunkSeqState_(uploadId);
+  if (!seqs[table]) seqs[table] = [];
+  seqs[table].push(String(seq));
+  try {
+    PropertiesService.getScriptProperties().setProperty(
+      CHUNK_SEQ_KEY, JSON.stringify({ uploadId: String(uploadId || ''), seqs: seqs })
+    );
+  } catch (err) { /* best-effort: the commit count check still catches trouble */ }
+}
+
+function resetChunkSeqs_(uploadId) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(
+      CHUNK_SEQ_KEY, JSON.stringify({ uploadId: String(uploadId || ''), seqs: {} })
+    );
+  } catch (err) { /* best-effort */ }
 }
 
 // Atomically-ish replace every live sheet with its staging copy. Renames are
@@ -590,19 +724,28 @@ function rowsToObjects_(sheet) {
 }
 
 function writeObjects_(sheet, rows, headers) {
-  sheet.clearContents();
-  if (!headers || !headers.length) return;
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  if (!rows.length) return;
-  var data = rows.map(function (r) {
+  if (!headers || !headers.length) {
+    sheet.clearContents();
+    return;
+  }
+  writeValueRows_(sheet, rows.map(function (r) {
     return headers.map(function (h) {
       var v = r[h];
       if (v === undefined || v === null) return '';
       if (typeof v === 'boolean') return v ? 'true' : 'false';
       return v;
     });
-  });
-  sheet.getRange(2, 1, data.length, headers.length).setValues(data);
+  }), headers);
+}
+
+// Same write, from rows that are already plain arrays (the de-duplication path
+// rewrites staged values it read straight back out of the sheet).
+function writeValueRows_(sheet, valueRows, headers) {
+  sheet.clearContents();
+  if (!headers || !headers.length) return;
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (!valueRows.length) return;
+  sheet.getRange(2, 1, valueRows.length, headers.length).setValues(valueRows);
 }
 
 function toBool_(v) {

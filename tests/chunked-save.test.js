@@ -64,9 +64,10 @@ function syncLayerSource() {
  * error — a transient failure that must fall back to saveAll without
  * poisoning the capability cache.
  */
-function makeCloud({ chunked = true, uploadIds = true, failChunk = 0, dropChunk = 0, failBeginTimes = 0 } = {}) {
+function makeCloud({ chunked = true, uploadIds = true, failChunk = 0, dropChunk = 0, doubleSend = 0, failBeginTimes = 0 } = {}) {
   const calls = [];
   const staged = { transactions: [], customerTx: [], seen: [] };
+  const stagedSeqs = new Set(); // (table, seq) pairs already staged this session
   const store = {};
   let chunkNo = 0;
   let beginNo = 0;
@@ -78,13 +79,31 @@ function makeCloud({ chunked = true, uploadIds = true, failChunk = 0, dropChunk 
       if (!chunked) return respond({ success: false, error: 'unknown action' });
       beginNo += 1;
       if (beginNo <= failBeginTimes) return { ok: false, status: 500, text: async () => 'Internal Error' };
+      // A new upload session stages from empty, exactly like the real backend.
+      staged.transactions = []; staged.customerTx = []; staged.seen = [];
+      stagedSeqs.clear();
       return respond({ success: true, ...(uploadIds ? { uploadId: 'upload-123' } : {}) });
     }
     if (body.action === 'saveChunk') {
       chunkNo += 1;
       if (failChunk === chunkNo) return respond({ success: false, error: 'chunk write failed' });
-      if (dropChunk !== chunkNo) (staged[body.table] || []).push(...body.rows);
-      return respond({ success: true, written: dropChunk === chunkNo ? 0 : body.rows.length });
+      // `doubleSend` hands the SAME POST to the backend twice — what a
+      // retrying proxy or a second tab does. The v3.2 seq bookkeeping makes the
+      // second copy a no-op; a backend without it stages the slice twice and
+      // the commit then refuses with the reported "staged N rows, expected M".
+      const deliveries = doubleSend === chunkNo ? 2 : 1;
+      let res = null;
+      for (let d = 0; d < deliveries; d++) {
+        const seqKey = body.table + ':' + body.seq;
+        if (body.seq !== undefined && stagedSeqs.has(seqKey)) {
+          res = { success: true, written: 0, duplicate: true };
+          continue;
+        }
+        if (dropChunk !== chunkNo) (staged[body.table] || []).push(...body.rows);
+        if (body.seq !== undefined) stagedSeqs.add(seqKey);
+        res = { success: true, written: dropChunk === chunkNo ? 0 : body.rows.length };
+      }
+      return respond(res);
     }
     if (body.action === 'saveCommit') {
       if (uploadIds && body.uploadId !== 'upload-123') {
@@ -226,6 +245,35 @@ test('a lost chunk aborts the commit — the backend refuses and live data stays
   assert.match(lastCloudError, /live data left untouched/);
   // Only the two delivered slices are staged — the lost one is not.
   assert.strictEqual(cloud.staged.transactions.length, 1000);
+});
+
+test('every slice carries a per-table seq, so the backend can recognise a replay', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const { first } = await runClient(cloud, bigDB());
+  assert.strictEqual(first, true);
+
+  const chunks = cloud.calls.filter((c) => c.action === 'saveChunk');
+  // 3000 transactions → 2 slices, then customerTx (50) and seen (100) → 1 each.
+  assert.deepStrictEqual(
+    chunks.map((c) => [c.table, c.seq]),
+    [['transactions', 0], ['transactions', 1], ['customerTx', 0], ['seen', 0]]
+  );
+  assert.ok(chunks.every((c) => Number.isInteger(c.seq)), 'seq must be a number, not undefined');
+});
+
+test('a slice delivered twice still saves — the seq stops it staging twice', async () => {
+  // A retrying proxy hands the second transactions slice to the backend twice.
+  // Without `seq` that stages 4000 rows against a promise of 3000 and the
+  // commit refuses ("staged 4000 rows, expected 3000"); with it the backend
+  // recognises the replay, answers { written: 0, duplicate: true }, and the
+  // save carries on to a successful commit.
+  const cloud = makeCloud({ chunked: true, doubleSend: 2 });
+  const { first, lastCloudError } = await runClient(cloud, bigDB());
+
+  assert.strictEqual(first, true, 'a replayed slice must not fail the save');
+  assert.strictEqual(lastCloudError, '');
+  assert.strictEqual(cloud.staged.transactions.length, 3000, 'the replayed slice must not be staged twice');
+  assert.ok(cloud.calls.some((c) => c.action === 'saveCommit'), 'the save must still go on to commit');
 });
 
 /* ── behaviour against the unchanged saveAll-only backend ───────────────── */
@@ -371,6 +419,21 @@ test('backend v3.0 ships the chunked staging actions alongside saveAll', () => {
   assert.match(GAS, /live data left untouched/);
   // An upload session id guards against interleaved uploads.
   assert.match(GAS, /uploadId/);
+});
+
+test('backend v3.2 can tell a repeated slice from a lost one', () => {
+  // Chunks are recorded per session so a replay is skipped instead of appended.
+  assert.match(GAS, /chunkAlreadyStaged_/);
+  assert.match(GAS, /recordChunkSeq_/);
+  // `seen` is a set of dedup keys: verified by distinct keys, de-duplicated
+  // before the swap, so a repeated slice cannot fail an otherwise complete save.
+  assert.match(GAS, /IDEMPOTENT_TABLES/);
+  assert.match(GAS, /dedupeStaged_/);
+  // The commit checks the session id too, and a refusal leaves staging empty.
+  assert.match(GAS, /function saveCommit_\(body\) \{\n[\s\S]{0,240}uploadSessionValid_/);
+  assert.match(GAS, /function resetStaging_/);
+  // waitLock's answer is honoured rather than ignored.
+  assert.ok(!/^\s*lock\.waitLock\(30000\);\s*$/m.test(GAS), 'waitLock result must not be discarded');
 });
 
 test('client keeps payload-aware timeouts and wires the chunked actions + fallback', () => {

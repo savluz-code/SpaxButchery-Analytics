@@ -1328,10 +1328,16 @@ async function performSaveToCloud() {
 
 // ── CHUNKED UPLOAD ──
 // saveBegin  → small tables (customers/monthly/settings) + staging reset
-// saveChunk  → one slice of a big table (transactions/customerTx/seen)
+// saveChunk  → one slice of a big table (transactions/customerTx/seen),
+//              numbered with a per-table `seq`
 // saveCommit → backend verifies every promised row landed before it swaps the
 //              staging sheets over the live ones, so a dropped connection
 //              costs a retry — never a truncated sheet.
+//
+// Backend v3.2 records the seq of every slice it stages and skips one it has
+// already seen, so a slice delivered twice (a retry, a proxy replay, the app
+// open in two tabs) no longer inflates the staged row count and fails the
+// commit with "chunk mismatch … staged N rows, expected M".
 async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
   showSyncStatus('⏳ Saving to cloud… (large upload, sending in parts)');
   let begin;
@@ -1366,9 +1372,14 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
   for (const table of ['transactions', 'customerTx', 'seen']) {
     const rows = bigTables[table];
     expect[table] = rows.length;
-    for (let i = 0; i < rows.length; i += CHUNK_ROWS) {
+    // `seq` numbers this table's slices within this upload session. The
+    // backend skips a slice it has already staged, so a request delivered
+    // twice (a retry, a proxy replay, the app open in two tabs) can no longer
+    // double the staged row count and fail the commit with "staged N rows,
+    // expected M". Older backends ignore the extra field.
+    for (let i = 0, seq = 0; i < rows.length; i += CHUNK_ROWS, seq++) {
       const slice = rows.slice(i, i + CHUNK_ROWS);
-      const res = await post({ action: 'saveChunk', table, rows: slice, uploadId }, CLOUD_TIMEOUT_CHUNK);
+      const res = await post({ action: 'saveChunk', table, rows: slice, uploadId, seq }, CLOUD_TIMEOUT_CHUNK);
       if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
       sent += slice.length;
       showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%');

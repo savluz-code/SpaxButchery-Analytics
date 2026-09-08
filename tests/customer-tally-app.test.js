@@ -49,7 +49,47 @@ function makeElement(id) {
   return el;
 }
 
-function bootApp({ localStorageSeed = {}, cloud = null } = {}) {
+// Minimal in-memory IndexedDB stand-in (same surface the app's IDB layer
+// uses): open → onupgradeneeded/onsuccess, transaction/objectStore,
+// get/put/delete with request + transaction callbacks. The Map is shared
+// between sessions, which is what makes the restart test meaningful.
+function makeFakeIndexedDB() {
+  const data = new Map();
+  const db = {
+    objectStoreNames: { contains: () => true },
+    createObjectStore: () => {},
+    close: () => {},
+    transaction: () => ({
+      objectStore: () => ({
+        get(key) {
+          const req = {};
+          queueMicrotask(() => { req.result = data.has(key) ? data.get(key) : undefined; req.onsuccess && req.onsuccess(); });
+          return req;
+        },
+        put(value, key) {
+          const req = { transaction: {} };
+          queueMicrotask(() => { data.set(key, value); req.transaction.oncomplete && req.transaction.oncomplete(); });
+          return req;
+        },
+        delete(key) {
+          const req = { transaction: {} };
+          queueMicrotask(() => { data.delete(key); req.transaction.oncomplete && req.transaction.oncomplete(); });
+          return req;
+        }
+      })
+    })
+  };
+  return {
+    data,
+    open() {
+      const req = {};
+      queueMicrotask(() => { req.result = db; req.onsuccess && req.onsuccess(); });
+      return req;
+    }
+  };
+}
+
+function bootApp({ localStorageSeed = {}, cloud = null, indexedDB = undefined } = {}) {
   const els = new Map();
   const savedPayloads = [];   // every payload POSTed to the stand-in Sheet
   const store = new Map(Object.entries(localStorageSeed));
@@ -98,6 +138,7 @@ function bootApp({ localStorageSeed = {}, cloud = null } = {}) {
     crypto: require('node:crypto').webcrypto, addEventListener() {}, removeEventListener() {},
     matchMedia: () => ({ matches: false, addEventListener() {} })
   };
+  if (indexedDB !== undefined) sandbox.indexedDB = indexedDB;
   sandbox.window = sandbox; sandbox.self = sandbox; sandbox.globalThis = sandbox;
   const ctx = vm.createContext(sandbox);
   const scripts = [...htmlSource.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)]
@@ -478,8 +519,11 @@ test('a Full Rebuild overlapping the baseline that the user keeps absorbs the ro
   assert.equal(ctx.DB.importedRev, 0, 'no new revenue from an in-baseline row');
 });
 
-test('the New-Customers-by-Month drill pops the customers whose first visit is that month', () => {
+test('the New-Customers-by-Month drill pops the customers whose first visit is that month', async () => {
   const ctx = bootApp();
+  // load() is async (it checks IndexedDB before localStorage) — flush the
+  // microtask queue so DB is seeded before we assert on it.
+  await new Promise(r => setTimeout(r, 0));
   // bootApp seeds DB.customers from SEED_CUSTOMERS, which has June 2026 first visits.
   assert.ok((ctx.DB.customers || []).some(c => c.firstVisit && String(c.firstVisit).slice(0, 7) === '2026-06'), 'seed has a June 2026 first visit');
   ctx.showNewCustomersMonth('2026-06');
@@ -812,4 +856,30 @@ test('same-name twins stay independent across a sync, and the revenue invariant 
   assert.equal(after.DB.importedRev, 700, 'the payment is not double counted by the sync');
   assert.equal(after.REPORT.totalRevenue + after.DB.importedRev, sumSpent(after));
   assert.equal(monthlyTotal(after), SEED_MONTHLY_TOTAL + 700);
+});
+
+test('a database persisted to IndexedDB survives a browser restart — with NO localStorage copy', async () => {
+  // Session 1: a fresh device (empty localStorage) whose browser has IndexedDB.
+  const fake = makeFakeIndexedDB();
+  const ctx1 = await bootLoaded({ indexedDB: fake });
+  const before = ctx1.DB.customers.length;
+
+  // A new customer + payment arrives; save() must persist it durably.
+  ctx1.importTransactions([row('Restart Test Customer', '0712000111', '2026-09-01', 850, 'RTST123456')]);
+  ctx1.save();
+  await new Promise(r => setTimeout(r, 20));
+
+  assert.ok(fake.data.has('spaxDB_v23'), 'the durable copy landed in IndexedDB');
+  const stored = JSON.parse(fake.data.get('spaxDB_v23'));
+  assert.ok(stored.customers.some(c => c.name === 'Restart Test Customer'), 'the new customer is in the durable copy');
+
+  // Session 2: the user closes and reopens the app — same IndexedDB, and
+  // localStorage is empty (it never held the database).
+  const ctx2 = await bootLoaded({ indexedDB: fake });
+  assert.equal(ctx2.DB.customers.length, before + 1, 'the restarted session restored the full database from IndexedDB');
+  assert.ok(ctx2.DB.customers.some(c => c.name === 'Restart Test Customer'), 'the new customer survived the restart');
+  assert.ok(ctx2.DB.transactions.some(t => t.receipt === 'RTST123456'), 'the transaction survived the restart');
+  // The dedup guard must survive too: re-importing the same statement skips.
+  const re = ctx2.importTransactions([row('Restart Test Customer', '0712000111', '2026-09-01', 850, 'RTST123456')]);
+  assert.equal(re.dupes, 1, 'the seen-map survived the restart, so the re-import is recognised as a duplicate');
 });

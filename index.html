@@ -3145,9 +3145,11 @@ const REPORT={totalCustomers:1669,totalRevenue:1250341,totalTxns:5519,masked:623
 
 /* ══════════ STATE ══════════ */
 let DB;
-function seedFromSavedBaseline(){
+async function seedFromSavedBaseline(){
   try {
-    const raw = localStorage.getItem(BASELINE_KEY);
+    // Baseline is a full copy of the DB — route it through IndexedDB too, or
+    // it hits the same ~5 MB localStorage wall the main store did.
+    const raw = (await idbGet(BASELINE_KEY)) || localStorage.getItem(BASELINE_KEY);
     if (!raw) return null;
     const saved = JSON.parse(raw);
     if (!saved || !saved.customers || !saved.customers.length) return null;
@@ -3161,8 +3163,8 @@ function seedFromSavedBaseline(){
     return saved;
   } catch (e) { return null; }
 }
-function seedDB(){
-  const fromBaseline = seedFromSavedBaseline();
+async function seedDB(){
+  const fromBaseline = await seedFromSavedBaseline();
   if (fromBaseline) return JSON.parse(JSON.stringify(fromBaseline));
   const today = new Date(getTodayEAT());
   return{
@@ -3199,10 +3201,14 @@ function seedDB(){
     itemCosts:{}
   };
 }
-function load(){
+async function load(){
   try{
     // Initialize DB with seed data FIRST (so saveToCloud has data to push if cloud is empty)
-    const s=localStorage.getItem('spaxDB_v23');
+    // The durable copy lives in IndexedDB (see persistDB) — its quota is device-disk
+    // sized, not the ~5 MB localStorage per-key limit. The legacy localStorage key is
+    // still read, so devices that saved with an older build migrate automatically on
+    // first load after the update (the next save writes the IDB copy).
+    const s = (await idbGet(DB_LOCAL_KEY)) || localStorage.getItem(DB_LOCAL_KEY);
     if(s){
       DB=JSON.parse(s);
       if(!DB.seen)DB.seen={};
@@ -3222,7 +3228,7 @@ function load(){
       DB.transactions.forEach(t => { markSeen(t); });
     }
     } else {
-      DB=seedDB();
+      DB=await seedDB();
     }
 
     // Build firstVisit and lastVisit lookup from seed data
@@ -3320,61 +3326,162 @@ function load(){
       if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
     });
   }catch(e){
-    DB=seedDB();
+    DB=await seedDB();
     refreshAll();
     const fixed = repairDates();
     if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
     return Promise.resolve();
   }
 }function save(){
-  // A full localStorage must NEVER block a save. persistDB() compacts the DB
-  // when it won't fit and reports whether a durable copy was written, but the
-  // cloud sync and the UI refresh always run — otherwise a (previously thrown)
-  // QuotaExceededError stopped auto-sync exactly when imports were growing the
-  // database, and left the Contact Resolver red-ringing with
-  // "exceeded the quota" (save() threw before its own saveToCloud() ran).
-  const persisted = persistDB();
-  if (persisted) {
-    DB_persistFailed = false;
-    DB_persistWarned = false;
-  } else if (!DB_persistWarned) {
-    DB_persistWarned = true;
-    showSyncStatus('⚠️ Local storage is full — data is safe in memory & the cloud. Free storage or reduce imports to save locally.');
-    if (typeof toast === 'function') toast('⚠️ Local storage full — data kept in memory & cloud only');
-  }
+  // A full local store must NEVER block a save. persistDB() writes a durable
+  // copy (IndexedDB first, localStorage as fallback) and reports the result —
+  // but the cloud sync and the UI refresh always run, so a local write
+  // failure can neither crash the caller (the old QuotaExceededError) nor skip
+  // cloud sync at the exact moment imports are growing the database.
+  persistDB().then(persisted => {
+    if (persisted) {
+      DB_persistFailed = false;
+      DB_persistWarned = false;
+    } else if (!DB_persistWarned) {
+      DB_persistWarned = true;
+      showSyncStatus('⚠️ Local storage is full — data is safe in memory & the cloud. Free storage or reduce imports to save locally.');
+      if (typeof toast === 'function') toast('⚠️ Local storage full — data kept in memory & cloud only');
+    }
+  });
   if (SYNC_MODE === 'auto') {
     saveToCloud();
   }
   refreshAll();
 }
 
-// ── QUOTA-SAFE LOCAL PERSISTENCE ──
-// A single localStorage key holds ~5 MB. A big import day (23k+ rows) easily
-// blows that, and an unguarded setItem then throws QuotaExceededError. Before
-// this helper that error bubbled out of save(), so every caller (Resolve,
-// Apply, dedupe, imports, contact-edit save…) crashed and cloud sync got
-// skipped at the worst moment. persistDB() swallows the failure, drops what is
-// safe to drop (seen-keys with no backing transaction, and history-only
-// backfill rows), retries once, and reports whether it got a durable copy
-// down. Cloud sync is deliberately OUTSIDE this helper — it must run even when
-// local is full.
+// ── LOCAL PERSISTENCE: IndexedDB primary, localStorage fallback ──
+// The database is stored THREE times per imported row — the global
+// transactions list, a per-customer copy in customerTx, and one or two
+// dedup keys in seen — so a few weeks of statement imports are tens of MB.
+// That can never fit a single localStorage key (~5 MB quota), which is why
+// "local storage full" kept coming back: PR #46's persistDB() stopped the
+// QuotaExceededError crash and shed what was safe to drop, but the DB keeps
+// outgrowing the key, so every save after a big import day failed to persist
+// again. The durable copy therefore lives in IndexedDB, whose quota is a
+// large share of the device disk (hundreds of MB), not 5 MB. localStorage
+// stays as the fallback for engines where IndexedDB is unavailable (some
+// private-browsing modes) — with its original compaction behaviour.
+const DB_LOCAL_KEY = 'spaxDB_v23';
 let DB_persistFailed = false;
 let DB_persistWarned = false;
 let DB_persistCompacted = false;
-function persistDB(){
-  // Serialize ONCE, then try to write. If we already compacted this session
-  // and it still won't fit, skip the expensive re-compaction + re-serialize on
-  // every subsequent save — just record the failure (the next successful write
-  // resets DB_persistCompacted so a future overflow re-compacts).
-  let payload;
-  try { payload = JSON.stringify(DB); }
-  catch (_) { DB_persistFailed = true; return false; }
+
+// ── Tiny IndexedDB KV layer (no dependencies) ──
+// Every call is defensive: any engine without working IndexedDB resolves to
+// null / undefined / false and the caller falls back to localStorage.
+const IDB_NAME = 'spax-analytics';
+const IDB_STORE = 'kv';
+let _idb = null;
+let _idbBroken = false;
+let _idbWriteChain = Promise.resolve();
+function idbOpen(){
+  if (_idb) return Promise.resolve(_idb);
+  if (_idbBroken) return Promise.resolve(null);
+  if (typeof indexedDB === 'undefined' || !indexedDB) { _idbBroken = true; return Promise.resolve(null); }
+  return new Promise(resolve => {
+    let settled = false;
+    const fail = () => { if (!settled) { settled = true; _idbBroken = true; resolve(null); } };
+    let req;
+    try { req = indexedDB.open(IDB_NAME, 1); } catch (_) { return fail(); }
+    if (!req) return fail();
+    req.onupgradeneeded = () => {
+      try {
+        const db = req.result;
+        if (db && !db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      } catch (_) {}
+    };
+    req.onsuccess = () => {
+      if (settled) return;
+      const db = req.result;
+      if (!db) return fail();
+      // Another tab opening a different version would wedge us here — drop
+      // the connection instead of stalling persistence.
+      db.onversionchange = () => { try { db.close(); } catch (_) {} if (_idb === db) _idb = null; };
+      settled = true;
+      _idb = db;
+      resolve(db);
+    };
+    req.onerror = () => fail();
+    req.onblocked = () => fail();
+  });
+}
+function idbObjectStore(mode){
+  if (!_idb) return null;
+  try { return _idb.transaction(IDB_STORE, mode).objectStore(IDB_STORE); } catch (_) { return null; }
+}
+function idbGet(key){
+  return idbOpen().then(db => {
+    if (!db) return undefined;
+    return new Promise(resolve => {
+      const os = idbObjectStore('readonly');
+      if (!os) return resolve(undefined);
+      let r;
+      try { r = os.get(key); } catch (_) { return resolve(undefined); }
+      r.onsuccess = () => resolve(r.result === undefined ? undefined : r.result);
+      r.onerror = () => resolve(undefined);
+    });
+  }).catch(() => undefined);
+}
+function idbSet(key, value){
+  return idbOpen().then(db => {
+    if (!db) return false;
+    return new Promise(resolve => {
+      const os = idbObjectStore('readwrite');
+      if (!os) return resolve(false);
+      let r;
+      try { r = os.put(value, key); } catch (_) { return resolve(false); }
+      let tx;
+      try { tx = r.transaction; } catch (_) {}
+      if (tx) {
+        tx.oncomplete = () => resolve(true);
+        tx.onabort = () => resolve(false);
+      } else {
+        r.onsuccess = () => resolve(true);
+        r.onerror = () => resolve(false);
+      }
+    });
+  }).catch(() => false);
+}
+function idbDel(key){
+  return idbOpen().then(db => {
+    if (!db) return false;
+    return new Promise(resolve => {
+      const os = idbObjectStore('readwrite');
+      if (!os) return resolve(false);
+      let r;
+      try { r = os.delete(key); } catch (_) { return resolve(false); }
+      let tx;
+      try { tx = r.transaction; } catch (_) {}
+      if (tx) {
+        tx.oncomplete = () => resolve(true);
+        tx.onabort = () => resolve(false);
+      } else {
+        r.onsuccess = () => resolve(true);
+        r.onerror = () => resolve(false);
+      }
+    });
+  }).catch(() => false);
+}
+
+// Legacy fallback — the original quota-safe localStorage writer, kept for
+// engines without IndexedDB: compacts what is safe to drop
+// (seen-keys with no backing transaction, history-only backfill rows),
+// retries once, and reports false (never throws) when even the compacted DB
+// does not fit.
+function persistToLocalStorage(payload){
   try {
-    localStorage.setItem('spaxDB_v23', payload);
-    DB_persistFailed = false;
-    DB_persistCompacted = false;
+    localStorage.setItem(DB_LOCAL_KEY, payload);
     return true;
   } catch (err) {
+    // Compaction-once latch: if we already compacted this session and it
+    // still won't fit, do NOT re-compact + re-write on every save — just
+    // record the failure (a successful write resets the latch, so a future
+    // overflow re-compacts).
     if (!DB_persistCompacted) {
       DB_persistCompacted = true;
       try {
@@ -3389,16 +3496,50 @@ function persistDB(){
           DB.transactions = DB.transactions.filter(t => !t.backfillOnly);
         }
         payload = JSON.stringify(DB);
-        localStorage.setItem('spaxDB_v23', payload);
-        DB_persistFailed = false;
+        localStorage.setItem(DB_LOCAL_KEY, payload);
         return true;
       } catch (_) {}
     }
-    // Still over quota — the live DB stays in memory and reaches the cloud on
-    // the next auto-save, so this device's session loses nothing.
-    DB_persistFailed = true;
     return false;
   }
+}
+
+// Serialize ONCE, then write. IndexedDB when available (its quota is
+// device-disk sized, so the DB is never compacted just to fit it); otherwise
+// the compaction-capable localStorage path. Returns Promise<boolean>:
+// whether a durable local copy was written. Cloud sync is deliberately
+// OUTSIDE this helper — it must run even when local persistence fails.
+function persistDB(){
+  let payload;
+  try { payload = JSON.stringify(DB); }
+  catch (_) { DB_persistFailed = true; return Promise.resolve(false); }
+  const result = idbOpen().then(db => {
+    if (db) {
+      // Chain writes so rapid saves land in call order (last snapshot wins).
+      _idbWriteChain = _idbWriteChain.then(() => idbSet(DB_LOCAL_KEY, payload));
+      return _idbWriteChain.then(ok => {
+        if (ok) {
+          // The IndexedDB copy just written is the newest snapshot — the
+          // legacy localStorage key (older, and the thing that used to hit the
+          // 5 MB wall) is dead weight now. Remove it to give the device back
+          // the storage it was reporting as full.
+          try { localStorage.removeItem(DB_LOCAL_KEY); } catch (_) {}
+        }
+        return ok;
+      });
+    }
+    return persistToLocalStorage(payload);
+  }).catch(() => false);
+  return result.then(ok => {
+    if (ok) {
+      DB_persistFailed = false;
+      DB_persistWarned = false;
+      DB_persistCompacted = false;
+    } else {
+      DB_persistFailed = true;
+    }
+    return ok;
+  });
 }
 const saveDB = save;
 const renderAll = refreshAll;
@@ -7173,31 +7314,39 @@ $('exportBtn').onclick = () => {
   a.download = 'spax_customers.csv'; a.click();
 };
 
-$('resetBtn').onclick = () => {
-  const hasCustom = !!(localStorage.getItem(BASELINE_KEY));
+$('resetBtn').onclick = async () => {
+  const hasCustom = !!(await idbGet(BASELINE_KEY)) || !!localStorage.getItem(BASELINE_KEY);
   const msg = hasCustom
     ? 'Reset to your saved baseline (the last “Save Current as Local Baseline”)? Imports after that save will be dropped.'
     : 'Reset ALL data to the original report seed (imports, dedup history, resolved contacts)?';
-  if (confirm(msg)) { DB = seedDB(); save(); toast(hasCustom ? '↺ Restored your saved baseline' : '↺ Reset complete'); }
+  if (confirm(msg)) { DB = await seedDB(); save(); toast(hasCustom ? '↺ Restored your saved baseline' : '↺ Reset complete'); }
 };
 
 /* ══════════ SAVE CURRENT AS LOCAL BASELINE / EXPORT JS SEED CODE ══════════ */
 const BASELINE_KEY = 'spaxBaseline_v23';
-function saveLocalBaseline(){
-  try {
-    localStorage.setItem(BASELINE_KEY, JSON.stringify(DB));
-    const n = DB.customers.length;
+async function saveLocalBaseline(){
+  let payload;
+  try { payload = JSON.stringify(DB); }
+  catch(e){ toast('❌ Could not save baseline: ' + e.message); return { ok: false }; }
+  const n = DB.customers.length;
+  // IndexedDB first (the baseline is a full DB copy — the 5 MB localStorage
+  // wall bit the main store, it would bit the baseline too); the legacy
+  // localStorage write stays as the fallback for engines without IndexedDB.
+  let ok = await idbSet(BASELINE_KEY, payload).catch(() => false);
+  if (!ok) {
+    try { localStorage.setItem(BASELINE_KEY, payload); ok = true; }
+    catch(e){ toast('❌ Could not save baseline: ' + e.message); ok = false; }
+  }
+  if (ok) {
     toast('💾 Local baseline saved');
     $('importLog').textContent = `💾 Baseline saved: ${n} customers @ ${new Date().toLocaleString('en-GB')}`;
     return { ok: true, customers: n };
-  } catch(e) {
-    toast('❌ Could not save baseline: ' + e.message);
-    return { ok: false };
   }
+  return { ok: false };
 }
 window.saveLocalBaseline = saveLocalBaseline;
-function restoreLocalBaseline(){
-  const raw = localStorage.getItem(BASELINE_KEY);
+async function restoreLocalBaseline(){
+  const raw = (await idbGet(BASELINE_KEY)) || localStorage.getItem(BASELINE_KEY);
   if(!raw){ toast('⚠️ No local baseline found — save one first'); return { ok: false }; }
   try {
     const saved = JSON.parse(raw);
@@ -7968,8 +8117,8 @@ $('rcBulkBtn').onclick=()=>{
 // Wait for load() to complete before first refresh
 load().then(() => {
   refreshAll();
-}).catch(() => {
-  DB = seedDB();
+}).catch(async () => {
+  DB = await seedDB();
   refreshAll();
 });
 </script>
@@ -8167,11 +8316,12 @@ async function smartMergeCloud(){
   }
 }
 
-function resetLocalData(){
+async function resetLocalData(){
   if(!confirm('🗑️ RESET LOCAL DATA\n\nThis will DELETE all local data AND overwrite the cloud with seed data.\n\nThis cannot be undone.\n\nAre you absolutely sure?')) return;
 
+  idbDel(DB_LOCAL_KEY);
   localStorage.removeItem('spaxDB_v23');
-  DB = seedDB();
+  DB = await seedDB();
   persistDB();
   refreshAll();
 
@@ -8192,7 +8342,7 @@ function updateSyncDetails(){
     <b>Local Transactions:</b> ${(DB.transactions || []).length.toLocaleString()}<br>
     <b>Imported Revenue:</b> KSh ${(DB.importedRev || 0).toLocaleString()}<br>
     <b>Contacts Resolved:</b> ${DB.resolved || 0}<br>
-    <b>Local Storage:</b> ${typeof DB_persistFailed !== 'undefined' && DB_persistFailed ? '<span style="color:var(--amber)">⚠️ Full — data is in memory &amp; cloud only</span>' : '<span style="color:var(--green)">OK</span>'}<br>
+    <b>Local Store:</b> ${typeof _idb !== 'undefined' && _idb ? 'IndexedDB' : 'localStorage (fallback)'} — ${typeof DB_persistFailed !== 'undefined' && DB_persistFailed ? '<span style="color:var(--amber)">⚠️ Full — data is in memory &amp; cloud only</span>' : '<span style="color:var(--green)">OK</span>'}<br>
     <b>GAS URL:</b> ${GAS_URL.includes('YOUR_SCRIPT') ? '<span style="color:var(--red)">Not configured</span>' : '<span style="color:var(--green)">Connected</span>'}
   `;
 }

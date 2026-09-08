@@ -37,6 +37,29 @@ test('Overview KPIs source live product stats and customer list length', () => {
   assert.doesNotMatch(refreshAll, /const totRev=REPORT\.totalRevenue\+DB\.importedRev;/);
 });
 
+test('Monthly Revenue is a clean stacked baseline+imported view and dashboard items are clickable', () => {
+  const refreshAll = refreshAllBody();
+
+  // Cleaner month-by-month revenue: stacked "Baseline" (report) vs "Imported",
+  // a summary strip, and click-through to that month's transactions.
+  assert.match(refreshAll, /label:'Baseline',data:baseline/);
+  assert.match(refreshAll, /label:'Imported',data:imported/);
+  assert.match(refreshAll, /const baseline = labels\.map\(l => baseByMonth\.get\(l\) \|\| 0\)/);
+  assert.match(refreshAll, /revSummary/, 'a monthly summary line is rendered');
+  assert.match(refreshAll, /showMonthTransactions\(labels\[els\[0\]\.index\]\)/, 'clicking a revenue bar drills the month');
+
+  // KPI tiles pop floating lists (clickable dashboard).
+  assert.match(refreshAll, /drillRevenue\(\)/);
+  assert.match(refreshAll, /drillCadenceOverdue\(\)/);
+  assert.match(refreshAll, /drillCustomers\(\)/);
+  assert.match(refreshAll, /drillNewThisMonth\(\)/);
+  assert.match(refreshAll, /drillVIPs\(\)/);
+
+  // Chart segments / bars are clickable too.
+  assert.match(refreshAll, /showNewCustomersMonth\(mk\)/, 'clicking a new-customer bar opens that month list');
+  assert.match(refreshAll, /showSegmentCustomers\(els\[0\]\.index\)/, 'clicking a lifecycle segment opens that list');
+});
+
 test('PR #20 cloud-sync hardening helpers are present', () => {
   // Each name was added by PR #20 (commit bdef619); they must survive.
   const restoredSymbols = [

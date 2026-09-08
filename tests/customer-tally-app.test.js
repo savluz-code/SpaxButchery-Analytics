@@ -883,3 +883,101 @@ test('a database persisted to IndexedDB survives a browser restart — with NO l
   const re = ctx2.importTransactions([row('Restart Test Customer', '0712000111', '2026-09-01', 850, 'RTST123456')]);
   assert.equal(re.dupes, 1, 'the seen-map survived the restart, so the re-import is recognised as a duplicate');
 });
+
+test('rebuild clean-slate wipe: reset to report state, keeping only names & contacts', async () => {
+  const ctx = await bootLoaded();
+  const freshSpent = sumSpent(ctx);   // the report total
+  const freshVisits = sumVisits(ctx);
+  const aMasked = ctx.DB.customers.find(c => c.masked);
+  assert.ok(aMasked, 'the seed carries masked contacts');
+
+  // Grow / bloat the database: a new customer, a post-report import, manual entries.
+  ctx.importTransactions([
+    row('Wipe Test Customer', '0712999000', '2026-08-20', 500, 'WIP1ABCDEF1'),
+    row('George Owiti', '0710428075', '2026-07-13', 300, 'WIP2ABCDEF2')
+  ]);
+  ctx.DB.dailyLedgers.push({ date: '2026-08-20', revenue: 1000, items: [] });
+  ctx.DB.dailyExpenses.push({ date: '2026-08-20', cat: 'Wages', amount: 200, note: 'test' });
+  const roster = ctx.DB.customers.map(c => c.name + '|' + c.contact);
+  assert.ok(ctx.DB.transactions.length > 0);
+
+  ctx.wipeDatabaseKeepRoster();
+
+  // The roster survives in full: names, contacts, masked state, and even the
+  // import-created customer — as a blank record with no report row of their own.
+  assert.deepEqual(ctx.DB.customers.map(c => c.name + '|' + c.contact), roster);
+  const keptMasked = ctx.DB.customers.find(c => c.name === aMasked.name && c.contact === aMasked.contact);
+  assert.equal(keptMasked.masked, true, 'the masked contact state survives');
+  const wipedNew = byName(ctx, 'Wipe Test Customer');
+  assert.equal(wipedNew.spent, 0);
+  assert.equal(wipedNew.visits, 0);
+  assert.equal(wipedNew.lastVisit, '', 'the blank record has no visit dates');
+
+  // Every piece of statement-derived data is gone.
+  assert.equal(ctx.DB.transactions.length, 0);
+  assert.equal(Object.keys(ctx.DB.customerTx).length, 0);
+  assert.equal(Object.keys(ctx.DB.seen).length, 0);
+  assert.equal(ctx.DB.importedRev, 0);
+  assert.equal(ctx.DB.importedTx, 0);
+
+  // Totals are back to EXACTLY the report (a fresh install's state).
+  assert.equal(sumSpent(ctx), freshSpent);
+  assert.equal(sumVisits(ctx), freshVisits);
+  const george = byName(ctx, 'George Owiti');
+  assert.equal(george.spent, 600, 'George is back to his report row');
+  assert.equal(george.visits, 2);
+  assert.equal(george.lastVisit, '2026-06-01');
+
+  // Manual entries are kept — no statement can restore them.
+  assert.equal(ctx.DB.dailyLedgers.length, 1);
+  assert.equal(ctx.DB.dailyExpenses.length, 1);
+
+  // Re-derivation stays consistent afterwards: only the kept ledger folds back in.
+  ctx.repairDates();
+  assert.equal(sumSpent(ctx), freshSpent);
+  assert.equal(ctx.DB.importedRev, 1000, 'importedRev = the kept ledger revenue, nothing else');
+});
+
+test('rebuild with clean-slate wipe: the selected statements become the single source of truth', async () => {
+  const ctx = await bootLoaded();
+  const freshSpent = sumSpent(ctx);
+  const roster = ctx.DB.customers.map(c => c.name + '|' + c.contact);
+
+  // A bloated / corrupted state: stale imports on top of the report.
+  ctx.importTransactions([row('George Owiti', '0710428075', '2026-08-10', 400, 'STALE1ABCD1')]);
+  assert.ok(ctx.DB.transactions.some(t => t.receipt === 'STALE1ABCD1'));
+
+  // The user ticks "Start from a clean database" in the modal and picks the
+  // August statement. proceedRebuild() must hand the option to handleRebuild.
+  ctx.document.getElementById('rebuildWipeAll').checked = true;
+  ctx.proceedRebuild();
+  assert.equal(ctx.pendingRebuildWipe, true, 'the modal option is passed to the rebuild');
+  ctx.parseAnyFile = async () => [row('George Owiti', '0710428075', '2026-08-25', 700, 'AUG1ABCDEF1')];
+  ctx.showConfirm = async () => true;
+  ctx.saveToCloud = async () => true;
+  await ctx.handleRebuild({ files: [{ name: 'august.csv' }], value: '' });
+  assert.equal(ctx.pendingRebuildWipe, false, 'the wipe option is consumed');
+
+  // The stale import is gone; only the rebuilt statement remains.
+  assert.ok(!ctx.DB.transactions.some(t => t.receipt === 'STALE1ABCD1'), 'stale data was wiped');
+  assert.equal(ctx.DB.transactions.length, 1);
+  assert.equal(ctx.DB.transactions[0].receipt, 'AUG1ABCDEF1');
+
+  // George: his report row + the rebuilt (post-cut-off) statement row.
+  const george = byName(ctx, 'George Owiti');
+  assert.equal(george.spent, 600 + 700);
+  assert.equal(george.visits, 2 + 1);
+
+  // The revenue invariants hold: header = report + imported = Σ cards.
+  assert.equal(sumSpent(ctx), freshSpent + 700);
+  assert.equal(ctx.REPORT.totalRevenue + ctx.DB.importedRev, sumSpent(ctx));
+  assert.equal(ctx.DB.importedRev, 700);
+  assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL + 700, 'the monthly chart = seed months + the rebuilt statement');
+
+  // The roster was untouched by the wipe + rebuild.
+  assert.deepEqual(ctx.DB.customers.map(c => c.name + '|' + c.contact), roster);
+
+  // The dedup guard was rebuilt from the survivors — a re-import is a duplicate.
+  const re = ctx.importTransactions([row('George Owiti', '0710428075', '2026-08-25', 700, 'AUG1ABCDEF1')]);
+  assert.equal(re.dupes, 1);
+});

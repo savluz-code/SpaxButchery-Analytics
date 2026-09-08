@@ -842,6 +842,12 @@ function doPost(e) {
       ✓ Rebuild only the period; use Backfill to add extra periods without replacing them<br>
       ✗ Manual edits to summary stats in the rebuilt period will be lost
     </div>
+    <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:.82rem;color:var(--muted);line-height:1.55;text-align:left">
+      <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
+        <input type="checkbox" id="rebuildWipeAll" style="margin-top:3px;flex:none">
+        <span>🧹 <b>Start from a clean database</b> — first wipe <b>all imported data</b> (transactions, history, totals &amp; the duplicate guard), keeping only <b>customer names &amp; contacts</b> plus your manual stock ledgers. The selected statements then become the single source of truth, on top of the original report figures.</span>
+      </label>
+    </div>
     <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
       <button class="btn ghost" onclick="closeRebuildModal()">Cancel</button>
       <button class="btn" style="background:var(--amber);color:#000" onclick="proceedRebuild()">📁 Choose Files</button>
@@ -8130,9 +8136,23 @@ function openBackfillModal(){ $('backfillModal').style.display = 'flex'; }
 function closeBackfillModal(){ $('backfillModal').style.display = 'none'; }
 function proceedBackfill(){ closeBackfillModal(); setTimeout(() => $('backfillFile').click(), 200); }
 
-function openRebuildModal(){ $('rebuildModal').style.display = 'flex'; }
+function openRebuildModal(){
+  pendingRebuildWipe = false;
+  const w = $('rebuildWipeAll');
+  if (w) w.checked = false;
+  $('rebuildModal').style.display = 'flex';
+}
 function closeRebuildModal(){ $('rebuildModal').style.display = 'none'; }
-function proceedRebuild(){ closeRebuildModal(); setTimeout(() => $('rebuildFile').click(), 200); }
+function proceedRebuild(){
+  // Clean-slate option: wipe all imported data (keep names & contacts) before
+  // importing the chosen statements — consumed by handleRebuild.
+  pendingRebuildWipe = !!(($('rebuildWipeAll') && $('rebuildWipeAll').checked));
+  closeRebuildModal();
+  setTimeout(() => $('rebuildFile').click(), 200);
+}
+// Set by proceedRebuild() from the rebuild modal's "start from a clean
+// database" option; consumed (and cleared) by handleRebuild.
+let pendingRebuildWipe = false;
 
 // Close modals on backdrop click
 $('backfillModal').addEventListener('click', e => { if(e.target === $('backfillModal')) closeBackfillModal(); });
@@ -8651,6 +8671,95 @@ function rebuildSeenMap(){
   DB.seen = seen;
 }
 
+/* ══════════ CLEAN-SLATE WIPE (Full Rebuild → "start from a clean database") ══════════
+   Wipes every piece of STATEMENT-IMPORTED data and resets each customer to the
+   original report figures — exactly the state a fresh install (or "Reset to
+   Original Report Data") produces — EXCEPT the roster itself: names, contacts
+   (including the hard-won resolved numbers) and masked state survive.
+   Why the report rows come back: the report is the app's foundation (the
+   header and the monthly chart always carry it — see deriveRevenueLedgers),
+   so wiping the import layer but keeping the baselines is the only state in
+   which the card, the header and the chart agree again. The selected
+   statements are then imported on top, exactly like a fresh build.
+   Kept on purpose: names + contacts, the report baseline, and the manual
+   entries (dailyLedgers, dailyExpenses, overheads, itemCosts) — those are
+   keyed/OCR'd stock-sheet data that no statement can restore. */
+function _seedFirstVisitOf(name, contact){
+  if (typeof SEED_CUSTOMERS === 'undefined' || !Array.isArray(SEED_CUSTOMERS)) return '';
+  for (const r of SEED_CUSTOMERS) {
+    if (r[0] === name && String(r[1] || '') === String(contact || '')) return stripTime(r[5]) || '';
+  }
+  for (const r of SEED_CUSTOMERS) {
+    if (r[0] === name) return stripTime(r[5]) || '';
+  }
+  return '';
+}
+function wipeDatabaseKeepRoster(){
+  const roster = (DB.customers || []).map(c => ({
+    name: String(c.name || '').trim(),
+    contact: String(c.contact || '').trim(),
+    masked: !!c.masked
+  })).filter(r => r.name);
+  const today = new Date(getTodayEAT());
+  const daysOf = (lastVisit) => (lastVisit
+    ? Math.max(0, Math.round((today - new Date(lastVisit)) / 86400000))
+    : 999);
+  const next = [];
+  const used = new Set();
+  roster.forEach(r => {
+    const key = r.name + '|' + r.contact;
+    if (used.has(key)) return; // an exact roster duplicate keeps one record
+    used.add(key);
+    const row = seedBaselineFor(r.name, r.contact);
+    if (row) {
+      // Report-known customer: restore the original report row (fresh-install
+      // state), with the roster's own contact/masked state (a resolved number
+      // must survive the wipe).
+      next.push({
+        name: r.name, contact: r.contact,
+        spent: row.spent, visits: row.visits,
+        days: daysOf(row.lastVisit),
+        firstVisit: _seedFirstVisitOf(r.name, r.contact),
+        lastVisit: row.lastVisit,
+        masked: r.masked,
+        isNew: false,
+        isSeed: true,
+        seedSpent: row.spent,
+        seedVisits: row.visits,
+        seedLastVisit: row.asOf
+      });
+    } else {
+      // Import-created customer: no report row of their own — a true blank
+      // slate. seedLastVisit '' is the "no baseline" stamp, so the report can
+      // never re-stamp one; their statement rows (re-imported below) rebuild
+      // their totals.
+      next.push({
+        name: r.name, contact: r.contact,
+        spent: 0, visits: 0, days: 999,
+        firstVisit: '', lastVisit: '',
+        masked: r.masked,
+        isNew: false, newBatch: 0,
+        isSeed: false,
+        seedSpent: 0, seedVisits: 0, seedLastVisit: ''
+      });
+    }
+  });
+  DB.customers = next;
+  // Everything statement-derived goes — the re-import rebuilds it:
+  DB.transactions = [];
+  DB.customerTx = {};
+  DB.seen = {};
+  DB.importedRev = 0;
+  DB.importedTx = 0;
+  // The monthly buckets are re-derived by repairDates() (REVENUE LEDGERS) from
+  // the report months + the daily ledgers + the re-imported rows; zero them so
+  // nothing imported leaks back in before that re-derivation runs.
+  const labels = (DB.monthly && Array.isArray(DB.monthly.labels) && DB.monthly.labels.length)
+    ? DB.monthly.labels.slice()
+    : (typeof SEED_MONTHLY !== 'undefined' && SEED_MONTHLY.labels ? SEED_MONTHLY.labels.slice() : []);
+  DB.monthly = { labels: labels, revenue: labels.map(() => 0) };
+}
+
 async function handleRebuild(input){
   const files = Array.from(input.files);
   if(files.length === 0) return;
@@ -8677,6 +8786,37 @@ async function handleRebuild(input){
       if(!rows.length){ updateImportModal('No transactions found in <b>' + file.name + '</b>', pct); continue; }
       updateImportModal('Reading <b>' + rows.length + '</b> rows from <b>' + file.name + '</b>…', pct+10);
       allRows.push(...rows);
+    }
+    // Optional clean-slate mode (checked in the rebuild modal): wipe ALL
+    // imported data — every transaction, per-customer history, the dedup guard
+    // and all imported revenue — and reset each customer to the original
+    // report figures, keeping only names & contacts (plus the manual stock
+    // ledgers). The selected statements then become the single source of
+    // truth, imported on top of the report exactly like a fresh build.
+    if (pendingRebuildWipe && allRows.length) {
+      const ok = await showConfirm('🧹','Start from a clean database?',
+        'This wipes <b>all imported data</b> — every transaction, per-customer history, the duplicate guard and all imported revenue — and resets each customer to the <b>original report figures</b> (the app\'s foundation, the same state as "Reset to Original Report Data").<br><br>' +
+        'Kept: <b>customer names & contacts</b> (including resolved numbers), your manual stock ledgers, expenses, overheads & item costs, and the report baseline itself.<br><br>' +
+        'The selected statements are then imported on top — they become the single source of truth for everything after the report. The cloud copy is replaced on the next auto-sync; on your other devices use <b>Force Pull</b> from this one afterwards.',
+        [
+          { label: '🧹 Wipe & rebuild', primary: true, value: true },
+          { label: 'Cancel this rebuild', value: false }
+        ]);
+      if (!ok) {
+        pendingRebuildWipe = false;
+        $('importModalIcon').textContent = '⚠️';
+        $('importModalTitle').textContent = 'Cancelled';
+        $('importModalBody').innerHTML = '<b>Rebuild cancelled</b> — nothing was changed.';
+        $('importModalBar').style.width = '0%';
+        $('importModalBar').style.background = 'var(--amber)';
+        $('importModalClose').style.display = 'inline-block';
+        showSyncStatus('⚠️ Rebuild cancelled');
+        input.value = '';
+        return;
+      }
+      wipeDatabaseKeepRoster();
+      pendingRebuildWipe = false;
+      updateImportModal('🧹 Database wiped (names & contacts kept) — importing statements…', 25);
     }
     // Scoped wipe: only the window the statements cover is cleared, never the
     // periods before or after it. The monthly chart and importedRev are NOT

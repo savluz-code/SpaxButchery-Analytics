@@ -115,7 +115,7 @@ test('app shell and service worker still parse after the rollback', () => {
   );
 });
 
-test('refreshAll executes without ReferenceError (e.g. TDZ on overview KPI variables)', () => {
+test('refreshAll executes without ReferenceError (e.g. TDZ on overview KPI variables)', async () => {
   const domElements = {};
   function mockEl() {
     return {
@@ -171,6 +171,11 @@ test('refreshAll executes without ReferenceError (e.g. TDZ on overview KPI varia
 
   const ctx = vm.createContext(sandbox);
   inline.forEach(match => vm.runInContext(match[2], ctx));
+
+  // load() is async (it checks IndexedDB before localStorage) — flush the
+  // microtask queue so DB is seeded before refreshAll touches it. The sandbox
+  // setTimeout is a no-op, so flush with resolved promises, not a timer.
+  for (let i = 0; i < 20; i++) await Promise.resolve();
 
   assert.doesNotThrow(() => {
     ctx.refreshAll();

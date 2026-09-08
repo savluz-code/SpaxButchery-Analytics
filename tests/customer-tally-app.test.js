@@ -385,6 +385,47 @@ test('a Full Rebuild wipes only the statement period and leaves periods before/a
   assert.equal(ctx.DB.importedRev, 950, 'importedRev = 500 (July) + 300 (August) + 150 (September)');
 });
 
+test('a Full Rebuild overlapping the report baseline warns, and cancelling leaves seed data untouched', async () => {
+  const ctx = await bootLoaded();
+  const sum0 = sumSpent(ctx);
+  // A statement dated INSIDE the baseline period (before the report cut-off).
+  ctx.parseAnyFile = async () => [row('George Owiti', '0710428075', '2026-05-10', 50, 'UJ0ABCDEF0')];
+  ctx.saveToCloud = async () => true;
+  // User cancels the baseline-overlap warning.
+  ctx.showConfirm = async () => false;
+  await ctx.handleRebuild({ files: [{ name: 'may.csv' }], value: '' });
+  assert.equal(sumSpent(ctx), sum0, 'a cancelled rebuild changes nothing');
+  assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL, 'seed monthly untouched');
+  assert.equal((ctx.DB.transactions || []).length, 0, 'no transaction rows added');
+  assert.equal(ctx.DB.importedRev, 0, 'no revenue booked');
+});
+
+test('a Full Rebuild overlapping the baseline that the user keeps absorbs the row and never moves seed totals', async () => {
+  const ctx = await bootLoaded();
+  const sum0 = sumSpent(ctx);
+  ctx.parseAnyFile = async () => [row('George Owiti', '0710428075', '2026-05-10', 50, 'UJ0ABCDEF0')];
+  ctx.saveToCloud = async () => true;
+  // User continues past the warning (keep baseline).
+  ctx.showConfirm = async () => true;
+  await ctx.handleRebuild({ files: [{ name: 'may.csv' }], value: '' });
+  // The row is dated inside George's report period → absorbed, never counted.
+  assert.equal(sumSpent(ctx), sum0, 'an in-baseline row does not inflate revenue');
+  assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL, 'seed monthly unchanged');
+  assert.equal(ctx.DB.importedRev, 0, 'no new revenue from an in-baseline row');
+});
+
+test('the New-Customers-by-Month drill pops the customers whose first visit is that month', () => {
+  const ctx = bootApp();
+  // bootApp seeds DB.customers from SEED_CUSTOMERS, which has June 2026 first visits.
+  assert.ok((ctx.DB.customers || []).some(c => c.firstVisit && String(c.firstVisit).slice(0, 7) === '2026-06'), 'seed has a June 2026 first visit');
+  ctx.showNewCustomersMonth('2026-06');
+  const title = ctx.document.getElementById('listTitle').textContent;
+  const body = ctx.document.getElementById('listBody').innerHTML;
+  assert.match(title, /June 2026/, 'title names the clicked month');
+  assert.match(title, /New Customers/, 'title labels it as new customers');
+  assert.ok(/new customer\(s\)/.test(body), 'subtitle reports a customer count');
+});
+
 test('a payment matched to the second record of a same-name pair still reaches importedRev', async () => {
   const ctx = await bootLoaded();
   const pair = ctx.DB.customers.filter(c => c.name === 'Tobias Odipo');

@@ -137,8 +137,9 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
 <section id="overview" class="tab active">
   <div class="kpi-grid" id="kpiGrid"></div>
   <div class="grid-2">
-    <div class="card"><h3>Monthly Revenue</h3><div class="hint">Baseline + imported transactions</div>
-      <div class="chart-box"><canvas id="ovRev"></canvas></div></div>
+    <div class="card"><h3>Monthly Revenue</h3><div class="hint">Stacked: baseline (report) + imported. Click a bar to see that month's transactions</div>
+      <div class="chart-box"><canvas id="ovRev"></canvas></div>
+      <div id="revSummary" style="font-size:.8rem;color:var(--muted);margin-top:8px;line-height:1.5"></div></div>
     <div class="card"><h3>Customer Lifecycle</h3><div class="hint">Days since last visit (tracked list)</div>
       <div class="chart-box"><canvas id="ovSeg"></canvas></div></div>
   </div>
@@ -782,6 +783,27 @@ function doPost(e) {
     <div id="importModalBody" style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">Please wait</div>
     <div class="prog-bar" style="margin-bottom:16px"><div id="importModalBar" style="width:0%"></div></div>
     <button class="btn" id="importModalClose" style="display:none" onclick="closeImportModal()">Done</button>
+  </div>
+</div>
+
+<!-- Floating List Modal (click-through on dashboard KPIs & charts) -->
+<div id="listModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);z-index:210;align-items:center;justify-content:center;padding:16px;">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:600px;width:100%;max-height:82vh;display:flex;flex-direction:column;padding:20px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h3 id="listTitle" style="margin:0;font-size:1.05rem"></h3>
+      <button class="btn ghost sm" onclick="closeListModal()">✕</button>
+    </div>
+    <div id="listBody" style="overflow:auto;min-height:60px"></div>
+  </div>
+</div>
+
+<!-- Generic Confirm Modal (used when a rebuild could conflict with the seed / report baseline) -->
+<div id="confirmModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);z-index:220;align-items:center;justify-content:center;padding:16px;">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:540px;width:100%;padding:24px;text-align:center;">
+    <div id="confirmIcon" style="font-size:3rem;margin-bottom:8px">⚠️</div>
+    <h3 id="confirmTitle" style="margin-bottom:8px">Confirm</h3>
+    <div id="confirmBody" style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px"></div>
+    <div id="confirmActions" style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap"></div>
   </div>
 </div>
 
@@ -4678,6 +4700,140 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
 if(location.hash)activateTab(location.hash.slice(1));
 window.addEventListener('hashchange',()=>activateTab(location.hash.slice(1)));
 
+/* ══════════ FLOATING LIST & CONFIRM (click-through dashboard) ══════════
+   Dashboard items (KPI tiles and chart bars) pop a floating list of the
+   customers / transactions behind them — e.g. "8 new customers for Sep"
+   opens the list of the 8 customers whose first-ever purchase was in
+   September. The list is intentionally non-destructive: it only reads live
+   DB state, never mutates a total, so opening it is always safe. */
+function escHtml(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function showListModal(title, body){
+  $('listTitle').textContent = title || 'List';
+  $('listBody').innerHTML = body || '<div style="color:var(--muted);font-style:italic;padding:20px 0">Nothing here yet</div>';
+  $('listModal').style.display = 'flex';
+}
+function closeListModal(){ $('listModal').style.display = 'none'; }
+// A single, reusable confirm dialog that resolves true/false. Used before a
+// rebuild that would overlap the report/baseline period.
+let _confirmResolver = null;
+function showConfirm(icon, title, body, buttons){
+  return new Promise(resolve => {
+    _confirmResolver = resolve;
+    $('confirmIcon').textContent = icon || '⚠️';
+    $('confirmTitle').textContent = title || 'Confirm';
+    $('confirmBody').innerHTML = body || '';
+    const act = $('confirmActions'); act.innerHTML = '';
+    (buttons || []).forEach(b => {
+      const el = document.createElement('button');
+      el.className = 'btn' + (b.primary ? '' : ' ghost');
+      if (b.danger) { el.style.background = 'var(--red)'; el.style.color = '#fff'; }
+      else if (b.primary) { el.style.background = 'var(--amber)'; el.style.color = '#000'; }
+      el.textContent = b.label;
+      el.onclick = () => { const v = (b.value !== undefined) ? b.value : true; closeConfirm(v); };
+      act.appendChild(el);
+    });
+    $('confirmModal').style.display = 'flex';
+  });
+}
+function closeConfirm(val){
+  if (_confirmResolver){ const r = _confirmResolver; _confirmResolver = null; r(val); }
+  $('confirmModal').style.display = 'none';
+}
+
+// Row renderer for a customer in a floating list.
+function listCustomerRow(c){
+  const st = c.masked ? (contactStatus(c) === 'Valid' ? 'valid' : 'masked') : 'valid';
+  const col = st === 'valid' ? 'var(--green)' : 'var(--amber)';
+  return '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 11px;' +
+    'border:1px solid var(--border);border-radius:8px;background:var(--card2);margin-bottom:6px">' +
+    '<div style="min-width:0"><div style="font-weight:600">' + escHtml(c.name) + '</div>' +
+    '<div style="font-size:.72rem;color:var(--muted)">' + escHtml(c.contact) + ' · ' + kes(c.spent) + ' · ' + (c.visits||0) + ' visits' + '</div></div>' +
+    '<div style="font-size:.68rem;color:' + col + ';white-space:nowrap">' + contactStatus(c) + '</div>' +
+    '</div>';
+}
+function listEmpty(){ return '<div style="color:var(--muted);font-style:italic;padding:20px 0;text-align:center">Nothing here yet — this slice is empty.</div>'; }
+
+// Show a scrollable list of customers behind a KPI / chart slice. Very long
+// lists (e.g. the full 1,669-customer database) are capped so the modal stays
+// snappy, with a clear "+N more" note instead of rendering thousands of rows.
+const LIST_CAP = 400;
+function showCustomersList(title, subtitle, customers, totalLine){
+  const all = (customers || []);
+  const shown = all.length > LIST_CAP ? all.slice(0, LIST_CAP) : all;
+  const more = all.length - shown.length;
+  showListModal(title,
+    '<div style="font-size:.8rem;color:var(--muted);margin-bottom:10px">' + escHtml(subtitle || '') + '</div>' +
+    (totalLine ? '<div style="font-size:1rem;font-weight:600;margin-bottom:10px">' + totalLine + '</div>' : '') +
+    (shown.length ? shown.map(listCustomerRow).join('') + (more > 0 ? '<div style="color:var(--muted);font-size:.78rem;text-align:center;padding:6px 0">… +' + more + ' more (search the customer tab)</div>' : '') : listEmpty())
+  );
+}
+// KPI / chart drill-downs — each opens the floating list of customers behind it.
+function drillRevenue(){
+  const rows = (DB.customers||[]).slice().sort((a,b) => (b.spent||0) - (a.spent||0));
+  showCustomersList('Total Revenue', 'All tracked customers by lifetime spend', rows,
+    kes(rows.reduce((s,c) => s + (Number(c.spent)||0), 0)) + ' · ' + rows.length + ' customer(s)');
+}
+function drillCadenceOverdue(){
+  const rows = (DB.customers||[]).filter(c => customerIPI(c).status === 'overdue');
+  showCustomersList('Cadence Overdue', 'Customers past 1.8× their personal purchase interval (IPI)', rows,
+    rows.length + ' customer(s)');
+}
+function drillCustomers(){
+  const rows = (DB.customers||[]).slice().sort((a,b) => ((b.spent||0) - (a.spent||0)) || String(a.name).localeCompare(String(b.name)));
+  showCustomersList('Customers', 'Tracked customer database', rows, rows.length + ' customer(s)');
+}
+function drillNewThisMonth(){
+  const rows = newThisMonthCustomers();
+  showCustomersList('New This Month', 'First-ever purchase in ' + monthLabelEAT(), rows, rows.length + ' customer(s)');
+}
+function drillVIPs(){
+  const rows = (DB.customers||[]).filter(c => c.spent >= 10000).slice().sort((a,b) => (b.spent||0) - (a.spent||0));
+  showCustomersList('Tracked VIPs', 'KES 10K+ lifetime spend', rows, rows.length + ' customer(s)');
+}
+function showNewCustomersMonth(mk){
+  const rows = (DB.customers||[]).filter(c => c.firstVisit && String(c.firstVisit).slice(0,7) === mk)
+    .slice().sort((a,b) => (b.spent||0) - (a.spent||0));
+  showCustomersList('New Customers · ' + monthLabelEAT(mk), 'First-ever purchase in ' + monthLabelEAT(mk),
+    rows, rows.length + ' new customer(s)');
+}
+// Floating list of the transactions recorded in a given calendar month (YYYY-MM).
+function showMonthTransactions(mk){
+  const rows = (DB.transactions||[]).filter(t => (t.date||'').slice(0,7) === mk)
+    .slice().sort((a,b) => (b.date||'').localeCompare(a.date||'', undefined, {numeric:true}));
+  const total = rows.reduce((s,t) => s + Math.max(0, Number(t.amount)||0), 0);
+  showListModal('Revenue · ' + monthLabelEAT(mk),
+    '<div style="font-size:.8rem;color:var(--muted);margin-bottom:10px">Transactions recorded in ' + escHtml(monthLabelEAT(mk)) +
+    '. The chart bar also includes baseline + daily-ledger income.</div>' +
+    '<div style="font-size:1rem;font-weight:600;margin-bottom:10px">' + kes(total) + ' · ' + rows.length + ' transaction(s)</div>' +
+    (rows.length ? rows.map(t =>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 11px;' +
+      'border:1px solid var(--border);border-radius:8px;background:var(--card2);margin-bottom:6px">' +
+      '<div style="min-width:0"><div style="font-weight:600">' + escHtml(t.name||'M-Pesa Customer') + '</div>' +
+      '<div style="font-size:.72rem;color:var(--muted)">' + escHtml(t.date) + (t.receipt ? ' · <span style="font-family:monospace">' + escHtml(t.receipt) + '</span>' : '') + '</div></div>' +
+      '<div style="font-weight:600;white-space:nowrap">' + kes(t.amount) + '</div>' +
+      '</div>').join('') : listEmpty())
+  );
+}
+// Floating list of customers in a lifecycle segment (0=Active, 1=At Risk, 2=Lost).
+function showSegmentCustomers(idx){
+  const labels = ['Active', 'At Risk', 'Lost'];
+  const filter = c => {
+    const d = Number(c.days) || 0;
+    if (idx === 0) return d <= 30;
+    if (idx === 1) return d > 60 && d <= 90;
+    return d > 90;
+  };
+  const rows = (DB.customers||[]).filter(filter);
+  showCustomersList('Customer Lifecycle · ' + labels[idx], labels[idx] + ' customers (days since last visit)',
+    rows, rows.length + ' customer(s)');
+}
+// Click-outside to close the floating list / confirm dialogs.
+function _bindOverlayClose() {
+  const lm = $('listModal'); if (lm && lm.addEventListener) lm.addEventListener('click', e => { if (e.target === lm) closeListModal(); });
+  const cm = $('confirmModal'); if (cm && cm.addEventListener) cm.addEventListener('click', e => { if (e.target === cm) closeConfirm(false); });
+}
+_bindOverlayClose();
+
 /* ══════════ OVERVIEW ══════════ */
 Chart.defaults.color='#8b9aa7';Chart.defaults.borderColor='rgba(255,255,255,.06)';
 let revChart,segChart,newChart;
@@ -4705,27 +4861,55 @@ function refreshAll(){
   $('hReach').textContent=validPct;
   $('maskedCount').textContent=`${REPORT.masked-DB.resolved} masked report-wide · ${cs.filter(c=>c.masked).length} in tracked list · ${DB.resolved} resolved`;
   const active=cs.filter(c=>c.days<=30).length,risk=cs.filter(c=>c.days>60&&c.days<=90).length,lost=cs.filter(c=>c.days>90).length;
-  const ipiOverdueCount = cs.filter(c => customerIPI(c).status === 'overdue').length;
-  const newMonthTotal = newThisMonthCustomers().length;
+  const overdueCusts = cs.filter(c => customerIPI(c).status === 'overdue');
+  const ipiOverdueCount = overdueCusts.length;
+  const newMonthCusts = newThisMonthCustomers();
+  const newMonthTotal = newMonthCusts.length;
+  const vipCusts = cs.filter(c => c.spent >= 10000).slice().sort((a,b) => (b.spent||0)-(a.spent||0));
+
+  // Every dashboard KPI is clickable: it pops a floating list of the customers
+  // it counts. Built with cursor:pointer + the same tile styling.
+  const kpiTile = (accent, label, value, detail, onclick) =>
+    `<div class="kpi" style="--accent:${accent};cursor:pointer" onclick="${onclick}"><div class="label">${label}</div><div class="value">${value}</div><div class="detail">${detail} · click</div></div>`;
 
 $('kpiGrid').innerHTML=`
-  <div class="kpi" style="--accent:var(--red)"><div class="label">Total Revenue</div><div class="value">${kes(totRev)}</div><div class="detail">Gross Sales</div></div>
-  <div class="kpi" style="--accent:var(--amber)"><div class="label">Cadence Overdue</div><div class="value">${ipiOverdueCount}</div><div class="detail">⚡ 1.8x personal IPI delay</div></div>
-  <div class="kpi" style="--accent:var(--blue)"><div class="label">Customers</div><div class="value">${totCust.toLocaleString()}</div><div class="detail">Tracked customers</div></div>
-  <div class="kpi" style="--accent:var(--gold)"><div class="label">New This Month</div><div class="value">${newMonthTotal.toLocaleString()}</div><div class="detail">🌱 first purchase in ${monthLabelEAT()}</div></div>
-  <div class="kpi" style="--accent:var(--purple)"><div class="label">Tracked VIPs</div><div class="value">${cs.filter(c=>c.spent>=10000).length}</div><div class="detail">KES 10K+ lifetime</div></div>
+  ${kpiTile('var(--red)','Total Revenue',kes(totRev),'Gross Sales', 'drillRevenue()')}
+  ${kpiTile('var(--amber)','Cadence Overdue',ipiOverdueCount,escHtml('⚡ 1.8x personal IPI'), 'drillCadenceOverdue()')}
+  ${kpiTile('var(--blue)','Customers',totCust.toLocaleString(),'Tracked customers', 'drillCustomers()')}
+  ${kpiTile('var(--gold)','New This Month',newMonthTotal.toLocaleString(),escHtml('🌱 first purchase in '+monthLabelEAT()), 'drillNewThisMonth()')}
+  ${kpiTile('var(--purple)','Tracked VIPs',vipCusts.length,'KES 10K+ lifetime', 'drillVIPs()')}
 `;
   if(revChart)revChart.destroy();if(segChart)segChart.destroy();if(newChart)newChart.destroy();
-  revChart=new Chart($('ovRev'),{type:'bar',data:{labels:DB.monthly.labels,datasets:[{data:DB.monthly.revenue,
-    backgroundColor:'rgba(230,57,70,.65)',borderRadius:6}]},options:{maintainAspectRatio:false,
-    plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>kes(c.raw)}}},scales:{y:{ticks:{callback:v=>(v/1000)+'K'}}}}});
+  // Cleaner monthly revenue: stacked baseline (report/seed) vs imported, with a
+  // one-line summary and click-through to the month's transactions.
+  const seedM = (typeof SEED_MONTHLY !== 'undefined' && SEED_MONTHLY && SEED_MONTHLY.labels) ? SEED_MONTHLY : { labels: [], revenue: [] };
+  const baseByMonth = new Map(); seedM.labels.forEach((l,i) => baseByMonth.set(l, Math.max(0, Number(seedM.revenue[i])||0)));
+  const labels = (DB.monthly && DB.monthly.labels) || [];
+  const baseline = labels.map(l => baseByMonth.get(l) || 0);
+  const imported = labels.map((l,i) => Math.max(0, (Number(DB.monthly.revenue[i])||0) - (baseByMonth.get(l)||0)));
+  revChart=new Chart($('ovRev'),{type:'bar',data:{labels,datasets:[
+    {label:'Baseline',data:baseline,backgroundColor:'rgba(148,163,184,.35)',borderRadius:5,stack:'r'},
+    {label:'Imported',data:imported,backgroundColor:'rgba(230,57,70,.65)',borderRadius:5,stack:'r'}
+  ]},options:{maintainAspectRatio:false,
+    plugins:{legend:{display:true,position:'bottom',labels:{boxWidth:12,font:{size:10}}},
+      tooltip:{callbacks:{label:c=>`${c.dataset.label}: ${kes(c.raw)}`,footer:items=>'Total '+kes(items.reduce((s,i)=>s+(DB.monthly.revenue[i.dataIndex]||0),0))}}},
+    scales:{x:{stacked:true,ticks:{font:{size:10}}},y:{stacked:true,ticks:{callback:v=>(v/1000)+'K'}}},
+    onClick:(e,els)=>{ if(els.length) showMonthTransactions(labels[els[0].index]); }}});
+  if($('revSummary')){
+    const lastNonZero = [...labels].reverse().find(l => (Number(DB.monthly.revenue[labels.indexOf(l)])||0) > 0);
+    $('revSummary').innerHTML =
+      '📈 Range <b>' + (labels[0]||'—') + '</b> → <b>' + (lastNonZero || labels[labels.length-1] || '—') + '</b> · ' +
+      'Total <b>' + kes(totRev) + '</b>' + (lastNonZero ? ' · Latest active month <b>' + escHtml(monthLabelEAT(lastNonZero)) + '</b>: <b>' + kes(Number(DB.monthly.revenue[labels.indexOf(lastNonZero)])||0) + '</b>' : '');
+  }
   segChart=new Chart($('ovSeg'),{type:'doughnut',data:{labels:[`Active (${active})`,`At Risk (${risk})`,`Lost (${lost})`],
     datasets:[{data:[active,risk,lost],backgroundColor:['#2ec4b6','#f4a261','#e63946'],borderColor:'#1a2129',borderWidth:2}]},
-    options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom'}}}});
+    options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom'}},
+      onClick:(e,els)=>{ if(els.length) showSegmentCustomers(els[0].index); }}});
   const newByMonth = newCustomersByMonth();
   newChart=new Chart($('ovNew'),{type:'bar',data:{labels:newByMonth.labels,datasets:[{data:newByMonth.counts,
     backgroundColor:'rgba(255,209,102,.75)',borderRadius:6}]},options:{maintainAspectRatio:false,
-    plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.parsed.y+' new customer(s)'}}},scales:{y:{ticks:{precision:0}}}}});
+    plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.parsed.y+' new customer(s)'}}},scales:{y:{ticks:{precision:0}}},
+    onClick:(e,els)=>{ if(els.length){ const mk = newByMonth.labels[els[0].index]; showNewCustomersMonth(mk); } }}});
   renderCustTable();renderMaskTable();renderSeg();renderTransactions();
   if($('analytics360') && $('analytics360').classList.contains('active')) renderAnalytics();
 }
@@ -8276,6 +8460,36 @@ async function handleRebuild(input){
     // the re-imported rows (REVENUE LEDGERS), so revenue that belongs to
     // untouched periods is preserved.
     const period = statementPeriodOf(allRows);
+    // Seed / report baseline guard: the seed totals already cover everything up
+    // to the report date (seedReportCutoff). If the chosen statements include
+    // dates inside that window, the rebuild would be re-importing rows the
+    // baseline already counted — warn and offer a corrective choice BEFORE
+    // touching anything, so the user can keep their seed data untouched.
+    const cutoff = seedReportCutoff();
+    const overlapsBaseline = !!(period.min && cutoff && period.min <= cutoff);
+    if(overlapsBaseline){
+      const ok = await showConfirm('⚠️','Statements overlap your report baseline',
+        'Your selected statements include dates on or before <b>' + escHtml(cutoff) + '</b>, ' +
+        'which fall inside your existing <b>report baseline period</b>.<br><br>' +
+        'Those rows are <b>already counted</b> in your seed totals and will be treated as ' +
+        'already-reported — revenue is <b>not</b> doubled, and your <b>seed data is not touched</b>.<br><br>' +
+        'If you only want to add or replace history without rebuilding, use <b>📥 Backfill</b> instead.',
+        [
+          { label: 'Continue (keep baseline)', primary: true, value: true },
+          { label: 'Cancel this rebuild', value: false }
+        ]);
+      if(!ok){
+        $('importModalIcon').textContent = '⚠️';
+        $('importModalTitle').textContent = 'Cancelled';
+        $('importModalBody').innerHTML = '<b>Rebuild cancelled</b> — nothing was changed. Use <b>📥 Backfill</b> to add history without rebuilding.';
+        $('importModalBar').style.width = '0%';
+        $('importModalBar').style.background = 'var(--amber)';
+        $('importModalClose').style.display = 'inline-block';
+        showSyncStatus('⚠️ Rebuild cancelled');
+        input.value = '';
+        return;
+      }
+    }
     const cleared = clearHistoryInPeriod(period);
     rebuildSeenMap();
     const result = importTransactions(allRows);

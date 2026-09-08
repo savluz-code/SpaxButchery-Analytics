@@ -349,6 +349,42 @@ test('Full Rebuild restarts the monthly chart from the seed months (+ daily ledg
   assert.equal(sumSpent(ctx), 1250341 + 750);
 });
 
+test('a Full Rebuild wipes only the statement period and leaves periods before/after untouched', async () => {
+  const ctx = await bootLoaded();
+  const jul0 = monthOf(ctx, '2026-07');
+  // Import two separate statement periods: a July row and an August row.
+  ctx.importTransactions([
+    row('George Owiti', '0710428075', '2026-07-20', 500, 'UJ1ABCDEF1'),
+    row('George Owiti', '0710428075', '2026-08-20', 300, 'UJ2ABCDEF1')
+  ]);
+  const sumAfterTwo = sumSpent(ctx);
+  const julAfter = monthOf(ctx, '2026-07');
+  assert.equal(julAfter, jul0 + 500, 'July credited before the rebuild');
+  assert.equal(monthOf(ctx, '2026-08'), 300, 'August credited before the rebuild');
+
+  // Rebuild ONLY the August statement — July must survive untouched.
+  ctx.parseAnyFile = async () => [row('George Owiti', '0710428075', '2026-08-20', 300, 'UJ2ABCDEF1')];
+  ctx.saveToCloud = async () => true;
+  await ctx.handleRebuild({ files: [{ name: 'august.csv' }], value: '' });
+
+  assert.equal(monthOf(ctx, '2026-07'), julAfter, 'July is preserved after a rebuild of August');
+  assert.equal(monthOf(ctx, '2026-08'), 300, 'August is credited once (wiped + re-imported)');
+  // George has a 600 seed baseline; he keeps the July row and gets the rebuilt
+  // August row back → 600 + 500 + 300 = 1400.
+  assert.equal(byName(ctx, 'George Owiti').spent, 1400, 'George keeps the July row and gets the rebuilt August row back');
+  assert.equal(sumSpent(ctx), sumAfterTwo, 'no revenue is lost or double-counted by a scoped rebuild');
+  assert.equal(ctx.DB.importedRev, 800, 'importedRev = 500 (July) + 300 (August)');
+
+  // Rebuild a period that was never imported (after the report cut-off) must
+  // not clear anything else — it is simply added on top.
+  ctx.parseAnyFile = async () => [row('George Owiti', '0710428075', '2026-09-10', 150, 'UF1ABCDEF1')];
+  await ctx.handleRebuild({ files: [{ name: 'september.csv' }], value: '' });
+  assert.equal(monthOf(ctx, '2026-07'), julAfter, 'rebuilding September leaves July alone');
+  assert.equal(monthOf(ctx, '2026-08'), 300, 'and August stays put too');
+  assert.equal(byName(ctx, 'George Owiti').spent, 1550, 'the September row is added on top');
+  assert.equal(ctx.DB.importedRev, 950, 'importedRev = 500 (July) + 300 (August) + 150 (September)');
+});
+
 test('a payment matched to the second record of a same-name pair still reaches importedRev', async () => {
   const ctx = await bootLoaded();
   const pair = ctx.DB.customers.filter(c => c.name === 'Tobias Odipo');

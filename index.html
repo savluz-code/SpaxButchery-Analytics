@@ -247,7 +247,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         <input type="file" id="rebuildFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleRebuild(this)">
       </div>
       <div style="font-size:.7rem;color:var(--muted);margin-top:8px;">
-        <b>Backfill</b> = add history only, keep summary stats · <b>Rebuild</b> = reset everything and recalculate
+        <b>Backfill</b> = add history only, keep summary stats · <b>Rebuild</b> = clear just the selected statement period and recalculate
       </div>
     </div>
     <div class="hint">Hybrid engine: embedded-text parsing + Tesseract OCR fallback for scanned/image PDFs</div>
@@ -810,16 +810,18 @@ function doPost(e) {
     <div style="font-size:3rem;margin-bottom:8px">🔄</div>
     <h3 style="margin-bottom:6px">Full Rebuild from Statements</h3>
     <div style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">
-      <b style="color:var(--red)">Warning:</b> This will <b>reset everything</b> and recalculate all stats from your statement files.<br><br>
-      ✓ Clears and rebuilds transaction history<br>
+      <b style="color:var(--red)">Warning:</b> This clears and rebuilds the <b>statement period only</b> — periods before or after the files you choose are left untouched.<br><br>
+      ✓ Clears and rebuilds transaction history for the selected period<br>
       ✓ Recalculates spent, visits, first/last visit dates<br>
-      ✓ Keeps customer names and resolved contacts<br>
-      ✗ Any manual edits to summary stats will be lost
+      ✓ Keeps transaction history in other periods<br>
+      ✓ Rebuild only the period; use Backfill to add extra periods without replacing them<br>
+      ✗ Manual edits to summary stats in the rebuilt period will be lost
     </div>
     <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
       <button class="btn ghost" onclick="closeRebuildModal()">Cancel</button>
       <button class="btn" style="background:var(--amber);color:#000" onclick="proceedRebuild()">📁 Choose Files</button>
     </div>
+    <div style="color:var(--muted);font-size:.75rem;margin-top:10px">Select <b>all</b> statements for a period in one rebuild — a second rebuild replaces only that period, not others.</div>
   </div>
 </div>
 
@@ -8187,40 +8189,72 @@ async function handleBackfill(input){
   input.value = '';
 }
 
+/* ══════════ REBUILD — SCOPED TO THE STATEMENT PERIOD ══════════
+   A Full Rebuild used to wipe EVERY transaction, every customer-history row,
+   the monthly chart and importedRev, then re-import only the files you picked,
+   so rebuilding June's statement erased July/August and later, and a second
+   rebuild silently replaced the first. Rebuild is now scoped: the date window
+   the statements actually cover is cleared and re-imported; transactions before
+   or after that window are left untouched. The statement period is derived from
+   the itemised rows about to be imported (aggregate / customer-export rows are
+   lifetime totals, not dated payments, so they never extend the window). */
+function statementPeriodOf(rows){
+  let min = '', max = '';
+  (rows || []).forEach(r => {
+    if (r && r.isAggregate) return;            // lifetime total, not a payment date
+    const d = stripTime(r.date) || '';
+    if(d){
+      if(!min || d < min) min = d;
+      if(!max || d > max) max = d;
+    }
+  });
+  return { min, max };
+}
+function inPeriod(d, period){
+  if(!period || !d) return false;
+  if(period.min && d < period.min) return false;
+  if(period.max && d > period.max) return false;
+  return true;
+}
+// Drop transaction rows (and the matching per-customer history rows) whose date
+// falls inside the statement period. Undated rows and rows outside the window
+// are never touched, and the dedup seen-map is rebuilt from the survivors.
+function clearHistoryInPeriod(period){
+  if(!period || !period.min || !period.max) return 0;
+  const inWin = (d) => inPeriod(stripTime(d) || '', period);
+  let removed = 0;
+  DB.transactions = (DB.transactions||[]).filter(t => {
+    if(inWin(t.date)){ removed++; return false; }
+    return true;
+  });
+  Object.keys(DB.customerTx||{}).forEach(name => {
+    const rows = DB.customerTx[name]||[];
+    const keep = rows.filter(t => {
+      if(inWin(t.date)){ removed++; return false; }
+      return true;
+    });
+    if(keep.length !== rows.length) DB.customerTx[name] = keep;
+  });
+  return removed;
+}
+function rebuildSeenMap(){
+  const seen = {};
+  (DB.transactions||[]).forEach(t => { markSeenInto(seen, t); });
+  DB.seen = seen;
+}
+
 async function handleRebuild(input){
   const files = Array.from(input.files);
   if(files.length === 0) return;
   showImportModal('🔄','Rebuilding from statements…','Initializing…',0);
   try{
-    DB.seen = {};
-    DB.transactions = [];
-    DB.customerTx = {};
-    DB.importedTx = 0;
-    // The monthly chart and importedRev are re-derived from the rebuilt
-    // records + the daily ledgers once the statements are back in
-    // (repairDates → reconcileRevenueLedgers, REVENUE LEDGERS). Reset them to
-    // the report's own months here so a rebuild that imports nothing still
-    // lands on a clean baseline.
-    DB.monthly = JSON.parse(JSON.stringify(SEED_MONTHLY));
-    DB.importedRev = 0;
-    // Reset customer aggregates but preserve seed metadata (isSeed, seedSpent,
-    // seedVisits) so the reconciliation logic can still distinguish seed
-    // customers from imported ones after rebuild.
-    DB.customers.forEach(c => {
-      // Make sure the baseline is stamped BEFORE the derived totals are zeroed,
-      // otherwise a legacy record would lose its un-itemised history.
-      ensureBaselineFields(c);
-      c.spent = 0;
-      c.visits = 0;
-      c.isNew = false;
-      c.newBatch = 0;
-      // Baselines (seedSpent/seedVisits/seedLastVisit) are preserved; spent/
-      // visits are re-derived from baseline + re-imported history.
-    });
-    let totalImported = 0, totalDupes = 0, totalAdded = 0, totalUpdated = 0;
+    // Parse every file first so we know the statement period before we touch
+    // any existing history. A rebuild from e.g. a June statement now clears
+    // and refills just that window, leaving May and July in place.
+    const allRows = [];
     for(let fi=0; fi<files.length; fi++){
       const file = files[fi];
-      const pct = Math.round((fi/files.length)*80);
+      const pct = Math.round((fi/files.length)*50);
       updateImportModal('Parsing <b>' + file.name + '</b>…<br><small>File ' + (fi+1) + ' of ' + files.length + '</small>', pct);
       let rows;
       try{
@@ -8233,13 +8267,23 @@ async function handleRebuild(input){
         throw err;
       }
       if(!rows.length){ updateImportModal('No transactions found in <b>' + file.name + '</b>', pct); continue; }
-      updateImportModal('Importing <b>' + rows.length + '</b> rows from <b>' + file.name + '</b>…', pct+10);
-      const result = importTransactions(rows, { continueBatch: fi > 0 });
-      totalImported += result.imported;
-      totalDupes += result.dupes;
-      totalAdded += result.added;
-      totalUpdated += result.updated;
+      updateImportModal('Reading <b>' + rows.length + '</b> rows from <b>' + file.name + '</b>…', pct+10);
+      allRows.push(...rows);
     }
+    // Scoped wipe: only the window the statements cover is cleared, never the
+    // periods before or after it. The monthly chart and importedRev are NOT
+    // reset here — they are re-derived from the survivors + the daily ledgers +
+    // the re-imported rows (REVENUE LEDGERS), so revenue that belongs to
+    // untouched periods is preserved.
+    const period = statementPeriodOf(allRows);
+    const cleared = clearHistoryInPeriod(period);
+    rebuildSeenMap();
+    const result = importTransactions(allRows);
+    const totalImported = result.imported, totalDupes = result.dupes,
+          totalAdded = result.added, totalUpdated = result.updated;
+    // Customer totals are re-derived from baseline + the surviving history for
+    // every record (repairDates), so a scoped rebuild can neither leak revenue
+    // from one window into another nor drop untouched periods.
     recalcFromHistory();
     save();
     if(SYNC_MODE === 'auto') await saveToCloud(true);
@@ -8248,6 +8292,7 @@ async function handleRebuild(input){
       '<b>' + totalDupes + '</b> duplicates skipped<br>' +
       '<b>' + totalAdded + '</b> new customers<br>' +
       '<b>' + totalUpdated + '</b> existing customers updated<br>' +
+      (cleared ? '<b>' + cleared + '</b> prior rows cleared in the statement period<br>' : '') +
       '<b>' + DB.customers.length + '</b> total customers now'
     );
     showSyncStatus('✅ Rebuild complete');

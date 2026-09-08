@@ -413,11 +413,20 @@ test('every mutation path re-derives the totals instead of hand-adjusting them',
   assert.doesNotMatch(dedupe, /primary\.spent\s*=\s*Math\.max/);
 
   const rebuildHandler = slice('async function handleRebuild(input){', 'function recalcFromHistory(){');
-  assert.match(rebuildHandler, /DB\.monthly = JSON\.parse\(JSON\.stringify\(SEED_MONTHLY\)\)/, 'rebuild must restart the monthly chart from the seed months');
+  // A Full Rebuild is now SCOPED to the statement period: it derives the window
+  // from the re-imported rows, clears only that window, rebuilds the seen-map
+  // from the survivors, and re-derives the ledgers from the surviving history +
+  // daily ledgers — it must NOT reset the whole monthly chart / importedRev to
+  // the seed months (that would erase the periods before/after the statement).
+  assert.match(rebuildHandler, /statementPeriodOf\(allRows\)/, 'rebuild must derive the statement period from the re-imported rows');
+  assert.match(rebuildHandler, /clearHistoryInPeriod\(period\)/, 'rebuild must clear only the statement period, not the whole set');
+  assert.match(rebuildHandler, /rebuildSeenMap\(\)/, 'rebuild must rebuild the seen-map from the surviving transactions');
+  assert.match(rebuildHandler, /importTransactions\(allRows\)/, 'rebuild must import the parsed rows in one batch');
+  assert.doesNotMatch(rebuildHandler, /DB\.monthly = JSON\.parse\(JSON\.stringify\(SEED_MONTHLY\)\)/, 'rebuild must NOT restart the monthly chart from the seed months (it is scoped to the statement period)');
+  assert.doesNotMatch(rebuildHandler, /DB\.importedRev = 0/, 'rebuild must NOT zero importedRev (it is re-derived from the survivors + ledgers)');
   // The daily ledgers are folded back in by reconcileRevenueLedgers() (REVENUE
-  // LEDGERS) rather than re-added by hand here, so a rebuild can neither drop
-  // them nor credit them twice.
-  assert.match(rebuildHandler, /DB\.importedRev = 0/, 'rebuild must reset importedRev before re-deriving');
+  // LEDGERS) rather than re-added by hand, so a rebuild can neither drop them
+  // nor credit them twice.
 
   const rebuild = slice('function recalcFromHistory(){', '/* ══════════ IMPORT MODAL HELPERS');
   assert.match(rebuild, /reconcileCustomerAggregates\(c, txs\)/);

@@ -592,3 +592,38 @@ test('a save that cannot get the script lock is refused, not run alongside the o
   // Nothing was staged or swapped while the lock was held elsewhere.
   assert.strictEqual(env.sheet('Transactions'), null, 'no sheet may be touched without the lock');
 });
+
+/* ── the deploy page must not lie about the version ──────────────────────────
+ *
+ * Merging to GitHub updates the Pages-hosted app but NOT the Apps Script
+ * backend — that only changes when Code.gs is pasted and redeployed. code.html
+ * is the page you copy from, so a stale version label on it tells you that you
+ * have deployed a version you have not. It now reads the version out of the
+ * file it is about to put on your clipboard.
+ */
+
+test('code.html reads the backend version from the file, not from hard-coded markup', () => {
+  const html = fs.readFileSync(path.join(ROOT, 'code.html'), 'utf8');
+
+  // The badge and the note are filled in at load time, not written as a
+  // version string in the markup.
+  assert.match(html, /<span class="badge" id="verBadge">/);
+  assert.match(html, /<b id="verNote">/);
+  assert.ok(!/class="badge">v\d+\.\d+/.test(html), 'the badge must not carry a hard-coded version');
+
+  // The regex it parses with, lifted from the page.
+  const fn = /function versionOf\(txt\)\{[\s\S]*?\n\}/.exec(html);
+  assert.ok(fn, 'versionOf must exist in code.html');
+  const versionOf = vm.runInContext('(' + fn[0].replace('function versionOf', 'function') + ')', vm.createContext({}));
+
+  // It must read the real file correctly — including the release before this
+  // one, which is what proves it is parsing rather than guessing.
+  const current = versionOf(GAS);
+  assert.ok(current, 'versionOf must match the header of google-apps-script.gs');
+  const header = /backend\s+(v[\d.]+)\s+\(([\d-]+)\)/.exec(GAS);
+  assert.strictEqual(current.ver, header[1]);
+  assert.strictEqual(current.date, header[2]);
+
+  // …and the version it reports is the one that fixes the chunk mismatch.
+  assert.strictEqual(current.ver, 'v3.2', 'code.html must be offering the fixed backend');
+});

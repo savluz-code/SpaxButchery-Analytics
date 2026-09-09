@@ -7157,6 +7157,10 @@ window.dedupeCustomers = dedupeCustomers;
 /* ══════════ FIRST VISIT CORRECTION ══════════ */
 function handleFixFirstVisit(input){
   const file = input.files[0];
+  // Reset the input IMMEDIATELY so the user can select files again without
+  // needing a page refresh. FileReader reads from the captured File object,
+  // not from the input element, so clearing early is safe.
+  input.value = '';
   if(!file) return;
   const reader = new FileReader();
   reader.onload = function(e){
@@ -7173,23 +7177,19 @@ function handleFixFirstVisit(input){
           rows = XLSX.utils.sheet_to_json(firstSheet);
         } else {
           alert('XLSX library not loaded. Please save as CSV and re-upload.');
-          input.value = '';
           return;
         }
       } else {
         alert('Please upload a .csv or .xlsx file');
-        input.value = '';
         return;
       }
       const result = fixFirstVisits(rows);
       alert('✅ First Visit correction complete!\n\nMatched & updated: ' + result.updated + '\nNot found: ' + result.notFound + '\nSkipped (no date): ' + result.skipped);
-      input.value = '';
       renderAll();
       if(SYNC_MODE === 'auto') saveToCloud(false, CLOUD_SAVE_NAMES.dupFix);
     }catch(err){
       alert('Error: ' + err.message);
       console.error(err);
-      input.value = '';
     }
   };
   if(file.name.endsWith('.xlsx')){
@@ -9109,6 +9109,12 @@ function backfillTransactions(txs){
 
 async function handleBackfill(input){
   const files = Array.from(input.files);
+  // Reset the input IMMEDIATELY so the user can select files again without
+  // waiting for the entire backfill to finish (or needing a page refresh).
+  // Previously input.value = '' sat at the end of this async function, so an
+  // early return, a thrown error, or a long-running OCR left the input stuck
+  // on the previous selection — selecting the same files again was silent.
+  input.value = '';
   if(files.length === 0) return;
   showSyncStatus('📥 Backfilling...');
   try{
@@ -9145,7 +9151,6 @@ async function handleBackfill(input){
     toast('❌ Backfill failed: ' + err.message);
     showSyncStatus('❌ Backfill failed');
   }
-  input.value = '';
 }
 
 /* ══════════ REBUILD — SCOPED TO THE STATEMENT PERIOD ══════════
@@ -9293,6 +9298,12 @@ function deleteAllKeepResolved(){
 
 async function handleRebuild(input){
   const files = Array.from(input.files);
+  // Reset the input IMMEDIATELY so the user can select files again without
+  // waiting for the entire rebuild to finish (or needing a page refresh).
+  // Rebuild has multiple early-return paths (cancel, errors) that would
+  // otherwise skip the reset at the bottom, leaving the input stuck on the
+  // previous selection — selecting the same files again was silent.
+  input.value = '';
   if(files.length === 0) return;
   showImportModal('🔄','Rebuilding from statements…','Initializing…',0);
   try{
@@ -9352,7 +9363,6 @@ async function handleRebuild(input){
         $('importModalBar').style.background = 'var(--amber)';
         $('importModalClose').style.display = 'inline-block';
         showSyncStatus('⚠️ Rebuild cancelled');
-        input.value = '';
         return;
       }
     }
@@ -9398,7 +9408,6 @@ async function handleRebuild(input){
     $('importModalClose').style.display='inline-block';
     showSyncStatus('❌ Rebuild failed');
   }
-  input.value = '';
 }
 
 function recalcFromHistory(){

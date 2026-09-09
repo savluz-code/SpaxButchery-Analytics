@@ -966,71 +966,25 @@ test('Delete All wipes EVERYTHING \u2014 records, rows, baseline \u2014 keeping 
   assert.equal(byName(ctx, 'Ruth Emilly').contact, '0723456321');
 });
 
-test('Delete All + rebuild: the selected statements become the ONLY data', async () => {
+test('standalone Delete All needs no statement, and a normal import fills the wiped database', async () => {
   const ctx = await bootLoaded();
-  const validBefore = ctx.DB.customers.filter(c => !c.masked && ctx.isValidKenyanContact(c.contact)).length;
-
-  // A bloated / corrupted state: a stale import on top of the report.
-  ctx.importTransactions([row('George Owiti', '0710428075', '2026-08-10', 400, 'STALE1ABCD1')]);
-  assert.ok(ctx.DB.transactions.some(t => t.receipt === 'STALE1ABCD1'));
-
-  // The user runs Delete All & Rebuild and picks the August statement.
-  // proceedRebuild() must hand the option to handleRebuild.
-  ctx.document.getElementById('rebuildWipeAll').checked = true;
-  ctx.proceedRebuild();
-  assert.equal(ctx.pendingRebuildWipe, true, 'the modal option is passed to the rebuild');
-  ctx.parseAnyFile = async () => [row('George Owiti', '0710428075', '2026-08-25', 700, 'AUG1ABCDEF1')];
-  ctx.showConfirm = async () => true; // wipe preview AND result screen both continue
+  ctx.showConfirm = async () => true; // destructive confirmation and completion screen
   ctx.saveToCloud = async () => true;
-  await ctx.handleRebuild({ files: [{ name: 'august.csv' }], value: '' });
-  assert.equal(ctx.pendingRebuildWipe, false, 'the wipe option is consumed');
 
-  // The stale import is gone; only the rebuilt statement remains.
-  assert.ok(!ctx.DB.transactions.some(t => t.receipt === 'STALE1ABCD1'), 'stale data was wiped');
-  assert.equal(ctx.DB.transactions.length, 1);
-  assert.equal(ctx.DB.transactions[0].receipt, 'AUG1ABCDEF1');
-
-  // George: his kept blank record + the rebuilt statement row ONLY (no 600 baseline).
-  const george = byName(ctx, 'George Owiti');
-  assert.equal(george.spent, 700);
-  assert.equal(george.visits, 1);
-
-  // Header = \u03a3 cards = imported (the report contributes 0).
-  assert.equal(sumSpent(ctx), 700);
-  assert.equal(ctx.reportTotals().totalRevenue + ctx.DB.importedRev, sumSpent(ctx));
-  assert.equal(ctx.DB.importedRev, 700);
-  assert.equal(monthlyTotal(ctx), 700, 'the monthly chart holds only the rebuilt statement');
-  assert.equal(ctx.DB.monthly.labels.join(','), '2026-08');
-
-  // Every other kept contact is still a blank.
-  const others = ctx.DB.customers.filter(c => c.name !== 'George Owiti');
-  assert.equal(others.length, validBefore - 1);
-  assert.ok(others.every(c => c.spent === 0 && c.visits === 0));
-
-  // The dedup guard was rebuilt from the survivors \u2014 a re-import is a duplicate.
-  const re = ctx.importTransactions([row('George Owiti', '0710428075', '2026-08-25', 700, 'AUG1ABCDEF1')]);
-  assert.equal(re.dupes, 1);
-});
-
-test('Delete All result screen: stopping keeps the wipe without importing', async () => {
-  const ctx = await bootLoaded();
-  ctx.importTransactions([row('George Owiti', '0710428075', '2026-08-10', 400, 'STALE1ABCD1')]);
-  ctx.document.getElementById('rebuildWipeAll').checked = true;
-  ctx.proceedRebuild();
-  ctx.parseAnyFile = async () => [row('George Owiti', '0710428075', '2026-08-25', 700, 'AUG1ABCDEF1')];
-  // The wipe preview says yes; the result screen says stop here.
-  let calls = 0;
-  ctx.showConfirm = async () => (++calls === 1);
-  ctx.saveToCloud = async () => true;
-  await ctx.handleRebuild({ files: [{ name: 'august.csv' }], value: '' });
-  assert.equal(calls, 2, 'the preview confirm and the result screen were both shown');
-  assert.equal(ctx.pendingRebuildWipe, false);
-  // Wiped (no stale rows, no baseline) but the statement was NOT imported.
+  const completed = await ctx.deleteAllStandalone();
+  assert.equal(completed, true);
+  assert.equal(ctx.DB.baselineCleared, true);
   assert.equal(ctx.DB.transactions.length, 0);
   assert.equal(sumSpent(ctx), 0);
-  assert.equal(ctx.DB.baselineCleared, true);
-  assert.equal(byName(ctx, 'George Owiti').spent, 0);
-  assert.ok(ctx.DB.customers.length > 1000, 'the kept contacts are still there');
+
+  // The ordinary import path works after the wipe; it does not need Rebuild.
+  const result = ctx.importTransactions([
+    row('George Owiti', '0710428075', '2026-09-01', 700, 'NORMAL1ABC1')
+  ]);
+  assert.equal(result.imported, 1);
+  assert.equal(byName(ctx, 'George Owiti').spent, 700);
+  assert.equal(byName(ctx, 'George Owiti').visits, 1);
+  assert.equal(monthOf(ctx, '2026-09'), 700);
 });
 
 test('Reset restores the report baseline after a Delete All', async () => {
@@ -1080,25 +1034,13 @@ test('a cleared baseline is viral across syncs and never resurrected by a stale 
   assert.equal(monthlyTotal(ctx2), 0, 'stale seed months cannot re-inflate the chart');
 });
 
-test('the Import tab offers Delete All & Rebuild, pre-ticking the wipe option', async () => {
-  assert.ok(/openRebuildModal\(true\)/.test(htmlSource), 'the Import tab has a Delete All & Rebuild button');
-  assert.ok(/Delete All & Rebuild/.test(htmlSource), 'the button is labelled Delete All & Rebuild');
-  assert.ok(/wipe EVERYTHING/.test(htmlSource), 'the option names the true wipe honestly');
+test('the Import tab keeps Delete All separate from Full Rebuild', async () => {
+  assert.ok(/onclick=\"openRebuildModal\(\)\"/.test(htmlSource), 'the Import tab has a Full Rebuild button');
+  assert.ok(/onclick=\"deleteAllStandalone\(\)\"/.test(htmlSource), 'the Import tab has a standalone Delete All button');
+  assert.ok(!/Delete All & Rebuild/.test(htmlSource), 'Delete All is not coupled to Rebuild');
 
   const ctx = await bootLoaded();
-  // Plain Full Rebuild opens unticked, as before.
   ctx.openRebuildModal();
-  assert.equal(ctx.document.getElementById('rebuildWipeAll').checked, false);
   assert.equal(ctx.document.getElementById('rebuildTitle').textContent, 'Full Rebuild from Statements');
   assert.equal(ctx.document.getElementById('rebuildIcon').textContent, '🔄');
-  // Delete All & Rebuild opens with the wipe pre-ticked.
-  ctx.openRebuildModal(true);
-  assert.equal(ctx.document.getElementById('rebuildWipeAll').checked, true);
-  assert.equal(ctx.document.getElementById('rebuildTitle').textContent, 'Delete All & Rebuild from Statements');
-  assert.equal(ctx.document.getElementById('rebuildIcon').textContent, '🗑️');
-  // …with live counts showing the scale of the wipe before anything is chosen.
-  assert.ok(/save .* reachable contacts/.test(ctx.document.getElementById('rebuildWipeCounts').textContent), 'live wipe counts are shown');
-  // …and proceeding hands the pre-ticked option to the rebuild.
-  ctx.proceedRebuild();
-  assert.equal(ctx.pendingRebuildWipe, true, 'the pre-ticked wipe is passed to the rebuild');
 });

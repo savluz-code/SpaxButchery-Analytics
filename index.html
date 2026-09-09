@@ -249,11 +249,11 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         <input type="file" id="backfillFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleBackfill(this)">
 
         <button class="btn" style="background:var(--amber);color:#000;font-size:.85rem;" onclick="openRebuildModal()">🔄 Full Rebuild</button>
-        <button class="btn" style="background:var(--red);color:#fff;font-size:.85rem;" onclick="openRebuildModal(true)" title="Wipe EVERYTHING (records, transactions, report baseline) and rebuild from statements — reachable contacts and manual books are kept">🗑️ Delete All & Rebuild</button>
+        <button class="btn" style="background:var(--red);color:#fff;font-size:.85rem;" onclick="deleteAllStandalone()" title="Wipe EVERYTHING (records, transactions, report baseline) — reachable contacts and manual books are kept">🗑️ Delete All</button>
         <input type="file" id="rebuildFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleRebuild(this)">
       </div>
       <div style="font-size:.7rem;color:var(--muted);margin-top:8px;">
-        <b>Backfill</b> = add history; totals only ever move up, never down · <b>Rebuild</b> = clear just the selected statement period and recalculate · <b>Delete All & Rebuild</b> = wipe EVERYTHING incl. the report baseline — only reachable contacts survive
+        <b>Backfill</b> = add history; totals only ever move up, never down · <b>Rebuild</b> = clear just the selected statement period and recalculate · <b>Delete All</b> = wipe EVERYTHING incl. the report baseline — import statements later with the normal drop zone
       </div>
     </div>
     <div class="hint">Hybrid engine: embedded-text parsing + Tesseract OCR fallback for scanned/image PDFs</div>
@@ -855,12 +855,6 @@ function doPost(e) {
       ✓ Keeps transaction history in other periods<br>
       ✓ Rebuild only the period; use Backfill to add extra periods without replacing them<br>
       ✗ Manual edits to summary stats in the rebuilt period will be lost
-    </div>
-    <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:.82rem;color:var(--muted);line-height:1.55;text-align:left">
-      <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
-        <input type="checkbox" id="rebuildWipeAll" style="margin-top:3px;flex:none">
-        <span>🗑️ <b>Delete All — wipe EVERYTHING and start over</b> — deletes <b>all</b> customer records, transactions, history, totals, the duplicate guard, <b>and the original report baseline itself</b>. Saved: <b>every reachable contact — your resolved numbers are kept</b> as blank records, plus your manual stock ledgers, expenses, overheads & item costs. The selected statements then become the single source of truth for all customer and sales figures.<br><span id="rebuildWipeCounts" style="color:var(--blue)"></span></span>
-      </label>
     </div>
     </div>
     <div class="modal-foot">
@@ -8312,39 +8306,73 @@ function openBackfillModal(){ $('backfillModal').style.display = 'flex'; }
 function closeBackfillModal(){ $('backfillModal').style.display = 'none'; }
 function proceedBackfill(){ closeBackfillModal(); setTimeout(() => $('backfillFile').click(), 200); }
 
-function openRebuildModal(presetWipe){
-  // presetWipe = true when opened via the Import tab's "Delete All & Rebuild"
-  // button: the wipe option comes pre-ticked (untick to downgrade to a
-  // period-only rebuild). Plain "Full Rebuild" opens unticked as before.
-  pendingRebuildWipe = false;
-  const w = $('rebuildWipeAll');
-  if (w) w.checked = !!presetWipe;
-  const t = $('rebuildTitle');
-  if (t) t.textContent = presetWipe ? 'Delete All & Rebuild from Statements' : 'Full Rebuild from Statements';
-  const ic = $('rebuildIcon');
-  if (ic) ic.textContent = presetWipe ? '🗑️' : '🔄';
-  // Live counts under the Delete All option, so the scale of the wipe is
-  // visible before anything is chosen (DB may still be loading → blank then).
-  const n = $('rebuildWipeCounts');
-  if (n) {
-    try {
-      const p = planDeleteAll();
-      n.textContent = `Right now that means: save ${p.savedCount.toLocaleString()} reachable contacts + manuals (${p.ledgersKept} ledgers, ${p.expensesKept} expenses, ${p.overheadsKept} overheads) · delete ${p.customersDeleted.toLocaleString()} records + ${p.transactionsDeleted.toLocaleString()} transactions + ${kes(p.revenueDeleted)} revenue + the report baseline.`;
-    } catch (_) { n.textContent = ''; }
-  }
+function openRebuildModal(){
+  // Rebuild is intentionally statement-scoped; Delete All has its own
+  // standalone action and never appears as an option in this dialog.
+  $('rebuildTitle').textContent = 'Full Rebuild from Statements';
+  $('rebuildIcon').textContent = '🔄';
   $('rebuildModal').style.display = 'flex';
 }
 function closeRebuildModal(){ $('rebuildModal').style.display = 'none'; }
 function proceedRebuild(){
-  // Delete All option: TRUE wipe (only reachable contacts kept) before
-  // importing the chosen statements — consumed by handleRebuild.
-  pendingRebuildWipe = !!(($('rebuildWipeAll') && $('rebuildWipeAll').checked));
   closeRebuildModal();
   setTimeout(() => $('rebuildFile').click(), 200);
 }
-// Set by proceedRebuild() from the rebuild modal's "Delete All" option;
-// consumed (and cleared) by handleRebuild.
-let pendingRebuildWipe = false;
+
+// Delete All is deliberately independent from statement parsing and rebuilds.
+// It clears the database immediately after confirmation; the normal import drop
+// zone remains available for the next statement, so a wipe never depends on a
+// file being selected first.
+async function deleteAllStandalone(){
+  const plan = planDeleteAll();
+  const ok = await showConfirm('🗑️', 'Delete All — wipe EVERYTHING except reachable contacts?',
+    'This deletes <b>everything</b>: <b>' + plan.customersDeleted.toLocaleString() + '</b> customer records, ' +
+    '<b>' + plan.transactionsDeleted.toLocaleString() + '</b> transactions, ' +
+    '<b>' + plan.historyRowsDeleted.toLocaleString() + '</b> history rows, the duplicate guard, ' +
+    '<b>' + kes(plan.revenueDeleted) + '</b> of revenue, and <b>the original report baseline itself</b>.<br><br>' +
+    'Saved: <b>' + plan.savedCount.toLocaleString() + ' reachable contacts</b>' +
+    (plan.resolvedKept ? ' (including <b>' + plan.resolvedKept + '</b> you resolved)' : '') +
+    ' — kept as blank records, ready for a fresh import — plus your manual books: ' +
+    'stock ledgers (' + plan.ledgersKept + '), expenses (' + plan.expensesKept + '), overheads (' + plan.overheadsKept + ') and item costs (' + plan.itemCostsKept + ').<br><br>' +
+    '<b>No statement is needed.</b> You can import one later with the normal import drop zone.',
+    [
+      { label: '🗑️ Delete All', primary: true, danger: true, value: true },
+      { label: 'Cancel', value: false }
+    ]);
+  if (!ok) return false;
+
+  const result = deleteAllKeepResolved();
+  let cloudNote;
+  if (SYNC_MODE === 'local') {
+    cloudNote = 'local-only mode — cloud untouched';
+  } else {
+    showSyncStatus('🗑️ Delete All done — pushing the clean state to the cloud…');
+    try {
+      const pushed = await saveToCloud(true);
+      cloudNote = pushed
+        ? 'wiped state pushed to the cloud'
+        : 'cloud push FAILED (' + escHtml(lastCloudError || 'unknown error') + ') — use Sync → Force Push';
+    } catch (err) {
+      cloudNote = 'cloud push FAILED (' + escHtml(err.message || 'unknown error') + ') — use Sync → Force Push';
+    }
+  }
+  await persistDB();
+  refreshAll();
+
+  await showConfirm('✅', 'Delete All complete',
+    '<div style="text-align:left">' +
+    '🗑️ <b>Deleted:</b> ' + result.customersDeleted.toLocaleString() + ' customer records · ' +
+    result.transactionsDeleted.toLocaleString() + ' transactions · ' +
+    result.historyRowsDeleted.toLocaleString() + ' history rows · ' +
+    kes(result.revenueDeleted) + ' revenue · the duplicate guard · <b>the report baseline</b>.<br><br>' +
+    '📇 <b>Saved: ' + result.savedCount.toLocaleString() + ' reachable contacts</b> — blank records ready to receive statement data. Manual books were kept (' +
+    result.ledgersKept + ' ledgers · ' + result.expensesKept + ' expenses · ' + result.overheadsKept + ' overheads · ' + result.itemCostsKept + ' item costs).<br><br>' +
+    '☁️ ' + cloudNote + '.<br><br>' +
+    'The database is now empty of report and statement data. Use the normal <b>📂 Drop one or more files here</b> import area whenever you are ready; no rebuild is required.',
+    [{ label: 'Done', primary: true, value: true }]);
+  showSyncStatus(cloudNote.indexOf('FAILED') >= 0 ? '⚠️ Delete All complete — cloud push failed' : '✅ Delete All complete — ready for normal import');
+  return true;
+}
 
 // Close modals on backdrop click
 $('backfillModal').addEventListener('click', e => { if(e.target === $('backfillModal')) closeBackfillModal(); });
@@ -8876,7 +8904,7 @@ function rebuildSeenMap(){
   DB.seen = seen;
 }
 
-/* ══════════ DELETE ALL (Rebuild → "Delete All & Rebuild") ══════════
+/* ══════════ DELETE ALL ══════════
    A TRUE wipe: every customer record, transaction, history row, dedup key,
    monthly bucket, revenue total AND the original report baseline itself are
    deleted. Two things survive: reachable contacts (every record carrying a
@@ -8965,37 +8993,6 @@ function deleteAllKeepResolved(){
   return plan;
 }
 
-// The Delete All RESULT screen, shown BEFORE the rebuild imports anything:
-// exactly what was deleted, exactly what was saved, and whether to import
-// the parsed statements now or stop here and import later. Reuses the generic
-// confirm modal; resolves true = continue with the import.
-function showDeleteAllResult(result, stmtCount, cloudNote){
-  const LIST_CAP = 25;
-  const shown = result.kept.slice(0, LIST_CAP).map(k =>
-    '<div>' + escHtml(k.name) + ' <span style="color:var(--blue)">' + escHtml(k.contact) + '</span></div>').join('');
-  const more = result.kept.length - Math.min(result.kept.length, LIST_CAP);
-  return showConfirm('🗑️', 'Delete All — result',
-    '<div style="text-align:left">' +
-    '🗑️ <b>Deleted:</b> ' + result.customersDeleted.toLocaleString() + ' customer records · ' +
-    result.transactionsDeleted.toLocaleString() + ' transactions · ' +
-    result.historyRowsDeleted.toLocaleString() + ' history rows · ' + kes(result.revenueDeleted) + ' revenue · ' +
-    'the duplicate guard · <b>the report baseline itself</b>.<br><br>' +
-    '📇 <b>Saved: ' + result.savedCount.toLocaleString() + ' reachable contacts</b>' +
-    (result.resolvedKept ? ' (including <b>' + result.resolvedKept + '</b> you resolved)' : '') +
-    ' — blank records, ready for the rebuild — plus manual books: ledgers (' + result.ledgersKept + ') · expenses (' + result.expensesKept + ') · overheads (' + result.overheadsKept + ') · item costs (' + result.itemCostsKept + '):' +
-    '<div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-top:6px;max-height:150px;overflow:auto;font-size:.8rem">' +
-    (shown || '<span style="color:var(--muted)">(none — no reachable contacts were kept)</span>') +
-    (more > 0 ? '<div style="color:var(--muted)">+ ' + more.toLocaleString() + ' more — full list in the Customers tab</div>' : '') +
-    '</div><br>' +
-    '☁️ ' + cloudNote + '.<br><br>' +
-    'Import the <b>' + Number(stmtCount).toLocaleString() + ' parsed statement rows</b> now — they become the single source of truth for all customer and sales figures — or stop here and import later.' +
-    '</div>',
-    [
-      { label: '▶ Import ' + Number(stmtCount).toLocaleString() + ' rows now', primary: true, value: true },
-      { label: '⏸ Stop here — import later', value: false }
-    ]);
-}
-
 async function handleRebuild(input){
   const files = Array.from(input.files);
   if(files.length === 0) return;
@@ -9022,76 +9019,6 @@ async function handleRebuild(input){
       if(!rows.length){ updateImportModal('No transactions found in <b>' + file.name + '</b>', pct); continue; }
       updateImportModal('Reading <b>' + rows.length + '</b> rows from <b>' + file.name + '</b>…', pct+10);
       allRows.push(...rows);
-    }
-    // Optional Delete All mode (checked in the rebuild modal, or the Import
-    // tab's Delete All & Rebuild button): TRUE wipe — every record, row,
-    // ledger and the report baseline itself go; only reachable contacts are
-    // kept as blanks. The wipe result is shown BEFORE anything is imported,
-    // and the user chooses whether the selected statements are imported now
-    // (they become the ONLY data) or later.
-    if (pendingRebuildWipe && allRows.length) {
-      // Live preview of exactly what Delete All will do (pure — nothing
-      // touched yet), so the confirm names real counts, not promises.
-      const plan = planDeleteAll();
-      const ok = await showConfirm('🗑️','Delete All — wipe EVERYTHING except reachable contacts?',
-        'This deletes <b>everything</b>: <b>' + plan.customersDeleted.toLocaleString() + '</b> customer records, ' +
-        '<b>' + plan.transactionsDeleted.toLocaleString() + '</b> transactions, ' +
-        '<b>' + plan.historyRowsDeleted.toLocaleString() + '</b> history rows, the duplicate guard, ' +
-        '<b>' + kes(plan.revenueDeleted) + '</b> of revenue, ' +
-        'AND the <b>original report baseline itself</b>.<br><br>' +
-        'Saved: <b>' + plan.savedCount.toLocaleString() + ' reachable contacts</b>' +
-        (plan.resolvedKept ? ' (including <b>' + plan.resolvedKept + '</b> you resolved)' : '') +
-        ' — kept as blank records, ready for the rebuild — plus your manual books: ' +
-        'stock ledgers (' + plan.ledgersKept + '), expenses (' + plan.expensesKept + '), overheads (' + plan.overheadsKept + '), item costs (' + plan.itemCostsKept + ').<br><br>' +
-        'After the wipe you will see the full result and choose whether to import the selected statements now or later.',
-        [
-          { label: '🗑️ Delete All', primary: true, value: true },
-          { label: 'Cancel this rebuild', value: false }
-        ]);
-      if (!ok) {
-        pendingRebuildWipe = false;
-        $('importModalIcon').textContent = '⚠️';
-        $('importModalTitle').textContent = 'Cancelled';
-        $('importModalBody').innerHTML = '<b>Rebuild cancelled</b> — nothing was changed.';
-        $('importModalBar').style.width = '0%';
-        $('importModalBar').style.background = 'var(--amber)';
-        $('importModalClose').style.display = 'inline-block';
-        showSyncStatus('⚠️ Rebuild cancelled');
-        input.value = '';
-        return;
-      }
-      const result = deleteAllKeepResolved();
-      pendingRebuildWipe = false;
-      // Push the wiped state to the cloud NOW, before the rebuild imports a
-      // single row: the cloud merge unions transactions, so a stale cloud
-      // would otherwise resurrect everything just deleted on the next sync.
-      let cloudNote;
-      if (SYNC_MODE === 'local') {
-        cloudNote = 'local-only mode — cloud untouched';
-      } else {
-        updateImportModal('🗑️ Wiped — pushing the clean state to the cloud…', 25);
-        const pushed = await saveToCloud(true);
-        cloudNote = pushed ? 'wiped state pushed to the cloud' : 'cloud push FAILED (' + escHtml(lastCloudError || 'unknown error') + ') — push manually or the old cloud data may return';
-      }
-      persistDB();
-      // The Delete All RESULT, shown BEFORE the rebuild imports anything: what
-      // was deleted, what was saved, and the choice to import now or later.
-      const go = await showDeleteAllResult(result, allRows.length, cloudNote);
-      if (!go) {
-        save();
-        refreshAll();
-        $('importModalIcon').textContent = '⏸️';
-        $('importModalTitle').textContent = 'Wiped — import when ready';
-        $('importModalBody').innerHTML = '<b>Delete All is done.</b> ' + result.savedCount.toLocaleString() + ' reachable contacts saved (manual books kept); everything else cleared.<br><br>' +
-          'Import statements any time via <b>📥 Backfill</b>, <b>🔄 Full Rebuild</b> or the drop zone — on your other devices use <b>Sync → Force Pull</b> from this one.';
-        $('importModalBar').style.width = '100%';
-        $('importModalBar').style.background = 'var(--amber)';
-        $('importModalClose').style.display = 'inline-block';
-        showSyncStatus('⏸️ Wiped — statements not imported yet');
-        input.value = '';
-        return;
-      }
-      updateImportModal('🗑️ Delete All done (' + result.savedCount.toLocaleString() + ' contacts saved) — importing statements…', 30);
     }
     // Scoped wipe: only the window the statements cover is cleared, never the
     // periods before or after it. The monthly chart and importedRev are NOT
@@ -9143,7 +9070,7 @@ async function handleRebuild(input){
     recalcFromHistory();
     // One local persist + ONE forced cloud push. save() would also kick off
     // an unforced saveToCloud that collides with the forced one below (the
-    // "backend busy with another save" after Delete All & Rebuild).
+    // "backend busy with another save" after a destructive reset).
     persistDB();
     refreshAll();
     let cloudOk = true;

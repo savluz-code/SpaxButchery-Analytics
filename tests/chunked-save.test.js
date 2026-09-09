@@ -417,6 +417,90 @@ test('forced saves queue behind each other — never two requests in flight', as
   assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveAll').length, 2);
 });
 
+test('background saves coalesce into ONE queued slot while forced saves queue individually — shown as 1/3…3/3', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 10); // small save → single saveAll each
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const inner = cloud.fetchImpl;
+  cloud.fetchImpl = async (url, options) => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    try {
+      await new Promise((r) => setTimeout(r, 20));
+      return await inner(url, options);
+    } finally {
+      inFlight -= 1;
+    }
+  };
+  ctx.fetch = cloud.fetchImpl;
+
+  vm.runInContext(syncLayerSource(), ctx);
+  const first = ctx.saveToCloud(true); // forced #1 starts
+  const bgA = ctx.saveToCloud(false); // background while #1 runs → queued slot
+  const bgB = ctx.saveToCloud(false); // second background → SAME slot (coalesced)
+  const forced2 = ctx.saveToCloud(true); // forced → its own slot
+
+  assert.strictEqual(bgA, bgB, 'background saves while one is queued must share one promise');
+  assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 2, 'one shared background slot + one forced slot');
+  assert.strictEqual(vm.runInContext('cloudSavePos', ctx), 1, 'the running job is task 1');
+
+  const results = await Promise.all([first, bgA, bgB, forced2]);
+  assert.deepStrictEqual(results, [true, true, true, true]);
+  assert.strictEqual(maxInFlight, 1, 'the queue must keep saves strictly serialized');
+  assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveAll').length, 3,
+    '3 uploads: forced #1, ONE coalesced background save, forced #2');
+  assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 0);
+  assert.strictEqual(vm.runInContext('cloudSaveRunning', ctx), false);
+
+  // The pill tells the user what is going on the whole time: 1/3 → 2/3 → 3/3,
+  // with the remaining count on every completion.
+  assert.ok(status.some((m) => /Saving to cloud… 1\/3/.test(m)), 'running save must show its queue position');
+  assert.ok(status.some((m) => /✅ Save 1\/3 complete — 2 more queued/.test(m)), 'first completion must announce the rest');
+  assert.ok(status.some((m) => /✅ Save 2\/3 complete — 1 more queued/.test(m)), 'second completion must announce the rest');
+  assert.ok(status.some((m) => /✅ Save 3\/3 complete/.test(m)), 'last completion must not claim queued tasks');
+});
+
+test('a queued save that fails stays visible and the queue keeps going for the next task', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 10);
+  db.customerTx = {};
+  db.seen = {};
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+
+  let saveAllNo = 0;
+  const inner = cloud.fetchImpl;
+  cloud.fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (body.action === 'saveAll') {
+      saveAllNo += 1;
+      if (saveAllNo === 2) { // the middle task of three
+        cloud.calls.push(body);
+        return { ok: true, text: async () => JSON.stringify({ success: false, error: 'cloud rejected the save' }) };
+      }
+    }
+    return inner(url, options);
+  };
+  ctx.fetch = cloud.fetchImpl;
+
+  vm.runInContext(syncLayerSource(), ctx);
+  const first = ctx.saveToCloud(true); // task 1 — succeeds
+  const doomed = ctx.saveToCloud(true); // task 2 — fails
+  const after = ctx.saveToCloud(true); // task 3 — must still run
+
+  const results = await Promise.all([first, doomed, after]);
+  assert.deepStrictEqual(results, [true, false, true], 'a failed queued save must not poison the queue');
+  assert.ok(status.some((m) => /❌ Save 2\/3 failed: cloud rejected the save/.test(m)), 'the failure must name its queue position');
+  assert.ok(status.some((m) => /✅ Save 3\/3 complete/.test(m)), 'the task behind the failure must still run');
+  assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 0);
+});
+
 test('a backend-busy response retries a small save automatically', async () => {
   const cloud = makeCloud({ chunked: true });
   const db = bigDB();
@@ -510,15 +594,24 @@ test('busy retries keep isSyncing true so a concurrent save cannot start', async
   vm.runInContext(src, ctx);
 
   const first = ctx.saveToCloud(true);
-  // While the first save is mid-busy-retry, an unforced save must be dropped
-  // (isSyncing still true) and a forced save must queue, never overlap.
+  // While the first save is mid-busy-retry, a background save must QUEUE (not
+  // start, not vanish) and a forced save queues in its own slot — the queue
+  // slot, not isSyncing, is what serializes them now.
   await new Promise((r) => setTimeout(r, 20));
-  const dropped = await ctx.saveToCloud(false);
-  assert.strictEqual(dropped, false, 'unforced save must not start while a busy retry is in flight');
+  assert.strictEqual(vm.runInContext('cloudSaveRunning', ctx), true, 'first save still in flight');
+  const bg = ctx.saveToCloud(false);
+  const forced = ctx.saveToCloud(true);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 2,
+    'background save + forced save must both be queued, never silently dropped');
+  assert.strictEqual(vm.runInContext('cloudSaveQueue[0].auto', ctx), true);
+  assert.strictEqual(vm.runInContext('cloudSaveQueue[1].force', ctx), true);
 
-  const ok = await first;
-  assert.strictEqual(ok, true, 'busy retries must eventually succeed');
+  const results = await Promise.all([first, bg, forced]);
+  assert.deepStrictEqual(results, [true, true, true], 'every queued save must eventually succeed');
   assert.strictEqual(vm.runInContext('isSyncing', ctx), false, 'isSyncing must clear only after the whole chain');
+  assert.strictEqual(vm.runInContext('cloudSaveRunning', ctx), false, 'queue must drain fully');
+  assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 0);
   // One failed attempt ×2 busy, then one success — never two concurrent POSTs.
   assert.ok(cloud.calls.filter((c) => c.action === 'saveAll').length >= 3);
 });
@@ -571,6 +664,14 @@ test('client keeps payload-aware timeouts and wires the chunked actions + fallba
   // outermost attempt — otherwise a concurrent save starts mid-retry.
   assert.match(HTML, /return await performSaveToCloud\(nextRetry\)/);
   assert.match(HTML, /if \(busyRetry === 0\) isSyncing = false/);
+  // The save queue: background saves coalesce into one slot (never silently
+  // dropped), forced saves each get a slot, and the queue announces itself.
+  assert.match(HTML, /if \(!force && cloudSaveAutoPromise\) return cloudSaveAutoPromise/, 'background saves must coalesce, not disappear');
+  assert.match(HTML, /cloudSaveQueue\.push\(job\)/, 'every save must take a place in the queue');
+  assert.match(HTML, /'⏳ Saving to cloud… ' \+ cloudSavePos \+ '\/' \+ total/, 'the pill must show "Saving to cloud… 1/3"');
+  assert.match(HTML, /'✅ Save ' \+ cloudSavePos \+ '\/' \+ total \+ ' complete' \+ rest/, 'completions must report the queue position');
+  assert.match(HTML, /Save queue complete/, 'the batch completion must be announced');
+  assert.match(HTML, /cloudSaveAnnounceRunning\(\)/, 'a running save must re-announce when tasks are queued behind it');
   // importTransactions must NOT fire its own cloud push — callers persist.
   // Strip comments first so the "Do NOT saveToCloud()" note doesn't match.
   const importBody = HTML.slice(

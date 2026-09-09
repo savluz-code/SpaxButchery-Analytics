@@ -1224,23 +1224,105 @@ async function loadFromCloud() {
 // Saves are serialized. Apps Script funnels writers through a script lock, so
 // two overlapping POSTs make the second one burn its whole timeout in
 // waitLock and fail — a big self-inflicted source of "cloud sync failed".
-// Forced saves queue behind the in-flight one; unforced saves are dropped
-// while one is running or queued, because the queued save builds its payload
-// from the live DB when it actually runs, so it carries the latest data.
-let cloudSaveChain = Promise.resolve(false);
-let cloudSaveQueued = false;
+//
+// Every save now takes a NUMBERED place in a queue instead of being silently
+// dropped while another save runs:
+//   • Forced saves (Force Push, Delete All, Smart Merge, Rebuild, Backfill)
+//     each get their own slot — the user explicitly asked for them.
+//   • Background saves (save() after every edit/import) share ONE slot: the
+//     queued save snapshots the live DB when it actually runs, so it already
+//     carries every change that arrived while it waited. Stacking N of them
+//     would just re-upload the same database N times.
+// The status pill shows the queue live: "⏳ Saving to cloud… 1/3" while the
+// first of three tasks uploads, "✅ Save 1/3 complete — 2 more queued" as each
+// one lands, and a "💾 Save queue complete" toast when the whole batch is
+// done. The user always sees what is saving in the background — nothing
+// overlaps the lock, nothing disappears unannounced.
+let cloudSaveQueue = [];         // jobs waiting to start: { force, auto, resolve }
+let cloudSaveRunning = false;    // a job is uploading right now
+let cloudSavePos = 0;            // 1-based number of the running job
+let cloudSaveAutoPromise = null; // shared promise of the coalesced background slot
+
+// The pill counting is LIVE: position + everything still queued. A save that
+// started alone becomes "1/3" the moment two more tasks land behind it.
+function cloudSaveLiveTotal() {
+  return cloudSavePos + cloudSaveQueue.length; // finished jobs are behind pos
+}
 
 function saveToCloud(force = false) {
   if (SYNC_MODE === 'local') return Promise.resolve(false);
-  if (!force && (isSyncing || cloudSaveQueued)) return Promise.resolve(false);
-  cloudSaveQueued = true;
-  const run = cloudSaveChain.catch(() => {}).then(() => {
-    cloudSaveQueued = false;
-    if (SYNC_MODE === 'local') return false;
-    return performSaveToCloud();
-  });
-  cloudSaveChain = run.catch(() => false);
-  return run;
+  // Background saves coalesce into one slot: if one is already queued or
+  // running, this request rides the same promise. The queued save reads the
+  // live DB when it actually runs, so it already includes this change.
+  if (!force && cloudSaveAutoPromise) return cloudSaveAutoPromise;
+  let resolveJob;
+  const promise = new Promise(resolve => { resolveJob = resolve; });
+  const job = { force: !!force, auto: !force, resolve: resolveJob };
+  if (!force) cloudSaveAutoPromise = promise;
+  cloudSaveQueue.push(job);
+  if (cloudSaveRunning) {
+    // The running save started before these tasks arrived — refresh its label
+    // so it reads "Saving to cloud… 1/3" while the rest wait their turn.
+    cloudSaveAnnounceRunning();
+  } else {
+    cloudSavePump();
+  }
+  return promise;
+}
+
+function cloudSaveAnnounceRunning() {
+  const total = cloudSaveLiveTotal();
+  showSyncStatus(total > 1
+    ? '⏳ Saving to cloud… ' + cloudSavePos + '/' + total
+    : '⏳ Saving to cloud...');
+}
+
+function cloudSavePump() {
+  // Never two uploads in flight — they would fight over the backend script
+  // lock, which is exactly the "cloud sync failed" bug this queue prevents.
+  if (cloudSaveRunning) return;
+  if (!cloudSaveQueue.length) {
+    // The batch drained. If more than one task ran, announce the batch
+    // completion once — the per-save pill messages fade after a few seconds.
+    if (cloudSavePos > 1 && typeof toast === 'function') {
+      toast('💾 Save queue complete — ' + cloudSavePos + '/' + cloudSavePos + ' tasks saved');
+    }
+    cloudSavePos = 0;
+    return;
+  }
+  const job = cloudSaveQueue.shift();
+  if (job.auto) cloudSaveAutoPromise = null; // slot running — new background saves queue for the next round
+  cloudSaveRunning = true;
+  cloudSavePos += 1;
+  cloudSaveAnnounceRunning();
+  Promise.resolve()
+    .then(() => SYNC_MODE === 'local' ? false : performSaveToCloud())
+    .then(ok => { job.resolve(!!ok); })
+    .catch(() => { job.resolve(false); })
+    .then(() => { cloudSaveRunning = false; cloudSavePump(); });
+}
+
+// Suffix added to in-progress messages when other tasks are queued behind the
+// running one, e.g. "⏳ Saving to cloud… 42% (save 1/3)".
+function cloudSaveTag() {
+  const total = cloudSaveLiveTotal();
+  return total > 1 ? ' (save ' + cloudSavePos + '/' + total + ')' : '';
+}
+
+// Success message: the last task of a batch logs the clean single-save text;
+// earlier tasks say how many remain, so an "1/3 complete" with two more queued
+// never looks like a silent drop.
+function cloudSaveDoneMessage() {
+  const total = cloudSaveLiveTotal();
+  const rest = cloudSaveQueue.length > 0 ? ' — ' + cloudSaveQueue.length + ' more queued' : '';
+  if (total > 1) return '✅ Save ' + cloudSavePos + '/' + total + ' complete' + rest;
+  return '✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString();
+}
+
+function cloudSaveFailedMessage(msg) {
+  const total = cloudSaveLiveTotal();
+  if (total > 1) return '❌ Save ' + cloudSavePos + '/' + total + ' failed: ' + msg;
+  return '❌ Save failed: ' + msg;
 }
 
 async function performSaveToCloud(busyRetry = 0) {
@@ -1250,9 +1332,9 @@ async function performSaveToCloud(busyRetry = 0) {
   // let save()/auto-sync fire a second POST while the first was still
   // holding the Apps Script lock. That second POST is what the user saw as
   // permanent "backend busy with another save": the "other save" was this
-  // tab fighting itself. Only the outermost attempt owns the flag.
+  // tab fighting itself. Only the outermost attempt owns the flag. The
+  // queue has already announced this job ("⏳ Saving to cloud… 1/3").
   if (busyRetry === 0) isSyncing = true;
-  if (busyRetry === 0) showSyncStatus('⏳ Saving to cloud...');
 
   try {
     // Merchant exclusion applies to the cloud too: never push Simon Musyoka
@@ -1362,7 +1444,7 @@ async function performSaveToCloud(busyRetry = 0) {
     }
     if (result.success) {
       lastSyncTime = new Date();
-      showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
+      showSyncStatus(cloudSaveDoneMessage());
       lastCloudError = '';
       return true;
     }
@@ -1378,7 +1460,7 @@ async function performSaveToCloud(busyRetry = 0) {
     if (isBackendBusyError(err) && busyRetry < CLOUD_BUSY_RETRIES) {
       const nextRetry = busyRetry + 1;
       const delayMs = CLOUD_BUSY_RETRY_DELAYS[nextRetry - 1] || CLOUD_BUSY_RETRY_DELAYS[CLOUD_BUSY_RETRY_DELAYS.length - 1];
-      showSyncStatus('⏳ Cloud busy (another save still writing) — retrying in ' + Math.ceil(delayMs / 1000) + 's (' + nextRetry + '/' + CLOUD_BUSY_RETRIES + ')');
+      showSyncStatus('⏳ Cloud busy (another save still writing) — retrying in ' + Math.ceil(delayMs / 1000) + 's (' + nextRetry + '/' + CLOUD_BUSY_RETRIES + ')' + cloudSaveTag());
       await new Promise(resolve => setTimeout(resolve, delayMs));
       return await performSaveToCloud(nextRetry);
     }
@@ -1388,9 +1470,9 @@ async function performSaveToCloud(busyRetry = 0) {
     // answer: usually a previous push from this device that the client gave
     // up on, still finishing on Apps Script — not an unknown process.
     if (isBackendBusyError(err)) {
-      showSyncStatus('❌ Save failed: backend still busy after retries — wait ~1 min then Force Push. Usually a previous save from this device still writing, or another open tab.');
+      showSyncStatus(cloudSaveFailedMessage('backend still busy after retries — wait ~1 min then Force Push. Usually a previous save from this device still writing, or another open tab.'));
     } else {
-      showSyncStatus('❌ Save failed: ' + lastCloudError);
+      showSyncStatus(cloudSaveFailedMessage(lastCloudError));
     }
     return false;
   } finally {
@@ -1411,7 +1493,7 @@ async function performSaveToCloud(busyRetry = 0) {
 // open in two tabs) no longer inflates the staged row count and fails the
 // commit with "chunk mismatch … staged N rows, expected M".
 async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
-  showSyncStatus('⏳ Saving to cloud… (large upload, sending in parts)');
+  showSyncStatus('⏳ Saving to cloud… (large upload, sending in parts)' + cloudSaveTag());
   let begin;
   try {
     begin = await post({
@@ -1454,7 +1536,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
       const res = await post({ action: 'saveChunk', table, rows: slice, uploadId, seq }, CLOUD_TIMEOUT_CHUNK);
       if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
       sent += slice.length;
-      showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%');
+      showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%' + cloudSaveTag());
     }
   }
 
@@ -1463,7 +1545,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
   const commit = await post({ action: 'saveCommit', expect, uploadId });
   if (commit.success) {
     lastSyncTime = new Date();
-    showSyncStatus('✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString());
+    showSyncStatus(cloudSaveDoneMessage());
     lastCloudError = '';
     return true;
   }
@@ -1499,7 +1581,9 @@ function showSyncStatus(msg) {
   if (!el) {
     el = document.createElement('div');
     el.id = 'syncStatus';
-    el.style.cssText = 'position:fixed;top:8px;right:8px;background:var(--card2);border:1px solid var(--border);padding:6px 12px;border-radius:8px;font-size:.75rem;color:var(--muted);z-index:100;transition:.3s;cursor:pointer;';
+    // Sits above modal overlays (z-index 200–400) so a background save's
+    // progress stays visible no matter what screen the user is on.
+    el.style.cssText = 'position:fixed;top:8px;right:8px;background:var(--card2);border:1px solid var(--border);padding:6px 12px;border-radius:8px;font-size:.75rem;color:var(--muted);z-index:500;transition:.3s;cursor:pointer;';
     el.onclick = () => { if(SYNC_MODE!=='local'){loadFromCloud();} };
     document.body.appendChild(el);
   }

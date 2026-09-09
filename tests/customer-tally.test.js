@@ -466,7 +466,7 @@ test('every mutation path re-derives the totals instead of hand-adjusting them',
   const rebuild = slice('function recalcFromHistory(){', '/* ══════════ IMPORT MODAL HELPERS');
   assert.match(rebuild, /reconcileCustomerAggregates\(c, txs\)/);
 
-  const load = slice('async function loadFromCloud() {', 'let cloudSaveChain');
+  const load = slice('async function loadFromCloud() {', 'let cloudSaveQueue');
   assert.match(load, /mergeBaselineFields\(localCust, cloudCust\)/);
 
   // The baseline cut-off must survive the cloud round-trip.

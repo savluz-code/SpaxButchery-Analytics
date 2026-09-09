@@ -967,6 +967,12 @@ const CLOUD_TIMEOUT_DEFAULT = 30000;   // probes, commits, small saveAll
 const CLOUD_TIMEOUT_CHUNK = 60000;     // saveBegin + saveChunk (~250 KB each)
 const CLOUD_TIMEOUT_LOAD = 90000;      // action=load (whole DB down)
 const CLOUD_TIMEOUT_BIG_SAVE = 180000; // one-shot saveAll fallback (whole DB up)
+// A busy response means the backend deliberately did not touch the data: a
+// different device/save still owns the script lock. Retry the COMPLETE save
+// after a short backoff. This is safe for both saveAll and chunked uploads (a
+// chunked retry starts with saveBegin, which resets staging).
+const CLOUD_BUSY_RETRIES = 2;
+const CLOUD_BUSY_RETRY_DELAYS = [2000, 5000];
 
 async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT) {
   const controller = new AbortController();
@@ -1236,7 +1242,7 @@ function saveToCloud(force = false) {
   return run;
 }
 
-async function performSaveToCloud() {
+async function performSaveToCloud(busyRetry = 0) {
   isSyncing = true;
   showSyncStatus('⏳ Saving to cloud...');
 
@@ -1354,6 +1360,17 @@ async function performSaveToCloud() {
     }
     throw new Error(result.error || 'Cloud rejected the save');
   } catch (err) {
+    // The backend returns this when another device/tab owns the script lock.
+    // It did not write anything, so retry the entire payload rather than
+    // resuming halfway through a chunked upload. Restarting at saveBegin is
+    // important: it clears any staging left by the first attempt.
+    if (isBackendBusyError(err) && busyRetry < CLOUD_BUSY_RETRIES) {
+      const nextRetry = busyRetry + 1;
+      const delayMs = CLOUD_BUSY_RETRY_DELAYS[nextRetry - 1] || CLOUD_BUSY_RETRY_DELAYS[CLOUD_BUSY_RETRY_DELAYS.length - 1];
+      showSyncStatus('⏳ Cloud busy — retrying save in ' + Math.ceil(delayMs / 1000) + 's (' + nextRetry + '/' + CLOUD_BUSY_RETRIES + ')');
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      return performSaveToCloud(nextRetry);
+    }
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);
     showSyncStatus('❌ Save failed: ' + lastCloudError);
@@ -1433,6 +1450,13 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
     return true;
   }
   throw new Error(commit.error || 'Cloud rejected the save');
+}
+
+// A save may fail without touching any sheet when another device/tab owns
+// Apps Script's script lock. Keep this separate from network retries: the
+// caller can safely restart the whole save, including a chunked upload.
+function isBackendBusyError(err) {
+  return /backend busy(?: with another save)?/i.test(String((err && err.message) || err));
 }
 
 // The pre-chunked backend answers unknown POST actions with exactly this

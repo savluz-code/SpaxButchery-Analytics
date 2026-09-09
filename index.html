@@ -96,6 +96,10 @@ textarea{width:100%;resize:vertical}
 @keyframes spin{to{transform:rotate(360deg)}}
 .prog-bar{height:8px;background:var(--card2);border-radius:4px;overflow:hidden;margin-top:8px}
 .prog-bar div{height:100%;background:var(--green);border-radius:4px;transition:width .3s;width:0}
+/* Scroll-safe modal cards: card never exceeds the viewport; body scrolls, button row stays pinned */
+.modal-card{max-height:calc(100vh - 32px);max-height:calc(100dvh - 32px);display:flex;flex-direction:column;overflow:hidden}
+.modal-scroll{overflow-y:auto;min-height:0;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;flex:1 1 auto}
+.modal-foot{flex:none}
 .ai-providers{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-top:10px}
 .ai-btn{display:flex;flex-direction:column;align-items:center;gap:6px;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:14px 8px;cursor:pointer;transition:.15s;color:var(--text)}
 .ai-btn:hover{border-color:var(--blue);transform:translateY(-2px)}
@@ -778,12 +782,16 @@ function doPost(e) {
 
 <!-- Import Progress Modal -->
 <div id="importModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:200;align-items:center;justify-content:center;padding:16px;">
-  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;text-align:center;">
-    <div id="importModalIcon" style="font-size:3rem;margin-bottom:8px">⏳</div>
-    <h3 id="importModalTitle" style="margin-bottom:6px">Importing…</h3>
-    <div id="importModalBody" style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">Please wait</div>
-    <div class="prog-bar" style="margin-bottom:16px"><div id="importModalBar" style="width:0%"></div></div>
-    <button class="btn" id="importModalClose" style="display:none" onclick="closeImportModal()">Done</button>
+  <div class="modal-card" style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;text-align:center;">
+    <div class="modal-scroll">
+      <div id="importModalIcon" style="font-size:3rem;margin-bottom:8px">⏳</div>
+      <h3 id="importModalTitle" style="margin-bottom:6px">Importing…</h3>
+      <div id="importModalBody" style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">Please wait</div>
+      <div class="prog-bar" style="margin-bottom:16px"><div id="importModalBar" style="width:0%"></div></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="importModalClose" style="display:none" onclick="closeImportModal()">Done</button>
+    </div>
   </div>
 </div>
 
@@ -800,17 +808,20 @@ function doPost(e) {
 
 <!-- Generic Confirm Modal (used when a rebuild could conflict with the seed / report baseline) -->
 <div id="confirmModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);z-index:220;align-items:center;justify-content:center;padding:16px;">
-  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:540px;width:100%;padding:24px;text-align:center;">
-    <div id="confirmIcon" style="font-size:3rem;margin-bottom:8px">⚠️</div>
-    <h3 id="confirmTitle" style="margin-bottom:8px">Confirm</h3>
-    <div id="confirmBody" style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px"></div>
-    <div id="confirmActions" style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap"></div>
+  <div class="modal-card" style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:540px;width:100%;padding:24px;text-align:center;">
+    <div class="modal-scroll">
+      <div id="confirmIcon" style="font-size:3rem;margin-bottom:8px">⚠️</div>
+      <h3 id="confirmTitle" style="margin-bottom:8px">Confirm</h3>
+      <div id="confirmBody" style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px"></div>
+    </div>
+    <div id="confirmActions" class="modal-foot" style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap"></div>
   </div>
 </div>
 
 <!-- Backfill Modal -->
 <div id="backfillModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:200;align-items:center;justify-content:center;padding:16px;">
-  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;text-align:center;">
+  <div class="modal-card" style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;text-align:center;">
+    <div class="modal-scroll">
     <div style="font-size:3rem;margin-bottom:8px">📥</div>
     <h3 style="margin-bottom:6px">Backfill Transaction History</h3>
     <div style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">
@@ -823,7 +834,8 @@ function doPost(e) {
       ✓ A statement can only correct a total <b>upward</b> — never below the
         report figure, which counts cash a statement cannot show
     </div>
-    <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+    </div>
+    <div class="modal-foot" style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
       <button class="btn ghost" onclick="closeBackfillModal()">Cancel</button>
       <button class="btn blue" onclick="proceedBackfill()">📁 Choose Files</button>
     </div>
@@ -832,7 +844,8 @@ function doPost(e) {
 
 <!-- Rebuild Modal -->
 <div id="rebuildModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:200;align-items:center;justify-content:center;padding:16px;">
-  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;text-align:center;">
+  <div class="modal-card" style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;text-align:center;">
+    <div class="modal-scroll">
     <div id="rebuildIcon" style="font-size:3rem;margin-bottom:8px">🔄</div>
     <h3 id="rebuildTitle" style="margin-bottom:6px">Full Rebuild from Statements</h3>
     <div style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">
@@ -849,21 +862,25 @@ function doPost(e) {
         <span>🗑️ <b>Delete All — wipe EVERYTHING and start over</b> — deletes <b>all</b> customer records, transactions, history, totals, the duplicate guard, <b>and the original report baseline itself</b>. Saved: <b>every reachable contact — your resolved numbers are kept</b> as blank records, plus your manual stock ledgers, expenses, overheads & item costs. The selected statements then become the single source of truth for all customer and sales figures.<br><span id="rebuildWipeCounts" style="color:var(--blue)"></span></span>
       </label>
     </div>
-    <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
-      <button class="btn ghost" onclick="closeRebuildModal()">Cancel</button>
-      <button class="btn" style="background:var(--amber);color:#000" onclick="proceedRebuild()">📁 Choose Files</button>
     </div>
-    <div style="color:var(--muted);font-size:.75rem;margin-top:10px">Select <b>all</b> statements for a period in one rebuild — a second rebuild replaces only that period, not others.</div>
+    <div class="modal-foot">
+      <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+        <button class="btn ghost" onclick="closeRebuildModal()">Cancel</button>
+        <button class="btn" style="background:var(--amber);color:#000" onclick="proceedRebuild()">📁 Choose Files</button>
+      </div>
+      <div style="color:var(--muted);font-size:.75rem;margin-top:10px">Select <b>all</b> statements for a period in one rebuild — a second rebuild replaces only that period, not others.</div>
+    </div>
   </div>
 </div>
 
 <!-- Contact Edit Modal (Contact Resolver) -->
 <div id="contactEditModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:250;align-items:center;justify-content:center;padding:16px;">
-  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+  <div class="modal-card" style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex:none">
       <h3 style="margin:0;font-size:1.05rem;">✏️ Edit Contact</h3>
       <button class="btn ghost" onclick="closeContactEdit()" style="font-size:1.2rem;line-height:1;">✕</button>
     </div>
+    <div class="modal-scroll">
     <div style="font-size:.8rem;color:var(--muted);margin-bottom:14px;">Correct the name and/or contact if they were captured incorrectly.</div>
     <input type="hidden" id="contactEditIdx">
     <div style="margin-bottom:12px;">
@@ -874,23 +891,28 @@ function doPost(e) {
       <label style="font-size:.8rem;color:var(--muted);display:block;margin-bottom:4px;font-weight:600;">Contact (phone)</label>
       <input type="text" id="contactEditPhone" style="width:100%;box-sizing:border-box" placeholder="e.g. 0723456321">
     </div>
-    <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;">
-      <button class="btn ghost" onclick="closeContactEdit()">Cancel</button>
-      <button class="btn green" onclick="saveContactEdit()">💾 Save Changes</button>
     </div>
-    <div id="contactEditMsg" style="margin-top:10px;font-size:.82rem;min-height:20px;"></div>
+    <div class="modal-foot">
+      <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;">
+        <button class="btn ghost" onclick="closeContactEdit()">Cancel</button>
+        <button class="btn green" onclick="saveContactEdit()">💾 Save Changes</button>
+      </div>
+      <div id="contactEditMsg" style="margin-top:10px;font-size:.82rem;min-height:20px;"></div>
+    </div>
   </div>
 </div>
 
 <!-- Encrypted PDF Password Modal -->
 <div id="pdfPasswordModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:300;align-items:center;justify-content:center;padding:16px;">
-  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:420px;width:100%;padding:24px;text-align:center;">
+  <div class="modal-card" style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:420px;width:100%;padding:24px;text-align:center;">
+    <div class="modal-scroll">
     <div style="font-size:3rem;margin-bottom:8px">🔒</div>
     <h3 style="margin-bottom:6px">Encrypted PDF</h3>
     <div id="pdfPasswordName" style="color:var(--muted);font-size:.9rem;margin-bottom:6px;word-break:break-word"></div>
     <div id="pdfPasswordError" style="display:none;color:var(--red);font-size:.85rem;margin-bottom:10px"></div>
     <input type="password" id="pdfPasswordInput" placeholder="Enter PDF password" autocomplete="off" style="width:100%;box-sizing:border-box;text-align:center;margin-bottom:16px">
-    <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+    </div>
+    <div class="modal-foot" style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
       <button class="btn ghost" id="pdfPasswordCancel">Cancel</button>
       <button class="btn blue" id="pdfPasswordOk">🔓 Unlock</button>
     </div>

@@ -245,10 +245,11 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         <input type="file" id="backfillFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleBackfill(this)">
 
         <button class="btn" style="background:var(--amber);color:#000;font-size:.85rem;" onclick="openRebuildModal()">🔄 Full Rebuild</button>
+        <button class="btn" style="background:var(--red);color:#fff;font-size:.85rem;" onclick="openRebuildModal(true)" title="Wipe EVERYTHING (records, transactions, report baseline) and rebuild from statements — reachable contacts and manual books are kept">🗑️ Delete All & Rebuild</button>
         <input type="file" id="rebuildFile" accept=".pdf,.csv,.xlsx" multiple style="display:none" onchange="handleRebuild(this)">
       </div>
       <div style="font-size:.7rem;color:var(--muted);margin-top:8px;">
-        <b>Backfill</b> = add history; totals only ever move up, never down · <b>Rebuild</b> = clear just the selected statement period and recalculate
+        <b>Backfill</b> = add history; totals only ever move up, never down · <b>Rebuild</b> = clear just the selected statement period and recalculate · <b>Delete All & Rebuild</b> = wipe EVERYTHING incl. the report baseline — only reachable contacts survive
       </div>
     </div>
     <div class="hint">Hybrid engine: embedded-text parsing + Tesseract OCR fallback for scanned/image PDFs</div>
@@ -297,7 +298,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
       <button class="btn ghost" id="saveBaselineBtn">💾 Save Current as Local Baseline</button>
       <button class="btn ghost" id="restoreBaselineBtn">♻️ Restore Local Baseline</button>
       <button class="btn blue" id="exportSeedBtn">🧬 Export as JS Seed Code</button>
-      <button class="btn ghost" id="resetBtn">↺ Reset to Original Report Data</button>
+      <button class="btn ghost" id="resetBtn" title="Restores the original report baseline in full — this is also how you undo a Delete All">↺ Reset to Original Report Data</button>
       <span style="color:var(--muted);font-size:.8rem" id="importLog"></span>
     </div>
   </div>
@@ -832,8 +833,8 @@ function doPost(e) {
 <!-- Rebuild Modal -->
 <div id="rebuildModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:200;align-items:center;justify-content:center;padding:16px;">
   <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;max-width:480px;width:100%;padding:24px;text-align:center;">
-    <div style="font-size:3rem;margin-bottom:8px">🔄</div>
-    <h3 style="margin-bottom:6px">Full Rebuild from Statements</h3>
+    <div id="rebuildIcon" style="font-size:3rem;margin-bottom:8px">🔄</div>
+    <h3 id="rebuildTitle" style="margin-bottom:6px">Full Rebuild from Statements</h3>
     <div style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">
       <b style="color:var(--red)">Warning:</b> This clears and rebuilds the <b>statement period only</b> — periods before or after the files you choose are left untouched.<br><br>
       ✓ Clears and rebuilds transaction history for the selected period<br>
@@ -845,7 +846,7 @@ function doPost(e) {
     <div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:.82rem;color:var(--muted);line-height:1.55;text-align:left">
       <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
         <input type="checkbox" id="rebuildWipeAll" style="margin-top:3px;flex:none">
-        <span>🧹 <b>Start from a clean database</b> — first wipe <b>all imported data</b> (transactions, history, totals &amp; the duplicate guard), keeping only <b>customer names &amp; contacts</b> plus your manual stock ledgers. The selected statements then become the single source of truth, on top of the original report figures.</span>
+        <span>🗑️ <b>Delete All — wipe EVERYTHING and start over</b> — deletes <b>all</b> customer records, transactions, history, totals, the duplicate guard, <b>and the original report baseline itself</b>. Saved: <b>every reachable contact — your resolved numbers are kept</b> as blank records, plus your manual stock ledgers, expenses, overheads & item costs. The selected statements then become the single source of truth for all customer and sales figures.<br><span id="rebuildWipeCounts" style="color:var(--blue)"></span></span>
       </label>
     </div>
     <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
@@ -1093,10 +1094,21 @@ async function loadFromCloud() {
 
       if (data.settings) {
         // importedRev / importedTx are derived below — taking max() with the
-        // cloud copy would re-import an inflated sheet's figures. resolved and
-        // importBatch are genuine monotonic counters, so they still merge.
-        DB.resolved = Math.max(Number(data.settings.resolved)||0, localResolvedSnap);
+        // cloud copy would re-import an inflated sheet's figures. importBatch
+        // is a genuine monotonic counter, so it still merges.
         DB.importBatch = Math.max(Number(data.settings.importBatch)||0, localImportBatchSnap);
+        // A cleared baseline is viral: once either side ran Delete All, the
+        // merge is cleared too and every record's baseline fields are
+        // scrubbed, so a stale copy can never resurrect the report figures
+        // record by record. The resolved counter then follows the cleared
+        // side (its records are the truth); otherwise it still merges.
+        const cloudCleared = Number(data.settings.baselineCleared) === 1;
+        if (cloudCleared || baselineCleared()) {
+          DB.resolved = baselineCleared() ? localResolvedSnap : (Number(data.settings.resolved) || 0);
+          scrubBaselineFields();
+        } else {
+          DB.resolved = Math.max(Number(data.settings.resolved)||0, localResolvedSnap);
+        }
       }
 
       // Transactions: union by receipt|date|time keys (including legacy 10-char variant)
@@ -1217,7 +1229,10 @@ async function performSaveToCloud() {
         importedRev: DB.importedRev,
         importedTx: DB.importedTx,
         resolved: DB.resolved,
-        importBatch: Number(DB.importBatch) || 0
+        importBatch: Number(DB.importBatch) || 0,
+        // Delete-All state rides the generic key/value settings sheet, so a
+        // wiped-then-pushed database stays wiped on every device that pulls.
+        baselineCleared: DB.baselineCleared ? 1 : 0
       },
       customerTx: Object.fromEntries(
         Object.entries(DB.customerTx || {}).filter(([name]) => !isMerchant(name))
@@ -1792,7 +1807,7 @@ const SEED_CUSTOMERS=[
 ["Lilian Adhiambo Owino","0706692668",800,4,228,"2025-08-01","2025-11-08"],
 ["Amos Otieno Onabo","0728570415",800,4,238,"2025-07-08","2025-10-29"],
 ["Rebecca Mawia Musili","0759641068",800,5,160,"2025-11-17","2026-01-15"],
-["Eunice Wanjiku Njoki","0746790876",800,1,82,"2026-04-03","2026-04-03"],
+["Eunice Wanjiku Njoki","0746796",800,1,82,"2026-04-03","2026-04-03"],
 ["Mary Muthoni Gitahi","0717011837",800,9,71,"2025-07-29","2026-04-14"],
 ["Wendy Apiyo Omondi","0794781642",800,2,106,"2025-10-25","2026-03-10"],
 ["Rafail Masitsa Amuhaya","0718***943",800,1,340,"2025-07-19","2025-07-19"],
@@ -3162,6 +3177,36 @@ const REPORT={totalCustomers:1669,totalRevenue:1250341,totalTxns:5519,masked:623
 
 /* ══════════ STATE ══════════ */
 let DB;
+// True once Delete All has cleared the original report baseline. The seed
+// tables above stay in the source (Reset restores them), but every read of
+// the baseline — seed rows, seed months, report totals, seed-date migration —
+// goes through the gates below and sees an empty baseline instead.
+function baselineCleared(){ return !!(DB && DB.baselineCleared); }
+// Effective report totals: the REPORT const normally, zeros once Delete All
+// has cleared the baseline. Every REPORT.* read in the UI must use this.
+function reportTotals(){
+  if (baselineCleared()) return { totalCustomers: 0, totalRevenue: 0, totalTxns: 0, masked: 0, valid: 0 };
+  return REPORT;
+}
+// Effective seed months for the monthly chart / revenue derivation: empty
+// once the baseline is cleared, so no report month can leak back in.
+function seedMonths(){
+  if (baselineCleared()) return { labels: [], revenue: [] };
+  return (typeof SEED_MONTHLY !== 'undefined' && SEED_MONTHLY && SEED_MONTHLY.labels) ? SEED_MONTHLY : { labels: [], revenue: [] };
+}
+// Blanks every record's baseline fields and raises the cleared flag.
+// Idempotent: run it after Delete All and after any cloud merge that meets a
+// cleared side, so a stale copy can never resurrect the baseline.
+function scrubBaselineFields(){
+  (DB.customers || []).forEach(c => {
+    if (!c) return;
+    c.seedSpent = 0;
+    c.seedVisits = 0;
+    c.seedLastVisit = '';
+    c.isSeed = false;
+  });
+  DB.baselineCleared = true;
+}
 async function seedFromSavedBaseline(){
   try {
     // Baseline is a full copy of the DB — route it through IndexedDB too, or
@@ -3181,6 +3226,9 @@ async function seedFromSavedBaseline(){
   } catch (e) { return null; }
 }
 async function seedDB(){
+  // NOTE: the object built below carries no baselineCleared flag, so Reset
+  // restores the original report baseline in full — it is the way back from
+  // a Delete All. (A saved local baseline round-trips its own flag instead.)
   const fromBaseline = await seedFromSavedBaseline();
   if (fromBaseline) return JSON.parse(JSON.stringify(fromBaseline));
   const today = new Date(getTodayEAT());
@@ -3269,9 +3317,12 @@ async function load(){
     if (sanitizeNegativeTotals() > 0) needsSave = true;
 
     // Migrate: add isSeed flag and seed baseline values for customers that
-    // match seed data but don't have these fields yet (from older versions)
+    // match seed data but don't have these fields yet (from older versions).
+    // Skipped entirely once Delete All has cleared the baseline — no seed
+    // figure or seed date may leak back into a cleared database on reload.
+    const seedMigr = !baselineCleared();
     DB.customers.forEach(c => {
-      if (seedSpentLookup[c.name] !== undefined && c.isSeed === undefined) {
+      if (seedMigr && seedSpentLookup[c.name] !== undefined && c.isSeed === undefined) {
         c.isSeed = true;
         c.seedSpent = seedSpentLookup[c.name];
         c.seedVisits = seedVisitsLookup[c.name];
@@ -3285,19 +3336,19 @@ async function load(){
       // Fix firstVisit from seed data if missing/empty — but NEVER overwrite
       // a real reconciled date with a stale seed value when transaction history exists.
       const hasHistory = (DB.customerTx[c.name] || []).length > 0;
-      if((!c.firstVisit || c.firstVisit === '') && !hasHistory && seedLookup[c.name]){
+      if(seedMigr && (!c.firstVisit || c.firstVisit === '') && !hasHistory && seedLookup[c.name]){
         c.firstVisit = stripTime(seedLookup[c.name]);
         needsSave = true;
       }
       // Also guard the "same as lastVisit" case — that equality is expected for
       // single-visit customers (c.visits === 1) and must not trigger a seed overwrite.
-      if((c.visits || 0) > 1 && c.firstVisit === c.lastVisit && !hasHistory && seedLookup[c.name] && c.firstVisit !== stripTime(seedLookup[c.name])){
+      if(seedMigr && (c.visits || 0) > 1 && c.firstVisit === c.lastVisit && !hasHistory && seedLookup[c.name] && c.firstVisit !== stripTime(seedLookup[c.name])){
         c.firstVisit = stripTime(seedLookup[c.name]);
         needsSave = true;
       }
       if(!c.lastVisit && c.days < 999){
         // Use actual lastVisit from seed if available, else calculate from days
-        c.lastVisit = stripTime(seedLastVisit[c.name]) || new Date(today.getTime() - c.days*86400000).toISOString().slice(0, 10);
+        c.lastVisit = (seedMigr && stripTime(seedLastVisit[c.name])) || new Date(today.getTime() - c.days*86400000).toISOString().slice(0, 10);
       }
       if(c.lastVisit && c.lastVisit !== ""){
         c.days = Math.max(0, Math.round((today - new Date(c.lastVisit)) / 86400000));
@@ -4064,6 +4115,12 @@ let _seedBaselineIndex = null;
 // and the report date be booked on top of a figure that already included them,
 // which is how the header ended up at roughly double the revenue.
 function _seedIndex(){
+  // A cleared baseline has no seed rows: every lookup misses, so no record
+  // can be (re-)stamped with report figures. Deliberately NOT cached — Reset
+  // restores the baseline and the cached full index below is still valid then.
+  // (typeof-guarded: unit-test slices that eval this block without the helper
+  // default to baseline-active, exactly the old behaviour.)
+  if (typeof baselineCleared === 'function' && baselineCleared()) return { byName: new Map(), byNameContact: new Map(), cutoff: '' };
   if (_seedBaselineIndex) return _seedBaselineIndex;
   const byName = new Map(), byNameContact = new Map(), rows = [];
   let cutoff = '';
@@ -4356,8 +4413,12 @@ function reconcileCustomerAggregates(c, hist){
 
    Which makes the invariant the UI depends on true by construction:
 
-     Σ monthly = SEED_MONTHLY + importedRev
-     REPORT.totalRevenue + importedRev = Σ c.spent   (= the header)
+     Σ monthly = seedMonths() + importedRev
+     reportTotals().totalRevenue + importedRev = Σ c.spent   (= the header)
+
+   (seedMonths() / reportTotals() are the SEED_MONTHLY / REPORT consts normally
+   and empty / zero once Delete All has cleared the baseline — the invariant
+   holds in both states.)
 
    A fresh seed therefore derives importedRev = 0 and monthly = SEED_MONTHLY,
    double-booked history can no longer raise either figure, and a stale cloud
@@ -4377,7 +4438,12 @@ function _ledgerMonthOf(dateStr){
 // the customers, their history and the daily ledgers.
 function deriveRevenueLedgers(){
   const months = new Map();
-  const seedM = (typeof SEED_MONTHLY !== 'undefined' && SEED_MONTHLY && SEED_MONTHLY.labels) ? SEED_MONTHLY : { labels: [], revenue: [] };
+  // Empty once Delete All has cleared the baseline. (typeof-guarded like
+  // _seedIndex: unit-test slices that eval this block without the helper keep
+  // the old seed-month behaviour.)
+  const seedM = (typeof baselineCleared === 'function' && baselineCleared())
+    ? { labels: [], revenue: [] }
+    : ((typeof SEED_MONTHLY !== 'undefined' && SEED_MONTHLY && SEED_MONTHLY.labels) ? SEED_MONTHLY : { labels: [], revenue: [] });
   seedM.labels.forEach((l, i) => months.set(l, Math.max(0, Number(seedM.revenue[i]) || 0)));
   const addMonth = (mk, amount) => {
     if (!mk || !(amount > 0)) return;
@@ -5079,11 +5145,20 @@ function refreshAll(){
   const cs=DB.customers;
   const totRev=getProductStats().totalRevenue;
   const totCust=DB.customers.length;
-  const validPct=(((REPORT.valid+DB.resolved)/totCust)*100).toFixed(1);
+  const rt=reportTotals();
+  // Reachable % and the masked line are report-relative normally; with the
+  // baseline cleared there is no report, so both are computed from the live
+  // records instead (kept contacts are all reachable → 100% until masked
+  // rows are re-imported).
+  const validPct = baselineCleared()
+    ? (totCust ? ((cs.filter(c=>!c.masked && isValidKenyanContact(c.contact)).length/totCust)*100).toFixed(1) : '0.0')
+    : (((rt.valid+DB.resolved)/totCust)*100).toFixed(1);
   $('hCust').textContent=totCust.toLocaleString();
   $('hRev').textContent=(totRev/1000).toFixed(0)+'K';
   $('hReach').textContent=validPct;
-  $('maskedCount').textContent=`${REPORT.masked-DB.resolved} masked report-wide · ${cs.filter(c=>c.masked).length} in tracked list · ${DB.resolved} resolved`;
+  $('maskedCount').textContent = baselineCleared()
+    ? `report baseline cleared · ${cs.filter(c=>c.masked).length} masked in tracked list · ${DB.resolved} reachable contacts kept`
+    : `${rt.masked-DB.resolved} masked report-wide · ${cs.filter(c=>c.masked).length} in tracked list · ${DB.resolved} resolved`;
   const active=cs.filter(c=>c.days<=30).length,risk=cs.filter(c=>c.days>60&&c.days<=90).length,lost=cs.filter(c=>c.days>90).length;
   const overdueCusts = cs.filter(c => customerIPI(c).status === 'overdue');
   const ipiOverdueCount = overdueCusts.length;
@@ -5106,7 +5181,7 @@ $('kpiGrid').innerHTML=`
   if(revChart)revChart.destroy();if(segChart)segChart.destroy();if(newChart)newChart.destroy();
   // Cleaner monthly revenue: stacked baseline (report/seed) vs imported, with a
   // one-line summary and click-through to the month's transactions.
-  const seedM = (typeof SEED_MONTHLY !== 'undefined' && SEED_MONTHLY && SEED_MONTHLY.labels) ? SEED_MONTHLY : { labels: [], revenue: [] };
+  const seedM = seedMonths(); // empty once Delete All has cleared the baseline
   const baseByMonth = new Map(); seedM.labels.forEach((l,i) => baseByMonth.set(l, Math.max(0, Number(seedM.revenue[i])||0)));
   const labels = (DB.monthly && DB.monthly.labels) || [];
   const baseline = labels.map(l => baseByMonth.get(l) || 0);
@@ -7437,10 +7512,17 @@ const AI_URLS={
 function dataSnapshot(){
   const cs=[...DB.customers].sort((a,b)=>b.spent-a.spent);
   const act=cs.filter(c=>c.days<=30).length,rk=cs.filter(c=>c.days>60&&c.days<=90).length,lo=cs.filter(c=>c.days>90).length;
+  const rt=reportTotals();
+  const cleared=baselineCleared();
+  const reachPct = cleared
+    ? (cs.length ? Math.round(cs.filter(c=>!c.masked && isValidKenyanContact(c.contact)).length/cs.length*100) : 0)
+    : Math.round(((rt.valid+DB.resolved)/rt.totalCustomers)*100);
   let s=`BUSINESS DATA — SpaxButchery (Kenyan butchery, M-Pesa payments)\n`;
-  s+=`Totals: revenue KES ${(REPORT.totalRevenue+DB.importedRev).toLocaleString()}, ${REPORT.totalCustomers+cs.filter(c=>!c.isSeed).length} customers, ${REPORT.totalTxns+DB.importedTx} transactions, avg KES 749/customer, KES 227/txn.\n`;
+  s+=`Totals: revenue KES ${(rt.totalRevenue+DB.importedRev).toLocaleString()}, ${cleared ? cs.length : (rt.totalCustomers+cs.filter(c=>!c.isSeed).length)} customers, ${rt.totalTxns+DB.importedTx} transactions, avg KES 749/customer, KES 227/txn.\n`;
   s+=`New this month (first-ever purchase in ${monthLabelEAT()}): ${newThisMonthCustomers().length}.\n`;
-  s+=`Segments (report-wide): Active≤30d:336, AtRisk 61-90d:147, Lost90+d:1186. Reachable contacts: ${(((REPORT.valid+DB.resolved)/REPORT.totalCustomers)*100).toFixed(0)}%.\n`;
+  s+= cleared
+    ? `Report baseline: CLEARED by Delete All (all figures below are rebuilt from statements only). Reachable contacts: ${reachPct}%.\n`
+    : `Segments (report-wide): Active≤30d:336, AtRisk 61-90d:147, Lost90+d:1186. Reachable contacts: ${reachPct}%.\n`;
   s+=`Tracked list: Active:${act} AtRisk:${rk} Lost:${lo}.\n`;
   s+=`Monthly revenue: `+DB.monthly.labels.map((l,i)=>`${l}:${DB.monthly.revenue[i]}`).join(', ')+'.\n';
   try{
@@ -7476,8 +7558,9 @@ function aiAnswer(q){
     const l=/laps|risk|away|inactive/.test(q)?pool.filter(c=>c.days>30):pool;
     return `🏆 <b>Top ${Math.min(n,l.length)}:</b>\n`+listC([...l].sort((a,b)=>b.spent-a.spent),n);}
   if(/revenue summary|total revenue|how much/.test(q)){
+    if(!DB.monthly.labels.length) return `💰 Total: <b>${kes(reportTotals().totalRevenue+DB.importedRev)}</b> — no monthly history yet${baselineCleared()?' (report baseline cleared; import statements to rebuild)':''}.`;
     const b=DB.monthly.revenue.indexOf(Math.max(...DB.monthly.revenue));
-    return `💰 Total: ${kes(REPORT.totalRevenue+DB.importedRev)} (${kes(DB.importedRev)} imported)\nBest month: <b>${DB.monthly.labels[b]}</b> — ${kes(DB.monthly.revenue[b])}\nAvg/customer KES 749 · Avg/txn KES 227`;}
+    return `💰 Total: ${kes(reportTotals().totalRevenue+DB.importedRev)} (${kes(DB.importedRev)} imported)\nBest month: <b>${DB.monthly.labels[b]}</b> — ${kes(DB.monthly.revenue[b])}\nAvg/customer KES 749 · Avg/txn KES 227`;}
   if(/at risk|risk/.test(q)){const r=cs.filter(c=>c.days>60&&c.days<=90).sort((a,b)=>b.spent-a.spent);
     return `🟠 <b>${r.length} at risk (61–90d):</b>\n`+listC(r,10)+`\n\n💡 Outreach → At Risk → ⚡ One-Click Bulk SMS.`;}
   if(/lost|churn/.test(q)){const l=cs.filter(c=>c.days>90).sort((a,b)=>b.spent-a.spent);
@@ -7489,7 +7572,8 @@ function aiAnswer(q){
   if(/(hasn't|not|no).*(visit|come|seen)|visited in/.test(q)&&num){const r=cs.filter(c=>c.days>=+num).sort((a,b)=>b.spent-a.spent);
     return `⏰ <b>${r.length} away ${num}+ days:</b>\n`+listC(r,12);}
   if(/masked|unreachable/.test(q)){
-    return `🔒 ${REPORT.masked-DB.resolved} masked report-wide, ${cs.filter(c=>c.masked).length} tracked, ${DB.resolved} resolved. Statement imports (even OCR'd) auto-unmask matches!`;}
+    if(baselineCleared()) return `🔒 Report baseline cleared: ${cs.filter(c=>c.masked).length} masked in the tracked list, ${DB.resolved} reachable contacts kept. Statement imports (even OCR'd) auto-unmask matches!`;
+    return `🔒 ${reportTotals().masked-DB.resolved} masked report-wide, ${cs.filter(c=>c.masked).length} tracked, ${DB.resolved} resolved. Statement imports (even OCR'd) auto-unmask matches!`;}
   if(/recommend|advice|action|suggest/.test(q)){
     const r=cs.filter(c=>c.days>60&&c.days<=90).length;
     return `🚀 1. One-Click Bulk SMS the ${r} at-risk customers today\n2. Call VIPs 60+ days away: ${cs.filter(c=>c.spent>=10000&&c.days>60).map(c=>c.name).join(', ')||'none 🎉'}\n3. Import weekly M-Pesa PDFs (OCR handles scans; auto-unmasks contacts)\n4. Rebuild basket size with bundles`;}
@@ -8147,22 +8231,38 @@ function openBackfillModal(){ $('backfillModal').style.display = 'flex'; }
 function closeBackfillModal(){ $('backfillModal').style.display = 'none'; }
 function proceedBackfill(){ closeBackfillModal(); setTimeout(() => $('backfillFile').click(), 200); }
 
-function openRebuildModal(){
+function openRebuildModal(presetWipe){
+  // presetWipe = true when opened via the Import tab's "Delete All & Rebuild"
+  // button: the wipe option comes pre-ticked (untick to downgrade to a
+  // period-only rebuild). Plain "Full Rebuild" opens unticked as before.
   pendingRebuildWipe = false;
   const w = $('rebuildWipeAll');
-  if (w) w.checked = false;
+  if (w) w.checked = !!presetWipe;
+  const t = $('rebuildTitle');
+  if (t) t.textContent = presetWipe ? 'Delete All & Rebuild from Statements' : 'Full Rebuild from Statements';
+  const ic = $('rebuildIcon');
+  if (ic) ic.textContent = presetWipe ? '🗑️' : '🔄';
+  // Live counts under the Delete All option, so the scale of the wipe is
+  // visible before anything is chosen (DB may still be loading → blank then).
+  const n = $('rebuildWipeCounts');
+  if (n) {
+    try {
+      const p = planDeleteAll();
+      n.textContent = `Right now that means: save ${p.savedCount.toLocaleString()} reachable contacts + manuals (${p.ledgersKept} ledgers, ${p.expensesKept} expenses, ${p.overheadsKept} overheads) · delete ${p.customersDeleted.toLocaleString()} records + ${p.transactionsDeleted.toLocaleString()} transactions + ${kes(p.revenueDeleted)} revenue + the report baseline.`;
+    } catch (_) { n.textContent = ''; }
+  }
   $('rebuildModal').style.display = 'flex';
 }
 function closeRebuildModal(){ $('rebuildModal').style.display = 'none'; }
 function proceedRebuild(){
-  // Clean-slate option: wipe all imported data (keep names & contacts) before
+  // Delete All option: TRUE wipe (only reachable contacts kept) before
   // importing the chosen statements — consumed by handleRebuild.
   pendingRebuildWipe = !!(($('rebuildWipeAll') && $('rebuildWipeAll').checked));
   closeRebuildModal();
   setTimeout(() => $('rebuildFile').click(), 200);
 }
-// Set by proceedRebuild() from the rebuild modal's "start from a clean
-// database" option; consumed (and cleared) by handleRebuild.
+// Set by proceedRebuild() from the rebuild modal's "Delete All" option;
+// consumed (and cleared) by handleRebuild.
 let pendingRebuildWipe = false;
 
 // Close modals on backdrop click
@@ -8236,6 +8336,10 @@ async function forcePullFromCloud(){
       DB.importedRev = Number(data.settings.importedRev) || 0;
       DB.importedTx = Number(data.settings.importedTx) || 0;
       DB.resolved = Number(data.settings.resolved) || 0;
+      // A pull is an overwrite: the cloud's Delete-All state wins as-is, so
+      // pulling a wiped database clears this device too (and vice versa).
+      DB.baselineCleared = Number(data.settings.baselineCleared) === 1;
+      if (DB.baselineCleared) scrubBaselineFields();
     }
     if(data.transactions){
       DB.transactions = data.transactions.map(t => ({...t, amount: Number(t.amount) || 0}));
@@ -8330,6 +8434,10 @@ async function smartMergeCloud(){
       DB.customerTx[name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
     });
 
+    // A cleared baseline is viral across merges too (see loadFromCloud).
+    if ((data.settings && Number(data.settings.baselineCleared) === 1) || baselineCleared()) {
+      scrubBaselineFields();
+    }
     sanitizeNegativeTotals();
     repairDates(); // re-derive spent/visits from the merged baseline + history
     save();
@@ -8373,6 +8481,7 @@ function updateSyncDetails(){
     <b>Local Transactions:</b> ${(DB.transactions || []).length.toLocaleString()}<br>
     <b>Imported Revenue:</b> KSh ${(DB.importedRev || 0).toLocaleString()}<br>
     <b>Contacts Resolved:</b> ${DB.resolved || 0}<br>
+    <b>Report Baseline:</b> ${baselineCleared() ? '<span style="color:var(--amber)">Cleared by Delete All — statements only (Reset restores it)</span>' : '<span style="color:var(--green)">Active</span>'}<br>
     <b>Local Store:</b> ${typeof _idb !== 'undefined' && _idb ? 'IndexedDB' : 'localStorage (fallback)'} — ${typeof DB_persistFailed !== 'undefined' && DB_persistFailed ? '<span style="color:var(--amber)">⚠️ Full — data is in memory &amp; cloud only</span>' : '<span style="color:var(--green)">OK</span>'}<br>
     <b>GAS URL:</b> ${GAS_URL.includes('YOUR_SCRIPT') ? '<span style="color:var(--red)">Not configured</span>' : '<span style="color:var(--green)">Connected</span>'}
   `;
@@ -8682,93 +8791,124 @@ function rebuildSeenMap(){
   DB.seen = seen;
 }
 
-/* ══════════ CLEAN-SLATE WIPE (Full Rebuild → "start from a clean database") ══════════
-   Wipes every piece of STATEMENT-IMPORTED data and resets each customer to the
-   original report figures — exactly the state a fresh install (or "Reset to
-   Original Report Data") produces — EXCEPT the roster itself: names, contacts
-   (including the hard-won resolved numbers) and masked state survive.
-   Why the report rows come back: the report is the app's foundation (the
-   header and the monthly chart always carry it — see deriveRevenueLedgers),
-   so wiping the import layer but keeping the baselines is the only state in
-   which the card, the header and the chart agree again. The selected
-   statements are then imported on top, exactly like a fresh build.
-   Kept on purpose: names + contacts, the report baseline, and the manual
-   entries (dailyLedgers, dailyExpenses, overheads, itemCosts) — those are
-   keyed/OCR'd stock-sheet data that no statement can restore. */
-function _seedFirstVisitOf(name, contact){
-  if (typeof SEED_CUSTOMERS === 'undefined' || !Array.isArray(SEED_CUSTOMERS)) return '';
-  for (const r of SEED_CUSTOMERS) {
-    if (r[0] === name && String(r[1] || '') === String(contact || '')) return stripTime(r[5]) || '';
-  }
-  for (const r of SEED_CUSTOMERS) {
-    if (r[0] === name) return stripTime(r[5]) || '';
-  }
-  return '';
-}
-function wipeDatabaseKeepRoster(){
-  const roster = (DB.customers || []).map(c => ({
-    name: String(c.name || '').trim(),
-    contact: String(c.contact || '').trim(),
-    masked: !!c.masked
-  })).filter(r => r.name);
-  const today = new Date(getTodayEAT());
-  const daysOf = (lastVisit) => (lastVisit
-    ? Math.max(0, Math.round((today - new Date(lastVisit)) / 86400000))
-    : 999);
-  const next = [];
+/* ══════════ DELETE ALL (Rebuild → "Delete All & Rebuild") ══════════
+   A TRUE wipe: every customer record, transaction, history row, dedup key,
+   monthly bucket, revenue total AND the original report baseline itself are
+   deleted. Two things survive: reachable contacts (every record carrying a
+   valid full phone number is kept as a blank, zeroed, no-baseline record, so
+   no Contact Resolver work is ever lost) and the manual books (daily stock
+   ledgers, daily expenses, overheads, item costs) — keyed/OCR'd data that no
+   statement can restore.
+   Why every valid number is kept, not just resolver-resolved ones: statements
+   mask phone numbers (0723***321), so a full number the wipe dropped could
+   never come back from a re-import — the customer would return masked and
+   need re-resolving. Masked / empty-contact records ARE deleted (statements
+   re-create whatever is real, and nothing of value is lost with them).
+   The cleared baseline is viral: DB.baselineCleared blanks every baseline
+   read (seed rows, seed months, report totals, seed-date migration) and rides
+   the cloud settings sheet, so no device or sync can resurrect the figures.
+   "Reset to Original Report Data" (seedDB) is the way back: it builds a
+   database without the flag, restoring the report baseline in full. */
+// Pure: what Delete All WILL do, without touching anything. Feeds the confirm
+// preview, the result screen and the modal's live counts line.
+function planDeleteAll(){
+  const kept = [];
   const used = new Set();
-  roster.forEach(r => {
-    const key = r.name + '|' + r.contact;
-    if (used.has(key)) return; // an exact roster duplicate keeps one record
+  let resolvedKept = 0;
+  (DB.customers || []).forEach(c => {
+    const name = String((c && c.name) || '').trim();
+    const contact = String((c && c.contact) || '').trim();
+    if (!name || !contact) return;
+    if (isMerchant(name)) return;
+    // Only reachable contacts survive: unmasked records with a valid number.
+    if (c.masked || !isValidKenyanContact(contact)) return;
+    const key = name + '|' + contact;
+    if (used.has(key)) return;
     used.add(key);
-    const row = seedBaselineFor(r.name, r.contact);
-    if (row) {
-      // Report-known customer: restore the original report row (fresh-install
-      // state), with the roster's own contact/masked state (a resolved number
-      // must survive the wipe).
-      next.push({
-        name: r.name, contact: r.contact,
-        spent: row.spent, visits: row.visits,
-        days: daysOf(row.lastVisit),
-        firstVisit: _seedFirstVisitOf(r.name, r.contact),
-        lastVisit: row.lastVisit,
-        masked: r.masked,
-        isNew: false,
-        isSeed: true,
-        seedSpent: row.spent,
-        seedVisits: row.visits,
-        seedLastVisit: row.asOf
-      });
-    } else {
-      // Import-created customer: no report row of their own — a true blank
-      // slate. seedLastVisit '' is the "no baseline" stamp, so the report can
-      // never re-stamp one; their statement rows (re-imported below) rebuild
-      // their totals.
-      next.push({
-        name: r.name, contact: r.contact,
-        spent: 0, visits: 0, days: 999,
-        firstVisit: '', lastVisit: '',
-        masked: r.masked,
-        isNew: false, newBatch: 0,
-        isSeed: false,
-        seedSpent: 0, seedVisits: 0, seedLastVisit: ''
-      });
+    kept.push({ name, contact });
+    // "Resolved" for display = the seed knew this name only masked. (Every
+    // masked seed name is unique, so the name lookup is unambiguous.)
+    if (typeof SEED_CUSTOMERS !== 'undefined' && Array.isArray(SEED_CUSTOMERS) &&
+        SEED_CUSTOMERS.some(r => r[0] === name && String(r[1] || '').indexOf('***') !== -1)) {
+      resolvedKept++;
     }
   });
-  DB.customers = next;
-  // Everything statement-derived goes — the re-import rebuilds it:
+  let historyRows = 0;
+  Object.keys(DB.customerTx || {}).forEach(name => { historyRows += (DB.customerTx[name] || []).length; });
+  return {
+    kept,
+    savedCount: kept.length,
+    resolvedKept,
+    customersDeleted: (DB.customers || []).length - kept.length,
+    transactionsDeleted: (DB.transactions || []).length,
+    historyRowsDeleted: historyRows,
+    seenDeleted: Object.keys(DB.seen || {}).length,
+    ledgersKept: (DB.dailyLedgers || []).length,
+    expensesKept: (DB.dailyExpenses || []).length,
+    overheadsKept: (DB.overheads || []).length,
+    itemCostsKept: Object.keys(DB.itemCosts || {}).length,
+    revenueDeleted: getProductStats().totalRevenue
+  };
+}
+function deleteAllKeepResolved(){
+  const plan = planDeleteAll();
+  // Every kept contact restarts blank: zeroed, no baseline, stamped
+  // seedLastVisit '' ("no baseline") so nothing can ever re-stamp one.
+  DB.customers = plan.kept.map(k => ({
+    name: k.name, contact: k.contact,
+    spent: 0, visits: 0, days: 999,
+    firstVisit: '', lastVisit: '',
+    masked: false,
+    isNew: false, newBatch: 0,
+    isSeed: false,
+    seedSpent: 0, seedVisits: 0, seedLastVisit: ''
+  }));
+  // Everything else goes. Monthly restarts EMPTY (no seed months — the
+  // baseline is cleared); the rebuild re-derives buckets from its own rows
+  // plus the kept manual ledgers. The manual books (dailyLedgers,
+  // dailyExpenses, overheads, itemCosts) are deliberately untouched — keyed /
+  // OCR'd data that no statement can restore.
   DB.transactions = [];
   DB.customerTx = {};
   DB.seen = {};
   DB.importedRev = 0;
   DB.importedTx = 0;
-  // The monthly buckets are re-derived by repairDates() (REVENUE LEDGERS) from
-  // the report months + the daily ledgers + the re-imported rows; zero them so
-  // nothing imported leaks back in before that re-derivation runs.
-  const labels = (DB.monthly && Array.isArray(DB.monthly.labels) && DB.monthly.labels.length)
-    ? DB.monthly.labels.slice()
-    : (typeof SEED_MONTHLY !== 'undefined' && SEED_MONTHLY.labels ? SEED_MONTHLY.labels.slice() : []);
-  DB.monthly = { labels: labels, revenue: labels.map(() => 0) };
+  DB.monthly = { labels: [], revenue: [] };
+  DB.importBatch = 0;
+  DB.resolved = plan.savedCount;
+  DB.baselineCleared = true;
+  return plan;
+}
+
+// The Delete All RESULT screen, shown BEFORE the rebuild imports anything:
+// exactly what was deleted, exactly what was saved, and whether to import
+// the parsed statements now or stop here and import later. Reuses the generic
+// confirm modal; resolves true = continue with the import.
+function showDeleteAllResult(result, stmtCount, cloudNote){
+  const LIST_CAP = 25;
+  const shown = result.kept.slice(0, LIST_CAP).map(k =>
+    '<div>' + escHtml(k.name) + ' <span style="color:var(--blue)">' + escHtml(k.contact) + '</span></div>').join('');
+  const more = result.kept.length - Math.min(result.kept.length, LIST_CAP);
+  return showConfirm('🗑️', 'Delete All — result',
+    '<div style="text-align:left">' +
+    '🗑️ <b>Deleted:</b> ' + result.customersDeleted.toLocaleString() + ' customer records · ' +
+    result.transactionsDeleted.toLocaleString() + ' transactions · ' +
+    result.historyRowsDeleted.toLocaleString() + ' history rows · ' + kes(result.revenueDeleted) + ' revenue · ' +
+    'the duplicate guard · <b>the report baseline itself</b>.<br><br>' +
+    '📇 <b>Saved: ' + result.savedCount.toLocaleString() + ' reachable contacts</b>' +
+    (result.resolvedKept ? ' (including <b>' + result.resolvedKept + '</b> you resolved)' : '') +
+    ' — blank records, ready for the rebuild — plus manual books: ledgers (' + result.ledgersKept + ') · expenses (' + result.expensesKept + ') · overheads (' + result.overheadsKept + ') · item costs (' + result.itemCostsKept + '):' +
+    '<div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-top:6px;max-height:150px;overflow:auto;font-size:.8rem">' +
+    (shown || '<span style="color:var(--muted)">(none — no reachable contacts were kept)</span>') +
+    (more > 0 ? '<div style="color:var(--muted)">+ ' + more.toLocaleString() + ' more — full list in the Customers tab</div>' : '') +
+    '</div><br>' +
+    '☁️ ' + cloudNote + '.<br><br>' +
+    'Import the <b>' + Number(stmtCount).toLocaleString() + ' parsed statement rows</b> now — they become the single source of truth for all customer and sales figures — or stop here and import later.' +
+    '</div>',
+    [
+      { label: '▶ Import ' + Number(stmtCount).toLocaleString() + ' rows now', primary: true, value: true },
+      { label: '⏸ Stop here — import later', value: false }
+    ]);
 }
 
 async function handleRebuild(input){
@@ -8798,19 +8938,29 @@ async function handleRebuild(input){
       updateImportModal('Reading <b>' + rows.length + '</b> rows from <b>' + file.name + '</b>…', pct+10);
       allRows.push(...rows);
     }
-    // Optional clean-slate mode (checked in the rebuild modal): wipe ALL
-    // imported data — every transaction, per-customer history, the dedup guard
-    // and all imported revenue — and reset each customer to the original
-    // report figures, keeping only names & contacts (plus the manual stock
-    // ledgers). The selected statements then become the single source of
-    // truth, imported on top of the report exactly like a fresh build.
+    // Optional Delete All mode (checked in the rebuild modal, or the Import
+    // tab's Delete All & Rebuild button): TRUE wipe — every record, row,
+    // ledger and the report baseline itself go; only reachable contacts are
+    // kept as blanks. The wipe result is shown BEFORE anything is imported,
+    // and the user chooses whether the selected statements are imported now
+    // (they become the ONLY data) or later.
     if (pendingRebuildWipe && allRows.length) {
-      const ok = await showConfirm('🧹','Start from a clean database?',
-        'This wipes <b>all imported data</b> — every transaction, per-customer history, the duplicate guard and all imported revenue — and resets each customer to the <b>original report figures</b> (the app\'s foundation, the same state as "Reset to Original Report Data").<br><br>' +
-        'Kept: <b>customer names & contacts</b> (including resolved numbers), your manual stock ledgers, expenses, overheads & item costs, and the report baseline itself.<br><br>' +
-        'The selected statements are then imported on top — they become the single source of truth for everything after the report. The cloud copy is replaced on the next auto-sync; on your other devices use <b>Force Pull</b> from this one afterwards.',
+      // Live preview of exactly what Delete All will do (pure — nothing
+      // touched yet), so the confirm names real counts, not promises.
+      const plan = planDeleteAll();
+      const ok = await showConfirm('🗑️','Delete All — wipe EVERYTHING except reachable contacts?',
+        'This deletes <b>everything</b>: <b>' + plan.customersDeleted.toLocaleString() + '</b> customer records, ' +
+        '<b>' + plan.transactionsDeleted.toLocaleString() + '</b> transactions, ' +
+        '<b>' + plan.historyRowsDeleted.toLocaleString() + '</b> history rows, the duplicate guard, ' +
+        '<b>' + kes(plan.revenueDeleted) + '</b> of revenue, ' +
+        'AND the <b>original report baseline itself</b>.<br><br>' +
+        'Saved: <b>' + plan.savedCount.toLocaleString() + ' reachable contacts</b>' +
+        (plan.resolvedKept ? ' (including <b>' + plan.resolvedKept + '</b> you resolved)' : '') +
+        ' — kept as blank records, ready for the rebuild — plus your manual books: ' +
+        'stock ledgers (' + plan.ledgersKept + '), expenses (' + plan.expensesKept + '), overheads (' + plan.overheadsKept + '), item costs (' + plan.itemCostsKept + ').<br><br>' +
+        'After the wipe you will see the full result and choose whether to import the selected statements now or later.',
         [
-          { label: '🧹 Wipe & rebuild', primary: true, value: true },
+          { label: '🗑️ Delete All', primary: true, value: true },
           { label: 'Cancel this rebuild', value: false }
         ]);
       if (!ok) {
@@ -8825,9 +8975,38 @@ async function handleRebuild(input){
         input.value = '';
         return;
       }
-      wipeDatabaseKeepRoster();
+      const result = deleteAllKeepResolved();
       pendingRebuildWipe = false;
-      updateImportModal('🧹 Database wiped (names & contacts kept) — importing statements…', 25);
+      // Push the wiped state to the cloud NOW, before the rebuild imports a
+      // single row: the cloud merge unions transactions, so a stale cloud
+      // would otherwise resurrect everything just deleted on the next sync.
+      let cloudNote;
+      if (SYNC_MODE === 'local') {
+        cloudNote = 'local-only mode — cloud untouched';
+      } else {
+        updateImportModal('🗑️ Wiped — pushing the clean state to the cloud…', 25);
+        const pushed = await saveToCloud(true);
+        cloudNote = pushed ? 'wiped state pushed to the cloud' : 'cloud push FAILED (' + escHtml(lastCloudError || 'unknown error') + ') — push manually or the old cloud data may return';
+      }
+      persistDB();
+      // The Delete All RESULT, shown BEFORE the rebuild imports anything: what
+      // was deleted, what was saved, and the choice to import now or later.
+      const go = await showDeleteAllResult(result, allRows.length, cloudNote);
+      if (!go) {
+        save();
+        refreshAll();
+        $('importModalIcon').textContent = '⏸️';
+        $('importModalTitle').textContent = 'Wiped — import when ready';
+        $('importModalBody').innerHTML = '<b>Delete All is done.</b> ' + result.savedCount.toLocaleString() + ' reachable contacts saved (manual books kept); everything else cleared.<br><br>' +
+          'Import statements any time via <b>📥 Backfill</b>, <b>🔄 Full Rebuild</b> or the drop zone — on your other devices use <b>Sync → Force Pull</b> from this one.';
+        $('importModalBar').style.width = '100%';
+        $('importModalBar').style.background = 'var(--amber)';
+        $('importModalClose').style.display = 'inline-block';
+        showSyncStatus('⏸️ Wiped — statements not imported yet');
+        input.value = '';
+        return;
+      }
+      updateImportModal('🗑️ Delete All done (' + result.savedCount.toLocaleString() + ' contacts saved) — importing statements…', 30);
     }
     // Scoped wipe: only the window the statements cover is cleared, never the
     // periods before or after it. The monthly chart and importedRev are NOT

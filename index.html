@@ -978,6 +978,14 @@ const CLOUD_BUSY_RETRY_DELAYS = [3000, 8000, 15000, 30000, 45000, 60000];
 async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // An external signal lets a higher-priority save (Delete All) abort this
+  // request mid-flight. The local controller stays the only one handed to
+  // fetch, so the timeout and the cancel share one abort path.
+  const external = options && options.signal;
+  if (external) {
+    if (external.aborted) controller.abort();
+    else external.addEventListener('abort', () => controller.abort());
+  }
   try {
     const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
     const text = await response.text();
@@ -992,8 +1000,11 @@ async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT
     return data;
   } catch (err) {
     // A raw AbortError tells the user nothing. Name it for what it is — the
-    // request outlived its timeout — and say where their data is.
+    // request outlived its timeout — and say where their data is. A cancel is
+    // different: it was asked for, so it must never be reported as a timeout
+    // (or as a failure at all — the save that pre-empted it announces itself).
     if (err && err.name === 'AbortError') {
+      if (external && external.aborted) throw cloudSaveCancelledError();
       throw new Error('Cloud connection timed out after ' + Math.round(timeoutMs / 1000) + 's (large upload or weak signal). Your data is safe locally and will sync on the next save.');
     }
     throw err;
@@ -1233,15 +1244,78 @@ async function loadFromCloud() {
 //     queued save snapshots the live DB when it actually runs, so it already
 //     carries every change that arrived while it waited. Stacking N of them
 //     would just re-upload the same database N times.
-// The status pill shows the queue live: "⏳ Saving to cloud… 1/3" while the
-// first of three tasks uploads, "✅ Save 1/3 complete — 2 more queued" as each
-// one lands, and a "💾 Save queue complete" toast when the whole batch is
-// done. The user always sees what is saving in the background — nothing
-// overlaps the lock, nothing disappears unannounced.
-let cloudSaveQueue = [];         // jobs waiting to start: { force, auto, resolve }
+// The status pill names the job it is running — "⏳ Saving to cloud — 📥
+// Backfill (1/3)" — and lists the ones waiting behind it by name too, so
+// "what is saving in the background?" always has a specific answer. Nothing
+// overlaps the lock, nothing disappears unannounced, and no message ever says
+// "another save" when the app knows which save it means.
+//
+// Every job therefore carries a NAME (see CLOUD_SAVE_NAMES), and one save is
+// allowed to jump the queue: Delete All. It aborts the upload in flight and
+// drops everything waiting, because a wipe that queues behind a long Backfill
+// upload would leave stale data in the cloud for as long as that upload runs.
+let cloudSaveQueue = [];         // jobs waiting to start: { force, auto, name, resolve }
 let cloudSaveRunning = false;    // a job is uploading right now
+let cloudSaveRunningJob = null;  // WHICH job owns the upload slot right now
 let cloudSavePos = 0;            // 1-based number of the running job
 let cloudSaveAutoPromise = null; // shared promise of the coalesced background slot
+let cloudSaveToken = null;       // { cancelled, controller } of the running job
+// Names of the jobs that completed in the current batch, for the completion
+// toast ("💾 Save queue complete — 📥 Backfill, 💾 Auto-save saved").
+let cloudSaveBatch = [];
+// Name of a save this device aborted mid-upload. Apps Script may still be
+// writing it server-side, which is exactly why the next save can come back
+// "backend busy" — so the retry message can name the culprit instead of
+// guessing at "another save".
+let cloudStoppedUpload = null;
+
+// The names shown in the pill, in toasts and in the sync panel. Every save
+// that reaches the cloud is one of these, so nothing is ever "unknown".
+const CLOUD_SAVE_NAMES = {
+  auto:       '💾 Auto-save',
+  save:       '💾 Save',
+  deleteAll:  '🗑️ Delete All',
+  forcePush:  '🚀 Force Push',
+  smartMerge: '🔀 Smart Merge',
+  backfill:   '📥 Backfill',
+  rebuild:    '🔧 Rebuild',
+  dupFix:     '🧹 First-visit fix'
+};
+
+// A cancelled save is not a failed one: the user asked for the thing that
+// replaced it. Flagged so callers can tell the two apart and stay quiet.
+function cloudSaveCancelledError() {
+  const err = new Error('save stopped — superseded by a higher-priority save');
+  err.spaxCancelled = true;
+  return err;
+}
+
+function cloudSaveIsCancelled() {
+  return !!(cloudSaveToken && cloudSaveToken.cancelled);
+}
+
+// A busy-retry backoff that gives up early when this job is cancelled, so a
+// pre-empting save is never made to wait out a sleep it did not ask for. The
+// pre-emption calls the `wake` hook directly — no polling.
+function cloudSaveDelay(ms) {
+  const token = cloudSaveToken;
+  return new Promise(resolve => {
+    const timer = setTimeout(done, ms);
+    function done() { clearTimeout(timer); resolve(); }
+    if (token) token.wake = done;
+  });
+}
+
+// Who is holding the cloud lock, as precisely as this device can know it. If
+// THIS device stopped an upload mid-flight, Apps Script is very likely still
+// writing it — so name that save. Otherwise the two possible writers are
+// enumerated rather than waved at as "another save".
+function cloudSaveBusyReason() {
+  if (cloudStoppedUpload) {
+    return 'the ' + cloudStoppedUpload + ' upload this device stopped is still being written on the server';
+  }
+  return 'another writer holds the cloud lock: an earlier upload from this device that the client gave up on, or this app open in another tab or on another device';
+}
 
 // The pill counting is LIVE: position + everything still queued. A save that
 // started alone becomes "1/3" the moment two more tasks land behind it.
@@ -1249,7 +1323,7 @@ function cloudSaveLiveTotal() {
   return cloudSavePos + cloudSaveQueue.length; // finished jobs are behind pos
 }
 
-function saveToCloud(force = false) {
+function saveToCloud(force = false, name) {
   if (SYNC_MODE === 'local') return Promise.resolve(false);
   // Background saves coalesce into one slot: if one is already queued or
   // running, this request rides the same promise. The queued save reads the
@@ -1257,12 +1331,15 @@ function saveToCloud(force = false) {
   if (!force && cloudSaveAutoPromise) return cloudSaveAutoPromise;
   let resolveJob;
   const promise = new Promise(resolve => { resolveJob = resolve; });
-  const job = { force: !!force, auto: !force, resolve: resolveJob };
+  // Every job is named. A caller that forgets still gets a real name rather
+  // than the old anonymous slot that surfaced as "another save".
+  const label = name || (force ? CLOUD_SAVE_NAMES.save : CLOUD_SAVE_NAMES.auto);
+  const job = { force: !!force, auto: !force, name: label, cancelled: false, resolve: resolveJob };
   if (!force) cloudSaveAutoPromise = promise;
   cloudSaveQueue.push(job);
   if (cloudSaveRunning) {
     // The running save started before these tasks arrived — refresh its label
-    // so it reads "Saving to cloud… 1/3" while the rest wait their turn.
+    // so the pill names it AND the jobs now waiting behind it.
     cloudSaveAnnounceRunning();
   } else {
     cloudSavePump();
@@ -1270,11 +1347,32 @@ function saveToCloud(force = false) {
   return promise;
 }
 
+// Names of the jobs still waiting, oldest first, for the "next: …" suffix.
+// Capped so a long queue can't push the running save's own name off the pill.
+function cloudSaveQueuedNames() {
+  return cloudSaveQueue.filter(j => !j.cancelled).map(j => j.name);
+}
+
+function cloudSaveQueuedSummary() {
+  const next = cloudSaveQueuedNames();
+  if (!next.length) return '';
+  const shown = next.slice(0, 2).join(', ');
+  const extra = next.length > 2 ? ' +' + (next.length - 2) + ' more' : '';
+  return ' · next: ' + shown + extra;
+}
+
+// The name of the save holding the upload slot — the answer to "what is
+// saving right now?". Falls back to the generic label only before the first
+// job has been picked up, never once one is running.
+function cloudSaveRunningName() {
+  return (cloudSaveRunningJob && cloudSaveRunningJob.name) || CLOUD_SAVE_NAMES.save;
+}
+
 function cloudSaveAnnounceRunning() {
   const total = cloudSaveLiveTotal();
-  showSyncStatus(total > 1
-    ? '⏳ Saving to cloud… ' + cloudSavePos + '/' + total
-    : '⏳ Saving to cloud...');
+  showSyncStatus('⏳ Saving to cloud — ' + cloudSaveRunningName() +
+    (total > 1 ? ' (' + cloudSavePos + '/' + total + ')' : '') +
+    cloudSaveQueuedSummary());
 }
 
 function cloudSavePump() {
@@ -1284,45 +1382,108 @@ function cloudSavePump() {
   if (!cloudSaveQueue.length) {
     // The batch drained. If more than one task ran, announce the batch
     // completion once — the per-save pill messages fade after a few seconds.
-    if (cloudSavePos > 1 && typeof toast === 'function') {
-      toast('💾 Save queue complete — ' + cloudSavePos + '/' + cloudSavePos + ' tasks saved');
+    if (cloudSaveBatch.length > 1 && typeof toast === 'function') {
+      toast('💾 Save queue complete — ' + cloudSaveBatch.join(', ') + ' saved');
     }
     cloudSavePos = 0;
+    cloudSaveBatch = [];
     return;
   }
   const job = cloudSaveQueue.shift();
+  // A pre-emption resolves queued jobs as it drops them; skip any that were
+  // cancelled between being dropped and being reached.
+  if (job.cancelled) { job.resolve(false); return cloudSavePump(); }
   if (job.auto) cloudSaveAutoPromise = null; // slot running — new background saves queue for the next round
   cloudSaveRunning = true;
+  cloudSaveRunningJob = job;
   cloudSavePos += 1;
+  // One abort handle per job: Delete All uses it to stop THIS upload without
+  // touching whatever replaces it.
+  cloudSaveToken = { cancelled: false, controller: new AbortController() };
   cloudSaveAnnounceRunning();
   Promise.resolve()
     .then(() => SYNC_MODE === 'local' ? false : performSaveToCloud())
-    .then(ok => { job.resolve(!!ok); })
+    .then(ok => { job.resolve(!!ok); if (ok) cloudSaveBatch.push(job.name); })
     .catch(() => { job.resolve(false); })
-    .then(() => { cloudSaveRunning = false; cloudSavePump(); });
+    .then(() => {
+      // Only the job that still owns the slot may release it. A job cancelled
+      // by a pre-emption unwinds AFTER its replacement has already started,
+      // and clearing the flag then would let a third save overlap the lock.
+      if (cloudSaveRunningJob === job) {
+        cloudSaveRunning = false;
+        cloudSaveRunningJob = null;
+        cloudSaveToken = null;
+      }
+      cloudSavePump();
+    });
 }
 
-// Suffix added to in-progress messages when other tasks are queued behind the
-// running one, e.g. "⏳ Saving to cloud… 42% (save 1/3)".
+// ── PRE-EMPTION ──
+// Delete All is the one save that must not wait its turn. It aborts the
+// request in flight, drops every queued job, and takes the slot on the next
+// pump. Returns the names of everything it stopped, so the UI can say exactly
+// what was cut short instead of "another save".
+function cloudSavePreempt(reasonName) {
+  const stopped = [];
+  const running = cloudSaveRunningJob;
+  if (running) {
+    stopped.push(running.name);
+    running.cancelled = true;
+    // The server may still be finishing this upload after the client lets go
+    // — remember the name so a "backend busy" retry can point at it.
+    cloudStoppedUpload = running.name;
+    if (cloudSaveToken) {
+      cloudSaveToken.cancelled = true;
+      try { cloudSaveToken.controller.abort(); } catch (_) {}
+      // Cut short any busy-retry backoff it is sleeping through.
+      if (typeof cloudSaveToken.wake === 'function') cloudSaveToken.wake();
+    }
+  }
+  cloudSaveQueue.forEach(j => {
+    if (j.cancelled) return;
+    stopped.push(j.name);
+    j.cancelled = true;
+    j.resolve(false);
+  });
+  cloudSaveQueue.length = 0;
+  // The coalesced background slot lived in that queue — it is gone with it,
+  // so the next save() opens a fresh slot instead of riding a dead promise.
+  cloudSaveAutoPromise = null;
+  // Restart the count: the stopped jobs never completed, so the save that is
+  // about to take over is the first (and usually only) one in this batch.
+  cloudSavePos = 0;
+  cloudSaveBatch = [];
+  if (stopped.length && typeof toast === 'function') {
+    toast('⏸️ Stopped ' + stopped.join(' + ') + ' — ' + reasonName + ' is taking over');
+  }
+  return stopped;
+}
+
+// Suffix on in-progress messages, naming the save they belong to, e.g.
+// "⏳ Saving to cloud — 📥 Backfill 42% (1/3)".
 function cloudSaveTag() {
   const total = cloudSaveLiveTotal();
-  return total > 1 ? ' (save ' + cloudSavePos + '/' + total + ')' : '';
+  return ' — ' + cloudSaveRunningName() + (total > 1 ? ' (' + cloudSavePos + '/' + total + ')' : '');
 }
 
-// Success message: the last task of a batch logs the clean single-save text;
-// earlier tasks say how many remain, so an "1/3 complete" with two more queued
-// never looks like a silent drop.
+// Success message: names the save that landed, its place in the batch, and
+// what is still queued behind it — so a completion can never be mistaken for
+// the whole queue finishing.
 function cloudSaveDoneMessage() {
   const total = cloudSaveLiveTotal();
-  const rest = cloudSaveQueue.length > 0 ? ' — ' + cloudSaveQueue.length + ' more queued' : '';
-  if (total > 1) return '✅ Save ' + cloudSavePos + '/' + total + ' complete' + rest;
-  return '✅ Saved to cloud ' + lastSyncTime.toLocaleTimeString();
+  const base = '✅ Saved to cloud — ' + cloudSaveRunningName() +
+    (total > 1 ? ' (' + cloudSavePos + '/' + total + ')' : '');
+  const rest = cloudSaveQueuedSummary();
+  // The single-save case keeps the clock, which is what a lone background
+  // save has always shown.
+  if (total === 1 && !rest) return base + ' · ' + lastSyncTime.toLocaleTimeString();
+  return base + rest;
 }
 
 function cloudSaveFailedMessage(msg) {
   const total = cloudSaveLiveTotal();
-  if (total > 1) return '❌ Save ' + cloudSavePos + '/' + total + ' failed: ' + msg;
-  return '❌ Save failed: ' + msg;
+  return '❌ Save failed — ' + cloudSaveRunningName() +
+    (total > 1 ? ' (' + cloudSavePos + '/' + total + ')' : '') + ': ' + msg;
 }
 
 async function performSaveToCloud(busyRetry = 0) {
@@ -1363,10 +1524,13 @@ async function performSaveToCloud(busyRetry = 0) {
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
 
+    // This save's abort handle: Delete All aborts it to take the slot over.
+    const cancelSignal = cloudSaveToken ? cloudSaveToken.controller.signal : undefined;
     const post = (obj, timeoutMs) => cloudRequest(GAS_URL, {
       method: 'POST',
       // text/plain keeps this a CORS-simple request for Apps Script web apps.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      signal: cancelSignal,
       body: JSON.stringify(obj)
     }, timeoutMs);
 
@@ -1401,6 +1565,10 @@ async function performSaveToCloud(busyRetry = 0) {
         const chunked = await saveToCloudChunked(post, payload, bigTables, totalBigRows);
         if (chunked) return true;
       } catch (err) {
+        // A cancel must be checked FIRST: saveToCloudChunked marks every
+        // saveBegin failure as probeFailed, and falling through to a one-shot
+        // saveAll would restart the very upload that was just stopped.
+        if (err && err.spaxCancelled) throw err;
         if (isUnknownActionError(err)) {
           cloudChunks = false;
           cloudChunkProbed = true;
@@ -1446,6 +1614,7 @@ async function performSaveToCloud(busyRetry = 0) {
       lastSyncTime = new Date();
       showSyncStatus(cloudSaveDoneMessage());
       lastCloudError = '';
+      cloudStoppedUpload = null; // this device's stopped upload is no longer the suspect
       return true;
     }
     throw new Error(result.error || 'Cloud rejected the save');
@@ -1457,20 +1626,33 @@ async function performSaveToCloud(busyRetry = 0) {
     // Restarting at saveBegin clears any staging left by the first attempt.
     // `return await` keeps this attempt's finally from clearing isSyncing
     // until the whole retry chain finishes.
+    // Stopped on purpose: a higher-priority save took the slot. Say which
+    // save was stopped and which one replaced it — never a bare "failed".
+    if (err && err.spaxCancelled) {
+      console.log('Cloud save stopped:', cloudSaveRunningName());
+      return false;
+    }
     if (isBackendBusyError(err) && busyRetry < CLOUD_BUSY_RETRIES) {
       const nextRetry = busyRetry + 1;
       const delayMs = CLOUD_BUSY_RETRY_DELAYS[nextRetry - 1] || CLOUD_BUSY_RETRY_DELAYS[CLOUD_BUSY_RETRY_DELAYS.length - 1];
-      showSyncStatus('⏳ Cloud busy (another save still writing) — retrying in ' + Math.ceil(delayMs / 1000) + 's (' + nextRetry + '/' + CLOUD_BUSY_RETRIES + ')' + cloudSaveTag());
-      await new Promise(resolve => setTimeout(resolve, delayMs));
+      const busyTotal = cloudSaveLiveTotal();
+      showSyncStatus('⏳ ' + cloudSaveRunningName() + ' waiting on the cloud' +
+        (busyTotal > 1 ? ' (' + cloudSavePos + '/' + busyTotal + ')' : '') +
+        ' — ' + cloudSaveBusyReason() +
+        ', retrying in ' + Math.ceil(delayMs / 1000) + 's (' + nextRetry + '/' + CLOUD_BUSY_RETRIES + ')');
+      // The wait must be interruptible: sitting out a 30s backoff while a
+      // Delete All is trying to take over would defeat the pre-emption.
+      await cloudSaveDelay(delayMs);
+      if (cloudSaveIsCancelled()) return false;
       return await performSaveToCloud(nextRetry);
     }
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);
     // Spell out the common case so "what's saving in the background?" has an
-    // answer: usually a previous push from this device that the client gave
-    // up on, still finishing on Apps Script — not an unknown process.
+    // answer: name the upload this device stopped if there was one, otherwise
+    // say precisely what the two possible writers are — never "another save".
     if (isBackendBusyError(err)) {
-      showSyncStatus(cloudSaveFailedMessage('backend still busy after retries — wait ~1 min then Force Push. Usually a previous save from this device still writing, or another open tab.'));
+      showSyncStatus(cloudSaveFailedMessage('the cloud is still busy after retries — ' + cloudSaveBusyReason() + '. Wait ~1 min then Force Push.'));
     } else {
       showSyncStatus(cloudSaveFailedMessage(lastCloudError));
     }
@@ -1493,7 +1675,7 @@ async function performSaveToCloud(busyRetry = 0) {
 // open in two tabs) no longer inflates the staged row count and fails the
 // commit with "chunk mismatch … staged N rows, expected M".
 async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
-  showSyncStatus('⏳ Saving to cloud… (large upload, sending in parts)' + cloudSaveTag());
+  showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · large upload, sending in parts');
   let begin;
   try {
     begin = await post({
@@ -1532,11 +1714,15 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
     // double the staged row count and fail the commit with "staged N rows,
     // expected M". Older backends ignore the extra field.
     for (let i = 0, seq = 0; i < rows.length; i += CHUNK_ROWS, seq++) {
+      // Check between slices rather than relying on the abort alone: a cancel
+      // that lands while this slice is in flight must stop the NEXT one, so a
+      // pre-empting save never waits for the rest of a long upload.
+      if (cloudSaveIsCancelled()) throw cloudSaveCancelledError();
       const slice = rows.slice(i, i + CHUNK_ROWS);
       const res = await post({ action: 'saveChunk', table, rows: slice, uploadId, seq }, CLOUD_TIMEOUT_CHUNK);
       if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
       sent += slice.length;
-      showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%' + cloudSaveTag());
+      showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · ' + Math.round(sent / totalBigRows * 100) + '%');
     }
   }
 
@@ -1547,6 +1733,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
     lastSyncTime = new Date();
     showSyncStatus(cloudSaveDoneMessage());
     lastCloudError = '';
+    cloudStoppedUpload = null; // this device's stopped upload is no longer the suspect
     return true;
   }
   throw new Error(commit.error || 'Cloud rejected the save');
@@ -3569,6 +3756,8 @@ async function load(){
     }
   });
   if (SYNC_MODE === 'auto') {
+    // No name argument: the queue names a background save "💾 Auto-save" by
+    // default, so this stays correct wherever save() is called from.
     saveToCloud();
   }
   refreshAll();
@@ -6996,7 +7185,7 @@ function handleFixFirstVisit(input){
       alert('✅ First Visit correction complete!\n\nMatched & updated: ' + result.updated + '\nNot found: ' + result.notFound + '\nSkipped (no date): ' + result.skipped);
       input.value = '';
       renderAll();
-      if(SYNC_MODE === 'auto') saveToCloud();
+      if(SYNC_MODE === 'auto') saveToCloud(false, CLOUD_SAVE_NAMES.dupFix);
     }catch(err){
       alert('Error: ' + err.message);
       console.error(err);
@@ -8425,19 +8614,34 @@ async function deleteAllStandalone(){
     ]);
   if (!ok) return false;
 
+  // Delete All takes the cloud slot OVER rather than queueing behind it. An
+  // upload already in flight is carrying the pre-wipe database, and one
+  // waiting in the queue would push it after the wipe — either way the cloud
+  // keeps stale data for as long as that save runs. Stop them, name what was
+  // stopped, and let the wipe go first.
+  const stoppedSaves = cloudSavePreempt(CLOUD_SAVE_NAMES.deleteAll);
+
   const result = deleteAllKeepResolved();
   let cloudNote;
   if (SYNC_MODE === 'local') {
     cloudNote = 'local-only mode — cloud untouched';
   } else {
-    showSyncStatus('🗑️ Delete All done — pushing the clean state to the cloud…');
+    showSyncStatus(stoppedSaves.length
+      ? '⏸️ Stopped ' + stoppedSaves.join(' + ') + ' — 🗑️ Delete All is pushing the clean state to the cloud…'
+      : '🗑️ Delete All done — pushing the clean state to the cloud…');
     try {
-      const pushed = await saveToCloud(true);
+      const pushed = await saveToCloud(true, CLOUD_SAVE_NAMES.deleteAll);
       cloudNote = pushed
         ? 'wiped state pushed to the cloud'
         : 'cloud push FAILED (' + escHtml(lastCloudError || 'unknown error') + ') — use Sync → Force Push';
     } catch (err) {
       cloudNote = 'cloud push FAILED (' + escHtml(err.message || 'unknown error') + ') — use Sync → Force Push';
+    }
+    if (stoppedSaves.length) {
+      cloudNote += '. Stopped mid-flight to let the wipe go first: ' + stoppedSaves.join(', ') +
+        ' — ' + (cloudNote.indexOf('FAILED') >= 0
+          ? 're-run it once the wipe has landed'
+          : 'its changes were already local and are gone with the wipe');
     }
   }
   await persistDB();
@@ -8496,7 +8700,7 @@ async function forcePushToCloud(){
 
   showSyncStatus('🚀 Force pushing local data...');
   try{
-    const saved = await saveToCloud(true);
+    const saved = await saveToCloud(true, CLOUD_SAVE_NAMES.forcePush);
     if (!saved) throw new Error(lastCloudError || 'Cloud did not confirm the save');
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.</span>';
     showSyncStatus('✅ Force push complete');
@@ -8637,7 +8841,7 @@ async function smartMergeCloud(){
     // Merchant exclusion survives merges too — drop any Simon Musyoka records
     // pulled in from the cloud BEFORE pushing, so the sheet gets scrubbed too.
     purgeMerchantData();
-    if (!await saveToCloud(true)) throw new Error(lastCloudError || 'Cloud did not confirm the save');
+    if (!await saveToCloud(true, CLOUD_SAVE_NAMES.smartMerge)) throw new Error(lastCloudError || 'Cloud did not confirm the save');
     refreshAll();
 
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Merged: ' + merged.length + ' total (' + localOnly + ' local-only kept, ' + cloudOnly + ' cloud-only added, ' + mergedCount + ' merged)</span>';
@@ -8667,8 +8871,18 @@ function updateSyncDetails(){
   if(!el) return;
   const lastSync = lastSyncTime ? lastSyncTime.toLocaleString() : 'Never';
   const mode = SYNC_MODE === 'auto' ? 'Auto (on every change)' : SYNC_MODE === 'manual' ? 'Manual' : 'Local only';
+  // Name the save in flight and everything waiting behind it, so this panel
+  // answers "what is saving?" specifically instead of leaving a spinner to
+  // be interpreted.
+  const queuedNames = cloudSaveQueuedNames();
+  const savingLine = cloudSaveRunning
+    ? `<span style="color:var(--amber)">⏳ ${escHtml(cloudSaveRunningName())}</span>${queuedNames.length ? ' — then ' + escHtml(queuedNames.join(', ')) : ''}`
+    : queuedNames.length
+      ? `<span style="color:var(--amber)">⏳ Waiting to start: ${escHtml(queuedNames.join(', '))}</span>`
+      : '<span style="color:var(--green)">Idle</span>';
   el.innerHTML = `
     <b>Sync Mode:</b> ${mode}<br>
+    <b>Saving Now:</b> ${savingLine}<br>
     <b>Last Sync:</b> ${lastSync}<br>
     <b>Local Customers:</b> ${DB.customers.length.toLocaleString()}<br>
     <b>Local Transactions:</b> ${(DB.transactions || []).length.toLocaleString()}<br>
@@ -8922,7 +9136,7 @@ async function handleBackfill(input){
     persistDB();
     refreshAll();
     let cloudOk = true;
-    if (SYNC_MODE !== 'local') cloudOk = await saveToCloud(true);
+    if (SYNC_MODE !== 'local') cloudOk = await saveToCloud(true, CLOUD_SAVE_NAMES.backfill);
     toast('✅ Backfill complete! ' + totalImported + ' added, ' + totalDupes + ' duplicates skipped' +
       (cloudOk ? '' : ' · ☁️ cloud push failed — retry Force Push'));
     showSyncStatus(cloudOk ? '✅ Backfill complete' : '⚠️ Backfill saved locally — cloud push failed, retry Force Push');
@@ -9160,7 +9374,7 @@ async function handleRebuild(input){
     let cloudOk = true;
     if (SYNC_MODE !== 'local') {
       updateImportModal('Pushing rebuilt data to the cloud…', 90);
-      cloudOk = await saveToCloud(true);
+      cloudOk = await saveToCloud(true, CLOUD_SAVE_NAMES.rebuild);
     }
     finishImportModal(
       '<b>' + totalImported + '</b> transactions imported<br>' +

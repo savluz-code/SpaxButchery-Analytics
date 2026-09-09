@@ -440,10 +440,10 @@ test('background saves coalesce into ONE queued slot while forced saves queue in
   ctx.fetch = cloud.fetchImpl;
 
   vm.runInContext(syncLayerSource(), ctx);
-  const first = ctx.saveToCloud(true); // forced #1 starts
-  const bgA = ctx.saveToCloud(false); // background while #1 runs → queued slot
-  const bgB = ctx.saveToCloud(false); // second background → SAME slot (coalesced)
-  const forced2 = ctx.saveToCloud(true); // forced → its own slot
+  const first = ctx.saveToCloud(true, '🚀 Force Push'); // forced #1 starts
+  const bgA = ctx.saveToCloud(false, '💾 Auto-save'); // background while #1 runs → queued slot
+  const bgB = ctx.saveToCloud(false, '💾 Auto-save'); // second background → SAME slot (coalesced)
+  const forced2 = ctx.saveToCloud(true, '📥 Backfill'); // forced → its own slot
 
   assert.strictEqual(bgA, bgB, 'background saves while one is queued must share one promise');
   assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 2, 'one shared background slot + one forced slot');
@@ -457,12 +457,14 @@ test('background saves coalesce into ONE queued slot while forced saves queue in
   assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 0);
   assert.strictEqual(vm.runInContext('cloudSaveRunning', ctx), false);
 
-  // The pill tells the user what is going on the whole time: 1/3 → 2/3 → 3/3,
-  // with the remaining count on every completion.
-  assert.ok(status.some((m) => /Saving to cloud… 1\/3/.test(m)), 'running save must show its queue position');
-  assert.ok(status.some((m) => /✅ Save 1\/3 complete — 2 more queued/.test(m)), 'first completion must announce the rest');
-  assert.ok(status.some((m) => /✅ Save 2\/3 complete — 1 more queued/.test(m)), 'second completion must announce the rest');
-  assert.ok(status.some((m) => /✅ Save 3\/3 complete/.test(m)), 'last completion must not claim queued tasks');
+  // The pill names the save in flight AND the ones waiting, the whole time:
+  // 1/3 → 2/3 → 3/3, so "what is saving?" never has a generic answer.
+  assert.ok(status.some((m) => /Saving to cloud — 🚀 Force Push \(1\/3\)/.test(m)), 'the pill must name the running save and its queue position');
+  assert.ok(status.some((m) => /next: 💾 Auto-save, 📥 Backfill/.test(m)), 'the pill must name the saves waiting behind it');
+  assert.ok(status.some((m) => /✅ Saved to cloud — 🚀 Force Push \(1\/3\)/.test(m)), 'first completion must name itself and its position');
+  assert.ok(status.some((m) => /✅ Saved to cloud — 💾 Auto-save \(2\/3\)/.test(m)), 'second completion must name itself');
+  assert.ok(status.some((m) => /✅ Saved to cloud — 📥 Backfill \(3\/3\)/.test(m)), 'last completion must not claim queued tasks');
+  assert.ok(!status.some((m) => /another save/i.test(m)), 'no message may fall back to a generic "another save"');
 });
 
 test('a queued save that fails stays visible and the queue keeps going for the next task', async () => {
@@ -490,14 +492,15 @@ test('a queued save that fails stays visible and the queue keeps going for the n
   ctx.fetch = cloud.fetchImpl;
 
   vm.runInContext(syncLayerSource(), ctx);
-  const first = ctx.saveToCloud(true); // task 1 — succeeds
-  const doomed = ctx.saveToCloud(true); // task 2 — fails
-  const after = ctx.saveToCloud(true); // task 3 — must still run
+  const first = ctx.saveToCloud(true, '🚀 Force Push'); // task 1 — succeeds
+  const doomed = ctx.saveToCloud(true, '🔀 Smart Merge'); // task 2 — fails
+  const after = ctx.saveToCloud(true, '📥 Backfill'); // task 3 — must still run
 
   const results = await Promise.all([first, doomed, after]);
   assert.deepStrictEqual(results, [true, false, true], 'a failed queued save must not poison the queue');
-  assert.ok(status.some((m) => /❌ Save 2\/3 failed: cloud rejected the save/.test(m)), 'the failure must name its queue position');
-  assert.ok(status.some((m) => /✅ Save 3\/3 complete/.test(m)), 'the task behind the failure must still run');
+  assert.ok(status.some((m) => /❌ Save failed — 🔀 Smart Merge \(2\/3\): cloud rejected the save/.test(m)),
+    'the failure must name the save that failed and its queue position');
+  assert.ok(status.some((m) => /✅ Saved to cloud — 📥 Backfill \(3\/3\)/.test(m)), 'the task behind the failure must still run');
   assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 0);
 });
 
@@ -668,8 +671,12 @@ test('client keeps payload-aware timeouts and wires the chunked actions + fallba
   // dropped), forced saves each get a slot, and the queue announces itself.
   assert.match(HTML, /if \(!force && cloudSaveAutoPromise\) return cloudSaveAutoPromise/, 'background saves must coalesce, not disappear');
   assert.match(HTML, /cloudSaveQueue\.push\(job\)/, 'every save must take a place in the queue');
-  assert.match(HTML, /'⏳ Saving to cloud… ' \+ cloudSavePos \+ '\/' \+ total/, 'the pill must show "Saving to cloud… 1/3"');
-  assert.match(HTML, /'✅ Save ' \+ cloudSavePos \+ '\/' \+ total \+ ' complete' \+ rest/, 'completions must report the queue position');
+  // Every save is named: the pill, the completions and the failures all say
+  // WHICH save they mean, so nothing is ever reported as "another save".
+  assert.match(HTML, /'⏳ Saving to cloud — ' \+ cloudSaveRunningName\(\)/, 'the pill must name the save that is running');
+  assert.match(HTML, /'✅ Saved to cloud — ' \+ cloudSaveRunningName\(\)/, 'completions must name the save that landed');
+  assert.match(HTML, /'❌ Save failed — ' \+ cloudSaveRunningName\(\)/, 'failures must name the save that failed');
+  assert.match(HTML, /const CLOUD_SAVE_NAMES = \{/, 'saves must be drawn from a fixed set of names');
   assert.match(HTML, /Save queue complete/, 'the batch completion must be announced');
   assert.match(HTML, /cloudSaveAnnounceRunning\(\)/, 'a running save must re-announce when tasks are queued behind it');
   // importTransactions must NOT fire its own cloud push — callers persist.
@@ -690,4 +697,190 @@ test('loadFromCloud does not force a push-back save', () => {
     .filter((l) => !l.trim().startsWith('//'))
     .join('\n');
   assert.ok(!/saveToCloud\(/.test(live), 'load must not trigger a forced save');
+});
+
+/* ── pre-emption: Delete All stops an in-flight save and goes first ──────── */
+
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+/**
+ * A cloud whose FIRST saveChunk never answers on its own — it only settles
+ * when the request's abort signal fires, exactly like a real fetch. That
+ * gives a genuinely in-flight upload to pre-empt.
+ */
+function makeHangingCloud(cloud) {
+  const inner = cloud.fetchImpl;
+  // Chunks are counted PER upload session (each saveBegin starts one), so a
+  // test can tell the stopped upload's slices apart from the wipe's own.
+  // `abortSignals` counts requests whose signal actually fired: the cancel
+  // flag alone also stops the loop between slices, but only a real abort
+  // makes the pre-emption IMMEDIATE instead of waiting out the chunk timeout.
+  const state = { session: 0, chunksPerSession: {}, abortSignals: 0, aborted: false };
+  cloud.fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (body.action === 'saveBegin') state.session += 1;
+    if (body.action === 'saveChunk') {
+      state.chunksPerSession[state.session] = (state.chunksPerSession[state.session] || 0) + 1;
+      if (state.session === 1 && state.chunksPerSession[1] === 1) {
+        await new Promise((resolve, reject) => {
+          const onAbort = () => {
+            state.abortSignals += 1;
+            reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+          };
+          if (options.signal && options.signal.aborted) return onAbort();
+          if (options.signal) options.signal.addEventListener('abort', onAbort);
+          // Only the abort is meant to end this. The fallback is short and
+          // unref'd so a missing abort fails the assertion fast instead of
+          // stalling the suite.
+          setTimeout(resolve, 2000).unref();
+        });
+      }
+    }
+    return inner(url, options);
+  };
+  return state;
+}
+
+test('Delete All pre-empts an in-flight upload: the upload is aborted and the wipe goes first', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, bigDB(), status));
+  const state = makeHangingCloud(cloud);
+  ctx.fetch = cloud.fetchImpl;
+
+  vm.runInContext(syncLayerSource(), ctx);
+  const backfill = ctx.saveToCloud(true, '📥 Backfill'); // starts, then hangs on slice 1
+  await tick();
+  assert.strictEqual(vm.runInContext('cloudSaveRunning', ctx), true, 'the Backfill upload is in flight');
+  assert.strictEqual(state.chunksPerSession[1], 1, 'it reached the first slice');
+  assert.ok(status.some((m) => /Saving to cloud — 📥 Backfill/.test(m)), 'the pill names the save in flight');
+
+  // Delete All arrives while that upload is still going.
+  const stopped = vm.runInContext("cloudSavePreempt('🗑️ Delete All')", ctx);
+  assert.deepStrictEqual(Array.from(stopped), ['📥 Backfill'], 'the pre-emption reports the save it stopped, by name');
+  assert.strictEqual(state.abortSignals, 1,
+    'the in-flight request must be ABORTED — the cancel flag alone would leave it running to its timeout');
+  state.aborted = true;
+  const wipe = ctx.saveToCloud(true, '🗑️ Delete All');
+
+  const [backfillResult, wipeResult] = await Promise.all([backfill, wipe]);
+  assert.strictEqual(backfillResult, false, 'the stopped upload resolves false — it did not land');
+  assert.strictEqual(wipeResult, true, 'the wipe goes through without waiting for the stopped upload');
+  assert.strictEqual(state.chunksPerSession[1], 1, 'the stopped upload sent no further slices');
+  assert.strictEqual(state.session, 2, 'the wipe ran as its own upload session');
+  assert.ok(state.chunksPerSession[2] > 1, 'the wipe uploaded in full');
+  assert.strictEqual(vm.runInContext('cloudSaveRunning', ctx), false, 'the slot is released, not leaked');
+  assert.strictEqual(vm.runInContext('cloudSaveRunningJob', ctx), null);
+
+  const actions = cloud.calls.map((c) => c.action);
+  assert.ok(actions.indexOf('saveCommit') === -1 || actions[actions.length - 1] === 'saveCommit',
+    'the stopped chunked upload must never commit stale data');
+});
+
+test('a stopped upload is reported as stopped, never as a failed save', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, bigDB(), status));
+  makeHangingCloud(cloud);
+  ctx.fetch = cloud.fetchImpl;
+
+  vm.runInContext(syncLayerSource(), ctx);
+  const backfill = ctx.saveToCloud(true, '📥 Backfill');
+  await tick();
+  vm.runInContext("cloudSavePreempt('🗑️ Delete All')", ctx);
+  await backfill;
+
+  assert.ok(!status.some((m) => /❌/.test(m)), 'a save the user deliberately superseded is not a failure');
+  assert.ok(!status.some((m) => /timed out/i.test(m)), 'a cancel must not be reported as a timeout');
+  assert.strictEqual(vm.runInContext('lastCloudError', ctx), '', 'a cancel leaves no cloud error behind');
+  assert.strictEqual(vm.runInContext('cloudStoppedUpload', ctx), '📥 Backfill',
+    'the stopped upload is remembered so a busy retry can name it');
+});
+
+test('pre-emption drops every queued save and names each one it drops', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, bigDB(), status));
+  makeHangingCloud(cloud);
+  ctx.fetch = cloud.fetchImpl;
+
+  vm.runInContext(syncLayerSource(), ctx);
+  const running = ctx.saveToCloud(true, '📥 Backfill');
+  await tick();
+  const queuedAuto = ctx.saveToCloud(false, '💾 Auto-save');
+  const queuedMerge = ctx.saveToCloud(true, '🔀 Smart Merge');
+  assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 2);
+
+  const stopped = vm.runInContext("cloudSavePreempt('🗑️ Delete All')", ctx);
+  assert.deepStrictEqual(Array.from(stopped), ['📥 Backfill', '💾 Auto-save', '🔀 Smart Merge'],
+    'the running save and both queued saves are named, in order');
+  assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 0, 'the queue is emptied');
+
+  const wipe = ctx.saveToCloud(true, '🗑️ Delete All');
+  assert.deepStrictEqual(await Promise.all([running, queuedAuto, queuedMerge, wipe]),
+    [false, false, false, true], 'dropped saves resolve false; only the wipe lands');
+});
+
+test('a busy retry names the upload this device stopped instead of saying "another save"', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 10); // keep this on the saveAll path
+  db.customerTx = {};
+  db.seen = {};
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+  const inner = cloud.fetchImpl;
+  let busy = true;
+  cloud.fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (busy && body.action === 'saveAll') {
+      busy = false;
+      cloud.calls.push(body);
+      return { ok: true, text: async () => JSON.stringify({
+        success: false, error: 'backend busy with another save — please retry the save'
+      }) };
+    }
+    return inner(url, options);
+  };
+  ctx.fetch = cloud.fetchImpl;
+
+  let src = syncLayerSource().replace(
+    /const CLOUD_BUSY_RETRY_DELAYS = \[[^\]]+\];/,
+    'const CLOUD_BUSY_RETRY_DELAYS = [5, 5, 5, 5, 5, 5];'
+  );
+  vm.runInContext(src, ctx);
+  // Delete All just stopped a Backfill upload; Apps Script is still writing it.
+  vm.runInContext("cloudStoppedUpload = '📥 Backfill'", ctx);
+
+  const result = await ctx.saveToCloud(true, '🗑️ Delete All');
+  assert.strictEqual(result, true, 'the retry still lands the wipe');
+  assert.ok(status.some((m) => /the 📥 Backfill upload this device stopped is still being written/.test(m)),
+    'the retry names the save holding the lock');
+  assert.ok(!status.some((m) => /another save/i.test(m)), 'no message falls back to a generic "another save"');
+  assert.strictEqual(vm.runInContext('cloudStoppedUpload', ctx), null, 'a successful save clears the suspect');
+});
+
+test('Delete All names the saves it stopped in the wipe push message', () => {
+  const fn = HTML.slice(HTML.indexOf('async function deleteAllStandalone(){'));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  assert.match(body, /cloudSavePreempt\(CLOUD_SAVE_NAMES\.deleteAll\)/, 'Delete All must pre-empt before it pushes');
+  assert.ok(body.indexOf('cloudSavePreempt') < body.indexOf('deleteAllKeepResolved()'),
+    'the pre-emption must happen before the wipe, not after');
+  assert.match(body, /Stopped ' \+ stoppedSaves\.join/, 'the pill must name what Delete All stopped');
+  assert.match(body, /saveToCloud\(true, CLOUD_SAVE_NAMES\.deleteAll\)/, 'the wipe push must be named');
+});
+
+test('every forced save is named at its call site', () => {
+  const expected = [
+    ['deleteAll', 'saveToCloud(true, CLOUD_SAVE_NAMES.deleteAll)'],
+    ['forcePush', 'saveToCloud(true, CLOUD_SAVE_NAMES.forcePush)'],
+    ['smartMerge', 'saveToCloud(true, CLOUD_SAVE_NAMES.smartMerge)'],
+    ['backfill', 'saveToCloud(true, CLOUD_SAVE_NAMES.backfill)'],
+    ['rebuild', 'saveToCloud(true, CLOUD_SAVE_NAMES.rebuild)'],
+    ['dupFix', 'saveToCloud(false, CLOUD_SAVE_NAMES.dupFix)']
+  ];
+  expected.forEach(([key, call]) => {
+    assert.ok(HTML.includes(call), key + ' must save under its own name: ' + call);
+  });
+  assert.ok(!/await saveToCloud\(true\)/.test(HTML), 'no forced save may stay anonymous');
 });

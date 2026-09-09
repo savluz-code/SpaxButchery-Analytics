@@ -407,6 +407,61 @@ test('forced saves queue behind each other — never two requests in flight', as
   assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveAll').length, 2);
 });
 
+test('a backend-busy response retries a small save automatically', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 10); // keep this on the saveAll path
+  db.customerTx = {};
+  db.seen = {};
+  const inner = cloud.fetchImpl;
+  let busy = true;
+  cloud.fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (busy && body.action === 'saveAll') {
+      busy = false;
+      cloud.calls.push(body);
+      return { ok: true, text: async () => JSON.stringify({
+        success: false,
+        error: 'backend busy with another save — please retry the save'
+      }) };
+    }
+    return inner(url, options);
+  };
+
+  const { first, status, lastCloudError } = await runClient(cloud, db);
+  assert.strictEqual(first, true, 'a transient lock collision should not surface as a failed push');
+  assert.strictEqual(lastCloudError, '');
+  assert.strictEqual(cloud.calls.map((c) => c.action).join(','), 'saveAll,saveAll');
+  assert.ok(status.some((message) => /retrying save/.test(message)), 'the retry should be visible');
+});
+
+test('a busy response during a chunked upload restarts from saveBegin', async () => {
+  const cloud = makeCloud({ chunked: true });
+  const inner = cloud.fetchImpl;
+  let busy = true;
+  cloud.fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (busy && body.action === 'saveChunk') {
+      busy = false;
+      cloud.calls.push(body);
+      return { ok: true, text: async () => JSON.stringify({
+        success: false,
+        error: 'backend busy with another save — please retry the save'
+      }) };
+    }
+    return inner(url, options);
+  };
+
+  const { first, lastCloudError } = await runClient(cloud, bigDB());
+  assert.strictEqual(first, true);
+  assert.strictEqual(lastCloudError, '');
+  const actions = cloud.calls.map((c) => c.action);
+  assert.strictEqual(actions[0], 'saveBegin');
+  assert.strictEqual(actions[1], 'saveChunk');
+  assert.strictEqual(actions[2], 'saveBegin', 'retry must reset the chunked upload');
+  assert.strictEqual(actions[actions.length - 1], 'saveCommit');
+});
+
 /* ── source-level pins ───────────────────────────────────────────────────── */
 
 test('backend v3.0 ships the chunked staging actions alongside saveAll', () => {
@@ -449,6 +504,8 @@ test('client keeps payload-aware timeouts and wires the chunked actions + fallba
   assert.match(HTML, /isUnknownActionError/, 'the unknown-action fallback must stay wired');
   assert.match(HTML, /spaxCloudChunked/, 'backend capability must be cached');
   assert.match(HTML, /uploadId/, 'the upload session id must be echoed');
+  assert.match(HTML, /isBackendBusyError/, 'a lock collision must be retried');
+  assert.match(HTML, /CLOUD_BUSY_RETRIES/, 'busy retries must be bounded');
 });
 
 test('loadFromCloud does not force a push-back save', () => {

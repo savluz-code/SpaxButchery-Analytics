@@ -409,12 +409,18 @@ test('forced saves queue behind each other — never two requests in flight', as
   ctx.fetch = cloud.fetchImpl;
 
   vm.runInContext(syncLayerSource(), ctx);
-  const [a, b] = await Promise.all([ctx.saveToCloud(true), ctx.saveToCloud(true)]);
+  const [a, b, c] = await Promise.all([
+    ctx.saveToCloud(true), ctx.saveToCloud(true), ctx.saveToCloud(true)
+  ]);
 
   assert.strictEqual(a, true);
   assert.strictEqual(b, true);
+  assert.strictEqual(c, true);
   assert.strictEqual(maxInFlight, 1, 'saves must be serialized — overlapping POSTs fight over the backend script lock');
-  assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveAll').length, 2);
+  assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveAll').length, 3);
+  assert.ok(status.some((message) => /Saving 1\/3/.test(message)), 'queue should show the first of three saves');
+  assert.ok(status.some((message) => /Save 1\/3 complete/.test(message)), 'queue should show completion before the next save');
+  assert.ok(status.some((message) => /Saving 2\/3/.test(message)), 'queue should show the next save position');
 });
 
 test('a backend-busy response retries a small save automatically', async () => {
@@ -510,17 +516,21 @@ test('busy retries keep isSyncing true so a concurrent save cannot start', async
   vm.runInContext(src, ctx);
 
   const first = ctx.saveToCloud(true);
-  // While the first save is mid-busy-retry, an unforced save must be dropped
-  // (isSyncing still true) and a forced save must queue, never overlap.
+  // While the first save is mid-busy-retry, an unforced save joins the queue
+  // instead of being silently dropped. It must wait for the first task and
+  // never overlap it.
   await new Promise((r) => setTimeout(r, 20));
-  const dropped = await ctx.saveToCloud(false);
-  assert.strictEqual(dropped, false, 'unforced save must not start while a busy retry is in flight');
+  const queued = ctx.saveToCloud(false);
+  assert.notStrictEqual(queued, false, 'a save arriving during a retry must be queued');
 
   const ok = await first;
   assert.strictEqual(ok, true, 'busy retries must eventually succeed');
+  assert.strictEqual(await queued, true, 'the queued save must eventually complete');
   assert.strictEqual(vm.runInContext('isSyncing', ctx), false, 'isSyncing must clear only after the whole chain');
-  // One failed attempt ×2 busy, then one success — never two concurrent POSTs.
-  assert.ok(cloud.calls.filter((c) => c.action === 'saveAll').length >= 3);
+  assert.ok(status.some((message) => /Saving \d+\/\d+/.test(message)), 'the visible queue position should be reported');
+  // One failed attempt ×2 busy, then one success, then the queued save —
+  // never two concurrent POSTs.
+  assert.ok(cloud.calls.filter((c) => c.action === 'saveAll').length >= 4);
 });
 
 /* ── source-level pins ───────────────────────────────────────────────────── */

@@ -1224,20 +1224,56 @@ async function loadFromCloud() {
 // Saves are serialized. Apps Script funnels writers through a script lock, so
 // two overlapping POSTs make the second one burn its whole timeout in
 // waitLock and fail — a big self-inflicted source of "cloud sync failed".
-// Forced saves queue behind the in-flight one; unforced saves are dropped
-// while one is running or queued, because the queued save builds its payload
-// from the live DB when it actually runs, so it carries the latest data.
+// Every save request now joins the queue (including an auto-save that arrives
+// while another save is retrying) instead of being silently dropped. Each task
+// builds its payload when it starts, so queued saves always carry the latest DB.
 let cloudSaveChain = Promise.resolve(false);
-let cloudSaveQueued = false;
+let cloudSavePending = 0;   // active task + tasks waiting behind it
+let cloudSaveCompleted = 0; // completed tasks in the current visible queue
+
+function showCloudSaveQueue(detail){
+  if (!cloudSavePending) return;
+  const total = cloudSaveCompleted + cloudSavePending;
+  const position = cloudSaveCompleted + 1;
+  const queued = Math.max(0, cloudSavePending - 1);
+  showSyncStatus('⏳ Saving ' + position + '/' + total + '…' +
+    (detail || '') + (queued ? ' (' + queued + ' queued)' : ''));
+}
+
+function finishCloudSaveTask(result){
+  cloudSavePending = Math.max(0, cloudSavePending - 1);
+  if (cloudSavePending) {
+    cloudSaveCompleted++;
+    const total = cloudSaveCompleted + cloudSavePending;
+    showSyncStatus((result ? '✅' : '⚠️') + ' Save ' + cloudSaveCompleted + '/' + total +
+      ' complete — ' + cloudSavePending + ' queued');
+  } else {
+    // performSaveToCloud already leaves the final success/failure message in
+    // place. Reset the counters only after the last task so a new save starts
+    // a clean 1/1 queue rather than inheriting an old total.
+    cloudSaveCompleted = 0;
+  }
+}
 
 function saveToCloud(force = false) {
   if (SYNC_MODE === 'local') return Promise.resolve(false);
-  if (!force && (isSyncing || cloudSaveQueued)) return Promise.resolve(false);
-  cloudSaveQueued = true;
+  if (cloudSavePending === 0) cloudSaveCompleted = 0;
+  cloudSavePending++;
+  showCloudSaveQueue();
+
   const run = cloudSaveChain.catch(() => {}).then(() => {
-    cloudSaveQueued = false;
     if (SYNC_MODE === 'local') return false;
+    showCloudSaveQueue();
     return performSaveToCloud();
+  }).then(result => {
+    finishCloudSaveTask(result);
+    return result;
+  }, err => {
+    // performSaveToCloud normally converts errors to false. Keep the queue
+    // healthy even if a future save implementation rejects unexpectedly.
+    console.error('Queued cloud save failed:', err);
+    finishCloudSaveTask(false);
+    return false;
   });
   cloudSaveChain = run.catch(() => false);
   return run;
@@ -1251,8 +1287,10 @@ async function performSaveToCloud(busyRetry = 0) {
   // holding the Apps Script lock. That second POST is what the user saw as
   // permanent "backend busy with another save": the "other save" was this
   // tab fighting itself. Only the outermost attempt owns the flag.
-  if (busyRetry === 0) isSyncing = true;
-  if (busyRetry === 0) showSyncStatus('⏳ Saving to cloud...');
+  if (busyRetry === 0) {
+    isSyncing = true;
+    showCloudSaveQueue();
+  }
 
   try {
     // Merchant exclusion applies to the cloud too: never push Simon Musyoka
@@ -1454,7 +1492,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
       const res = await post({ action: 'saveChunk', table, rows: slice, uploadId, seq }, CLOUD_TIMEOUT_CHUNK);
       if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
       sent += slice.length;
-      showSyncStatus('⏳ Saving to cloud… ' + Math.round(sent / totalBigRows * 100) + '%');
+      showCloudSaveQueue(' ' + Math.round(sent / totalBigRows * 100) + '%');
     }
   }
 

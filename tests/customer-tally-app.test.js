@@ -884,76 +884,103 @@ test('a database persisted to IndexedDB survives a browser restart — with NO l
   assert.equal(re.dupes, 1, 'the seen-map survived the restart, so the re-import is recognised as a duplicate');
 });
 
-test('rebuild clean-slate wipe: reset to report state, keeping only names & contacts', async () => {
+test('Delete All wipes EVERYTHING \u2014 records, rows, baseline \u2014 keeping reachable contacts + manual books', async () => {
   const ctx = await bootLoaded();
-  const freshSpent = sumSpent(ctx);   // the report total
-  const freshVisits = sumVisits(ctx);
-  const aMasked = ctx.DB.customers.find(c => c.masked);
-  assert.ok(aMasked, 'the seed carries masked contacts');
+  const validBefore = ctx.DB.customers.filter(c => !c.masked && ctx.isValidKenyanContact(c.contact)).length;
+  assert.ok(validBefore > 1000, 'the seed carries 1k+ reachable contacts');
+  assert.ok(ctx.DB.customers.filter(c => c.masked).length > 0, 'the seed carries masked contacts');
 
-  // Grow / bloat the database: a new customer, a post-report import, manual entries.
+  // Resolve one masked contact, bloat the database, add manual entries.
+  assert.equal(ctx.resolveContacts([{ name: 'Ruth Emilly', phone: '0723456321' }], true), 1);
   ctx.importTransactions([
     row('Wipe Test Customer', '0712999000', '2026-08-20', 500, 'WIP1ABCDEF1'),
     row('George Owiti', '0710428075', '2026-07-13', 300, 'WIP2ABCDEF2')
   ]);
   ctx.DB.dailyLedgers.push({ date: '2026-08-20', revenue: 1000, items: [] });
   ctx.DB.dailyExpenses.push({ date: '2026-08-20', cat: 'Wages', amount: 200, note: 'test' });
-  const roster = ctx.DB.customers.map(c => c.name + '|' + c.contact);
+  ctx.DB.overheads.push({ name: 'Rent', amount: 5000, cadence: 'monthly' });
+  ctx.DB.itemCosts['beef'] = 500;
   assert.ok(ctx.DB.transactions.length > 0);
 
-  ctx.wipeDatabaseKeepRoster();
+  // The plan is pure: previewing the wipe changes nothing.
+  const customersBefore = ctx.DB.customers.length;
+  const plan = ctx.planDeleteAll();
+  assert.equal(ctx.DB.customers.length, customersBefore, 'planning touches nothing');
+  assert.equal(plan.savedCount, validBefore + 2, 'every reachable contact survives: seed-valid + resolved + import-created');
+  assert.equal(plan.resolvedKept, 1, 'the resolved contact is counted as resolved');
+  assert.equal(plan.customersDeleted, customersBefore - plan.savedCount);
+  assert.ok(plan.transactionsDeleted > 0);
+  assert.ok(plan.revenueDeleted > 0);
+  assert.equal(plan.ledgersKept, 1, 'the manual books are counted as kept');
+  assert.equal(plan.expensesKept, 1);
+  assert.equal(plan.overheadsKept, 1);
+  assert.equal(plan.itemCostsKept, 1);
 
-  // The roster survives in full: names, contacts, masked state, and even the
-  // import-created customer — as a blank record with no report row of their own.
-  assert.deepEqual(ctx.DB.customers.map(c => c.name + '|' + c.contact), roster);
-  const keptMasked = ctx.DB.customers.find(c => c.name === aMasked.name && c.contact === aMasked.contact);
-  assert.equal(keptMasked.masked, true, 'the masked contact state survives');
-  const wipedNew = byName(ctx, 'Wipe Test Customer');
-  assert.equal(wipedNew.spent, 0);
-  assert.equal(wipedNew.visits, 0);
-  assert.equal(wipedNew.lastVisit, '', 'the blank record has no visit dates');
+  const result = ctx.deleteAllKeepResolved();
+  assert.equal(result.savedCount, plan.savedCount);
 
-  // Every piece of statement-derived data is gone.
+  // Only reachable contacts survive \u2014 as blank, baseline-free records.
+  assert.equal(ctx.DB.customers.length, plan.savedCount);
+  assert.ok(ctx.DB.customers.every(c => !c.masked && ctx.isValidKenyanContact(c.contact)));
+  assert.ok(ctx.DB.customers.every(c => c.spent === 0 && c.visits === 0 && c.seedSpent === 0 && c.seedVisits === 0 && c.seedLastVisit === '' && c.isSeed === false));
+  assert.equal(byName(ctx, 'Ruth Emilly').contact, '0723456321', 'the resolved number survives');
+  assert.equal(byName(ctx, 'George Owiti').spent, 0, 'NO report figures are restored \u2014 the baseline is not immune');
+  assert.equal(byName(ctx, 'George Owiti').lastVisit, '');
+  assert.equal(ctx.DB.customers.filter(c => c.masked).length, 0, 'masked records are gone (statements re-create whatever is real)');
+  assert.equal(ctx.DB.customers.filter(c => c.name === 'Peris Wacera Waite').length, 3, 'same-name twins with valid numbers all survive as blanks');
+
+  // EVERYTHING else is gone: rows, guard, money, months, baseline.
   assert.equal(ctx.DB.transactions.length, 0);
   assert.equal(Object.keys(ctx.DB.customerTx).length, 0);
   assert.equal(Object.keys(ctx.DB.seen).length, 0);
   assert.equal(ctx.DB.importedRev, 0);
   assert.equal(ctx.DB.importedTx, 0);
+  assert.equal(ctx.DB.monthly.labels.length, 0, 'no seed months leak back in');
+  assert.equal(ctx.DB.dailyLedgers.length, 1, 'manual ledgers are kept \u2014 no statement can restore them');
+  assert.equal(ctx.DB.dailyExpenses.length, 1, 'manual expenses are kept');
+  assert.equal(ctx.DB.overheads.length, 1, 'manual overheads are kept');
+  assert.equal(ctx.DB.itemCosts['beef'], 500, 'item costs are kept');
+  assert.equal(ctx.DB.baselineCleared, true);
+  assert.equal(ctx.DB.resolved, plan.savedCount, 'the counter equals the kept contacts');
+  assert.equal(ctx.DB.importBatch, 0);
 
-  // Totals are back to EXACTLY the report (a fresh install's state).
-  assert.equal(sumSpent(ctx), freshSpent);
-  assert.equal(sumVisits(ctx), freshVisits);
-  const george = byName(ctx, 'George Owiti');
-  assert.equal(george.spent, 600, 'George is back to his report row');
-  assert.equal(george.visits, 2);
-  assert.equal(george.lastVisit, '2026-06-01');
+  // Totals are ZERO \u2014 header, cards and chart agree on nothing.
+  assert.equal(sumSpent(ctx), 0);
+  assert.equal(sumVisits(ctx), 0);
+  assert.equal(ctx.getProductStats().totalRevenue, 0, 'the header revenue is zero');
+  assert.equal(monthlyTotal(ctx), 0);
 
-  // Manual entries are kept — no statement can restore them.
-  assert.equal(ctx.DB.dailyLedgers.length, 1);
-  assert.equal(ctx.DB.dailyExpenses.length, 1);
+  // Every baseline read is gated: no seed row, no cut-off, no report.
+  assert.equal(ctx.seedBaselineFor('George Owiti', '0710428075'), null);
+  assert.equal(ctx.seedReportCutoff(), '');
+  assert.equal(ctx.reportTotals().totalRevenue, 0);
+  assert.equal(ctx.reportTotals().totalCustomers, 0);
 
-  // Re-derivation stays consistent afterwards: only the kept ledger folds back in.
+  // Re-derivation heals nothing back except the kept ledger: cards stay zero.
   ctx.repairDates();
-  assert.equal(sumSpent(ctx), freshSpent);
+  assert.equal(sumSpent(ctx), 0);
+  assert.equal(sumVisits(ctx), 0);
   assert.equal(ctx.DB.importedRev, 1000, 'importedRev = the kept ledger revenue, nothing else');
+  assert.equal(monthlyTotal(ctx), 1000);
+  assert.equal(ctx.DB.monthly.labels.join(','), '2026-08', 'the only month is the kept ledger\'s own');
+  assert.equal(byName(ctx, 'Ruth Emilly').contact, '0723456321');
 });
 
-test('rebuild with clean-slate wipe: the selected statements become the single source of truth', async () => {
+test('Delete All + rebuild: the selected statements become the ONLY data', async () => {
   const ctx = await bootLoaded();
-  const freshSpent = sumSpent(ctx);
-  const roster = ctx.DB.customers.map(c => c.name + '|' + c.contact);
+  const validBefore = ctx.DB.customers.filter(c => !c.masked && ctx.isValidKenyanContact(c.contact)).length;
 
-  // A bloated / corrupted state: stale imports on top of the report.
+  // A bloated / corrupted state: a stale import on top of the report.
   ctx.importTransactions([row('George Owiti', '0710428075', '2026-08-10', 400, 'STALE1ABCD1')]);
   assert.ok(ctx.DB.transactions.some(t => t.receipt === 'STALE1ABCD1'));
 
-  // The user ticks "Start from a clean database" in the modal and picks the
-  // August statement. proceedRebuild() must hand the option to handleRebuild.
+  // The user runs Delete All & Rebuild and picks the August statement.
+  // proceedRebuild() must hand the option to handleRebuild.
   ctx.document.getElementById('rebuildWipeAll').checked = true;
   ctx.proceedRebuild();
   assert.equal(ctx.pendingRebuildWipe, true, 'the modal option is passed to the rebuild');
   ctx.parseAnyFile = async () => [row('George Owiti', '0710428075', '2026-08-25', 700, 'AUG1ABCDEF1')];
-  ctx.showConfirm = async () => true;
+  ctx.showConfirm = async () => true; // wipe preview AND result screen both continue
   ctx.saveToCloud = async () => true;
   await ctx.handleRebuild({ files: [{ name: 'august.csv' }], value: '' });
   assert.equal(ctx.pendingRebuildWipe, false, 'the wipe option is consumed');
@@ -963,21 +990,115 @@ test('rebuild with clean-slate wipe: the selected statements become the single s
   assert.equal(ctx.DB.transactions.length, 1);
   assert.equal(ctx.DB.transactions[0].receipt, 'AUG1ABCDEF1');
 
-  // George: his report row + the rebuilt (post-cut-off) statement row.
+  // George: his kept blank record + the rebuilt statement row ONLY (no 600 baseline).
   const george = byName(ctx, 'George Owiti');
-  assert.equal(george.spent, 600 + 700);
-  assert.equal(george.visits, 2 + 1);
+  assert.equal(george.spent, 700);
+  assert.equal(george.visits, 1);
 
-  // The revenue invariants hold: header = report + imported = Σ cards.
-  assert.equal(sumSpent(ctx), freshSpent + 700);
-  assert.equal(ctx.REPORT.totalRevenue + ctx.DB.importedRev, sumSpent(ctx));
+  // Header = \u03a3 cards = imported (the report contributes 0).
+  assert.equal(sumSpent(ctx), 700);
+  assert.equal(ctx.reportTotals().totalRevenue + ctx.DB.importedRev, sumSpent(ctx));
   assert.equal(ctx.DB.importedRev, 700);
-  assert.equal(monthlyTotal(ctx), SEED_MONTHLY_TOTAL + 700, 'the monthly chart = seed months + the rebuilt statement');
+  assert.equal(monthlyTotal(ctx), 700, 'the monthly chart holds only the rebuilt statement');
+  assert.equal(ctx.DB.monthly.labels.join(','), '2026-08');
 
-  // The roster was untouched by the wipe + rebuild.
-  assert.deepEqual(ctx.DB.customers.map(c => c.name + '|' + c.contact), roster);
+  // Every other kept contact is still a blank.
+  const others = ctx.DB.customers.filter(c => c.name !== 'George Owiti');
+  assert.equal(others.length, validBefore - 1);
+  assert.ok(others.every(c => c.spent === 0 && c.visits === 0));
 
-  // The dedup guard was rebuilt from the survivors — a re-import is a duplicate.
+  // The dedup guard was rebuilt from the survivors \u2014 a re-import is a duplicate.
   const re = ctx.importTransactions([row('George Owiti', '0710428075', '2026-08-25', 700, 'AUG1ABCDEF1')]);
   assert.equal(re.dupes, 1);
+});
+
+test('Delete All result screen: stopping keeps the wipe without importing', async () => {
+  const ctx = await bootLoaded();
+  ctx.importTransactions([row('George Owiti', '0710428075', '2026-08-10', 400, 'STALE1ABCD1')]);
+  ctx.document.getElementById('rebuildWipeAll').checked = true;
+  ctx.proceedRebuild();
+  ctx.parseAnyFile = async () => [row('George Owiti', '0710428075', '2026-08-25', 700, 'AUG1ABCDEF1')];
+  // The wipe preview says yes; the result screen says stop here.
+  let calls = 0;
+  ctx.showConfirm = async () => (++calls === 1);
+  ctx.saveToCloud = async () => true;
+  await ctx.handleRebuild({ files: [{ name: 'august.csv' }], value: '' });
+  assert.equal(calls, 2, 'the preview confirm and the result screen were both shown');
+  assert.equal(ctx.pendingRebuildWipe, false);
+  // Wiped (no stale rows, no baseline) but the statement was NOT imported.
+  assert.equal(ctx.DB.transactions.length, 0);
+  assert.equal(sumSpent(ctx), 0);
+  assert.equal(ctx.DB.baselineCleared, true);
+  assert.equal(byName(ctx, 'George Owiti').spent, 0);
+  assert.ok(ctx.DB.customers.length > 1000, 'the kept contacts are still there');
+});
+
+test('Reset restores the report baseline after a Delete All', async () => {
+  const ctx = await bootLoaded();
+  ctx.deleteAllKeepResolved();
+  assert.equal(ctx.DB.baselineCleared, true);
+  assert.equal(sumSpent(ctx), 0);
+  ctx.set('DB', await ctx.seedDB());
+  assert.ok(!ctx.DB.baselineCleared, 'the flag is gone');
+  assert.equal(sumSpent(ctx), ctx.REPORT.totalRevenue, '\u03a3 spent is the report total again');
+  assert.ok(ctx.seedBaselineFor('George Owiti', '0710428075'), 'seed lookups work again');
+  assert.equal(ctx.reportTotals().totalRevenue, ctx.REPORT.totalRevenue);
+});
+
+test('a cleared baseline is viral across syncs and never resurrected by a stale sheet', async () => {
+  const fresh = await bootLoaded();
+  // This device wiped and pushed: the sheet carries wiped customers + the flag.
+  const wiped = await bootLoaded();
+  wiped.deleteAllKeepResolved();
+  const wipedSheet = {
+    customers: JSON.parse(JSON.stringify(wiped.DB.customers)),
+    monthly: { labels: [], revenue: [] },
+    settings: { importedRev: 0, importedTx: 0, resolved: wiped.DB.resolved, importBatch: 0, baselineCleared: 1 },
+    transactions: [], customerTx: {}, seen: {}
+  };
+  // A stale device (full baseline) syncs against the wiped sheet.
+  const stale = await bootLoaded({ cloud: wipedSheet });
+  assert.equal(await stale.loadFromCloud(), true);
+  assert.equal(stale.DB.baselineCleared, true, 'the cleared flag wins the merge');
+  assert.ok(stale.DB.customers.every(c => !c.isSeed && Number(c.seedSpent) === 0 && c.seedLastVisit === ''), 'no record keeps baseline figures');
+  assert.equal(stale.DB.resolved, wiped.DB.resolved, 'the counter follows the cleared side');
+
+  // And a wiped device syncing against a stale (baseline) sheet stays cleared.
+  const staleSheet = {
+    customers: fresh.DB.customers.map(c => ({ ...c })),
+    monthly: { labels: fresh.DB.monthly.labels.slice(), revenue: fresh.DB.monthly.revenue.slice() },
+    settings: { importedRev: 0, importedTx: 0, resolved: 99, importBatch: 3 },
+    transactions: [], customerTx: {}, seen: {}
+  };
+  const ctx2 = await bootLoaded({ cloud: staleSheet });
+  ctx2.deleteAllKeepResolved();
+  const localResolved = ctx2.DB.resolved;
+  await ctx2.loadFromCloud();
+  assert.equal(ctx2.DB.baselineCleared, true, 'local cleared state survives a stale sync');
+  assert.equal(ctx2.DB.resolved, localResolved, 'the stale counter cannot resurrect');
+  assert.ok(ctx2.DB.customers.every(c => !c.isSeed && Number(c.seedSpent) === 0), 'stale baselines cannot merge back in');
+  assert.equal(monthlyTotal(ctx2), 0, 'stale seed months cannot re-inflate the chart');
+});
+
+test('the Import tab offers Delete All & Rebuild, pre-ticking the wipe option', async () => {
+  assert.ok(/openRebuildModal\(true\)/.test(htmlSource), 'the Import tab has a Delete All & Rebuild button');
+  assert.ok(/Delete All & Rebuild/.test(htmlSource), 'the button is labelled Delete All & Rebuild');
+  assert.ok(/wipe EVERYTHING/.test(htmlSource), 'the option names the true wipe honestly');
+
+  const ctx = await bootLoaded();
+  // Plain Full Rebuild opens unticked, as before.
+  ctx.openRebuildModal();
+  assert.equal(ctx.document.getElementById('rebuildWipeAll').checked, false);
+  assert.equal(ctx.document.getElementById('rebuildTitle').textContent, 'Full Rebuild from Statements');
+  assert.equal(ctx.document.getElementById('rebuildIcon').textContent, '🔄');
+  // Delete All & Rebuild opens with the wipe pre-ticked.
+  ctx.openRebuildModal(true);
+  assert.equal(ctx.document.getElementById('rebuildWipeAll').checked, true);
+  assert.equal(ctx.document.getElementById('rebuildTitle').textContent, 'Delete All & Rebuild from Statements');
+  assert.equal(ctx.document.getElementById('rebuildIcon').textContent, '🗑️');
+  // …with live counts showing the scale of the wipe before anything is chosen.
+  assert.ok(/save .* reachable contacts/.test(ctx.document.getElementById('rebuildWipeCounts').textContent), 'live wipe counts are shown');
+  // …and proceeding hands the pre-ticked option to the rebuild.
+  ctx.proceedRebuild();
+  assert.equal(ctx.pendingRebuildWipe, true, 'the pre-ticked wipe is passed to the rebuild');
 });

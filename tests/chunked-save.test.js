@@ -146,10 +146,20 @@ function makeSandbox(cloud, db, status) {
   };
 }
 
-async function runClient(cloud, db, { saveTwice = false } = {}) {
+async function runClient(cloud, db, { saveTwice = false, fastBusy = false } = {}) {
   const status = [];
   const ctx = vm.createContext(makeSandbox(cloud, db, status));
-  vm.runInContext(syncLayerSource(), ctx);
+  // Busy-retry backoffs are multi-second in production (outlast a server-side
+  // write). Tests that exercise the busy path pass fastBusy so they don't
+  // sit on real wall-clock delays.
+  let src = syncLayerSource();
+  if (fastBusy) {
+    src = src.replace(
+      /const CLOUD_BUSY_RETRY_DELAYS = \[[^\]]+\];/,
+      'const CLOUD_BUSY_RETRY_DELAYS = [5, 5, 5, 5, 5, 5];'
+    );
+  }
+  vm.runInContext(src, ctx);
   const first = await ctx.saveToCloud(true);
   const second = saveTwice ? await ctx.saveToCloud(true) : undefined;
   const lastCloudError = vm.runInContext('lastCloudError', ctx);
@@ -428,11 +438,11 @@ test('a backend-busy response retries a small save automatically', async () => {
     return inner(url, options);
   };
 
-  const { first, status, lastCloudError } = await runClient(cloud, db);
+  const { first, status, lastCloudError } = await runClient(cloud, db, { fastBusy: true });
   assert.strictEqual(first, true, 'a transient lock collision should not surface as a failed push');
   assert.strictEqual(lastCloudError, '');
   assert.strictEqual(cloud.calls.map((c) => c.action).join(','), 'saveAll,saveAll');
-  assert.ok(status.some((message) => /retrying save/.test(message)), 'the retry should be visible');
+  assert.ok(status.some((message) => /retrying/.test(message)), 'the retry should be visible');
 });
 
 test('a busy response during a chunked upload restarts from saveBegin', async () => {
@@ -452,7 +462,7 @@ test('a busy response during a chunked upload restarts from saveBegin', async ()
     return inner(url, options);
   };
 
-  const { first, lastCloudError } = await runClient(cloud, bigDB());
+  const { first, lastCloudError } = await runClient(cloud, bigDB(), { fastBusy: true });
   assert.strictEqual(first, true);
   assert.strictEqual(lastCloudError, '');
   const actions = cloud.calls.map((c) => c.action);
@@ -460,6 +470,57 @@ test('a busy response during a chunked upload restarts from saveBegin', async ()
   assert.strictEqual(actions[1], 'saveChunk');
   assert.strictEqual(actions[2], 'saveBegin', 'retry must reset the chunked upload');
   assert.strictEqual(actions[actions.length - 1], 'saveCommit');
+});
+
+test('busy retries keep isSyncing true so a concurrent save cannot start', async () => {
+  // Regression for the permanent "backend busy" loop: a bare
+  // `return performSaveToCloud(next)` runs `finally { isSyncing = false }`
+  // the moment the inner call is *scheduled*, not when it finishes. That
+  // let save() fire a second POST while the first was still mid-retry, and
+  // the second POST then hit the lock the first still held.
+  const cloud = makeCloud({ chunked: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 10);
+  db.customerTx = {};
+  db.seen = {};
+
+  let busyHits = 0;
+  const inner = cloud.fetchImpl;
+  cloud.fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (body.action === 'saveAll' && busyHits < 2) {
+      busyHits += 1;
+      cloud.calls.push(body);
+      // Hold the "lock" briefly so a concurrent save would race if isSyncing
+      // were cleared mid-retry.
+      await new Promise((r) => setTimeout(r, 30));
+      return { ok: true, text: async () => JSON.stringify({
+        success: false,
+        error: 'backend busy with another save — please retry the save'
+      }) };
+    }
+    return inner(url, options);
+  };
+
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+  // Speed up busy backoffs so the test does not wait real seconds.
+  const src = syncLayerSource()
+    .replace(/const CLOUD_BUSY_RETRY_DELAYS = \[[^\]]+\];/, 'const CLOUD_BUSY_RETRY_DELAYS = [5, 5, 5, 5, 5, 5];');
+  vm.runInContext(src, ctx);
+
+  const first = ctx.saveToCloud(true);
+  // While the first save is mid-busy-retry, an unforced save must be dropped
+  // (isSyncing still true) and a forced save must queue, never overlap.
+  await new Promise((r) => setTimeout(r, 20));
+  const dropped = await ctx.saveToCloud(false);
+  assert.strictEqual(dropped, false, 'unforced save must not start while a busy retry is in flight');
+
+  const ok = await first;
+  assert.strictEqual(ok, true, 'busy retries must eventually succeed');
+  assert.strictEqual(vm.runInContext('isSyncing', ctx), false, 'isSyncing must clear only after the whole chain');
+  // One failed attempt ×2 busy, then one success — never two concurrent POSTs.
+  assert.ok(cloud.calls.filter((c) => c.action === 'saveAll').length >= 3);
 });
 
 /* ── source-level pins ───────────────────────────────────────────────────── */
@@ -506,6 +567,18 @@ test('client keeps payload-aware timeouts and wires the chunked actions + fallba
   assert.match(HTML, /uploadId/, 'the upload session id must be echoed');
   assert.match(HTML, /isBackendBusyError/, 'a lock collision must be retried');
   assert.match(HTML, /CLOUD_BUSY_RETRIES/, 'busy retries must be bounded');
+  // Busy retries must await the recursive call and only clear isSyncing on the
+  // outermost attempt — otherwise a concurrent save starts mid-retry.
+  assert.match(HTML, /return await performSaveToCloud\(nextRetry\)/);
+  assert.match(HTML, /if \(busyRetry === 0\) isSyncing = false/);
+  // importTransactions must NOT fire its own cloud push — callers persist.
+  // Strip comments first so the "Do NOT saveToCloud()" note doesn't match.
+  const importBody = HTML.slice(
+    HTML.indexOf('function importTransactions(txs, opts = {}) {'),
+    HTML.indexOf('/* ══════════ 1-CLICK ROLLBACK DUPLICATE REVENUE')
+  ).split('\n').filter((l) => !/^\s*\/\//.test(l) && !/^\s*\*/.test(l)).join('\n');
+  assert.ok(!/saveToCloud\s*\(/.test(importBody), 'import must not nest a cloud push (collides with rebuild wipe push)');
+  assert.ok(!/\bsave\s*\(\s*\)/.test(importBody), 'import must not call save() — callers persist after it returns');
 });
 
 test('loadFromCloud does not force a push-back save', () => {

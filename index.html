@@ -968,11 +968,18 @@ const CLOUD_TIMEOUT_CHUNK = 60000;     // saveBegin + saveChunk (~250 KB each)
 const CLOUD_TIMEOUT_LOAD = 90000;      // action=load (whole DB down)
 const CLOUD_TIMEOUT_BIG_SAVE = 180000; // one-shot saveAll fallback (whole DB up)
 // A busy response means the backend deliberately did not touch the data: a
-// different device/save still owns the script lock. Retry the COMPLETE save
-// after a short backoff. This is safe for both saveAll and chunked uploads (a
+// different device/tab/save still owns the script lock. Retry the COMPLETE
+// save after a backoff. This is safe for both saveAll and chunked uploads (a
 // chunked retry starts with saveBegin, which resets staging).
-const CLOUD_BUSY_RETRIES = 2;
-const CLOUD_BUSY_RETRY_DELAYS = [2000, 5000];
+//
+// Backoffs are long on purpose: a big saveAll / chunked upload can hold Apps
+// Script's lock for minutes (the client may have already timed out while the
+// server is still writing). Short 2s/5s retries made "backend busy" look
+// permanent — nothing unknown was saving; it was OUR previous attempt, or
+// another tab, still finishing. Six tries spanning ~2.5 min outlast a typical
+// write without hammering the lock.
+const CLOUD_BUSY_RETRIES = 6;
+const CLOUD_BUSY_RETRY_DELAYS = [3000, 8000, 15000, 30000, 45000, 60000];
 
 async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT) {
   const controller = new AbortController();
@@ -1243,8 +1250,15 @@ function saveToCloud(force = false) {
 }
 
 async function performSaveToCloud(busyRetry = 0) {
-  isSyncing = true;
-  showSyncStatus('⏳ Saving to cloud...');
+  // isSyncing must stay true across busy retries. A bare
+  // `return performSaveToCloud(next)` runs `finally { isSyncing = false }`
+  // as soon as the inner call is *started* — not when it finishes — which
+  // let save()/auto-sync fire a second POST while the first was still
+  // holding the Apps Script lock. That second POST is what the user saw as
+  // permanent "backend busy with another save": the "other save" was this
+  // tab fighting itself. Only the outermost attempt owns the flag.
+  if (busyRetry === 0) isSyncing = true;
+  if (busyRetry === 0) showSyncStatus('⏳ Saving to cloud...');
 
   try {
     // Merchant exclusion applies to the cloud too: never push Simon Musyoka
@@ -1360,23 +1374,33 @@ async function performSaveToCloud(busyRetry = 0) {
     }
     throw new Error(result.error || 'Cloud rejected the save');
   } catch (err) {
-    // The backend returns this when another device/tab owns the script lock.
-    // It did not write anything, so retry the entire payload rather than
-    // resuming halfway through a chunked upload. Restarting at saveBegin is
-    // important: it clears any staging left by the first attempt.
+    // The backend returns this when another device/tab owns the script lock
+    // (or when a previous attempt from THIS tab is still writing server-side
+    // after a client timeout). It did not write anything, so retry the entire
+    // payload rather than resuming halfway through a chunked upload.
+    // Restarting at saveBegin clears any staging left by the first attempt.
+    // `return await` keeps this attempt's finally from clearing isSyncing
+    // until the whole retry chain finishes.
     if (isBackendBusyError(err) && busyRetry < CLOUD_BUSY_RETRIES) {
       const nextRetry = busyRetry + 1;
       const delayMs = CLOUD_BUSY_RETRY_DELAYS[nextRetry - 1] || CLOUD_BUSY_RETRY_DELAYS[CLOUD_BUSY_RETRY_DELAYS.length - 1];
-      showSyncStatus('⏳ Cloud busy — retrying save in ' + Math.ceil(delayMs / 1000) + 's (' + nextRetry + '/' + CLOUD_BUSY_RETRIES + ')');
+      showSyncStatus('⏳ Cloud busy (another save still writing) — retrying in ' + Math.ceil(delayMs / 1000) + 's (' + nextRetry + '/' + CLOUD_BUSY_RETRIES + ')');
       await new Promise(resolve => setTimeout(resolve, delayMs));
-      return performSaveToCloud(nextRetry);
+      return await performSaveToCloud(nextRetry);
     }
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);
-    showSyncStatus('❌ Save failed: ' + lastCloudError);
+    // Spell out the common case so "what's saving in the background?" has an
+    // answer: usually a previous push from this device that the client gave
+    // up on, still finishing on Apps Script — not an unknown process.
+    if (isBackendBusyError(err)) {
+      showSyncStatus('❌ Save failed: backend still busy after retries — wait ~1 min then Force Push. Usually a previous save from this device still writing, or another open tab.');
+    } else {
+      showSyncStatus('❌ Save failed: ' + lastCloudError);
+    }
     return false;
   } finally {
-    isSyncing = false;
+    if (busyRetry === 0) isSyncing = false;
   }
 }
 
@@ -3428,22 +3452,26 @@ async function load(){
       // whose rows were previously lost can re-book them instead of skipping
       // them as "already imported".
       const healed = healOrphanedSeenKeys();
-      if (healed > 0) persistDB();
       const fixed = repairDates();
-      if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
+      if (fixed > 0) console.log('Date repair: fixed', fixed, 'customers');
+      // Persist locally only. A cloud push on every boot after repair raced
+      // with the user's first deliberate push (Delete All / Force Push) and
+      // made the backend look permanently busy — the "background save" was
+      // this startup heal. The next real edit / Force Push carries the data.
+      if (healed > 0 || fixed > 0) persistDB();
       return cloudLoaded;
     }).catch(() => {
       refreshAll();
       const healed = healOrphanedSeenKeys();
-      if (healed > 0) persistDB();
       const fixed = repairDates();
-      if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
+      if (fixed > 0) console.log('Date repair: fixed', fixed, 'customers');
+      if (healed > 0 || fixed > 0) persistDB();
     });
   }catch(e){
     DB=await seedDB();
     refreshAll();
     const fixed = repairDates();
-    if(fixed > 0){ console.log('Date repair: fixed', fixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
+    if (fixed > 0) { console.log('Date repair: fixed', fixed, 'customers'); persistDB(); }
     return Promise.resolve();
   }
 }function save(){
@@ -6651,8 +6679,15 @@ function importTransactions(txs, opts = {}) {
   // (and so their contribution to the ledgers) update before we re-derive.
   touched.forEach((_info, cust) => reconcileCustomerAggregates(cust));
 
+  // repairDates() re-derives spent/visits from baseline + the history just
+  // written (CUSTOMER TALLY) — that is what makes Visits visible on the card
+  // after an import / rebuild. Do NOT save()/saveToCloud() here: the caller
+  // (confirm import, handleRebuild, handleBackfill) always persists after
+  // this returns. A nested cloud push mid-import was the "backend busy with
+  // another save" the user could not explain — the wipe push still held the
+  // Apps Script lock while this intermediate save tried to start.
   const importFixed = repairDates();
-  if(importFixed > 0){ console.log('Import repair: fixed', importFixed, 'customers'); save(); if(SYNC_MODE === 'auto') saveToCloud(); }
+  if (importFixed > 0) console.log('Import repair: fixed', importFixed, 'customers');
   if(comebacks.length) triggerComebackMessages(comebacks);
   return { imported, dupes, added, updated, unmasked };
 }
@@ -8770,11 +8805,15 @@ async function handleBackfill(input){
     }
     const dateFixes = repairDates();
     if(dateFixes > 0) console.log('Backfill date repair: fixed', dateFixes, 'customer date field(s)');
-    save();
-    if(SYNC_MODE === 'auto') await saveToCloud(true);
-    toast('✅ Backfill complete! ' + totalImported + ' added, ' + totalDupes + ' duplicates skipped');
-    showSyncStatus('✅ Backfill complete');
+    // One local persist + one forced cloud push (same reason as rebuild:
+    // save() would also fire an unforced cloud save that collides).
+    persistDB();
     refreshAll();
+    let cloudOk = true;
+    if (SYNC_MODE !== 'local') cloudOk = await saveToCloud(true);
+    toast('✅ Backfill complete! ' + totalImported + ' added, ' + totalDupes + ' duplicates skipped' +
+      (cloudOk ? '' : ' · ☁️ cloud push failed — retry Force Push'));
+    showSyncStatus(cloudOk ? '✅ Backfill complete' : '⚠️ Backfill saved locally — cloud push failed, retry Force Push');
   }catch(err){
     console.error(err);
     toast('❌ Backfill failed: ' + err.message);
@@ -9098,21 +9137,32 @@ async function handleRebuild(input){
     const totalImported = result.imported, totalDupes = result.dupes,
           totalAdded = result.added, totalUpdated = result.updated;
     // Customer totals are re-derived from baseline + the surviving history for
-    // every record (repairDates), so a scoped rebuild can neither leak revenue
-    // from one window into another nor drop untouched periods.
+    // every record (repairDates / recalcFromHistory), so a scoped rebuild can
+    // neither leak revenue from one window into another nor drop untouched
+    // periods — and Visits on each card equals the itemised history count.
     recalcFromHistory();
-    save();
-    if(SYNC_MODE === 'auto') await saveToCloud(true);
+    // One local persist + ONE forced cloud push. save() would also kick off
+    // an unforced saveToCloud that collides with the forced one below (the
+    // "backend busy with another save" after Delete All & Rebuild).
+    persistDB();
+    refreshAll();
+    let cloudOk = true;
+    if (SYNC_MODE !== 'local') {
+      updateImportModal('Pushing rebuilt data to the cloud…', 90);
+      cloudOk = await saveToCloud(true);
+    }
     finishImportModal(
       '<b>' + totalImported + '</b> transactions imported<br>' +
       '<b>' + totalDupes + '</b> duplicates skipped<br>' +
       '<b>' + totalAdded + '</b> new customers<br>' +
       '<b>' + totalUpdated + '</b> existing customers updated<br>' +
       (cleared ? '<b>' + cleared + '</b> prior rows cleared in the statement period<br>' : '') +
-      '<b>' + DB.customers.length + '</b> total customers now'
+      '<b>' + DB.customers.length + '</b> total customers now' +
+      (cloudOk
+        ? '<br><span style="color:var(--green)">☁️ Cloud updated</span>'
+        : '<br><span style="color:var(--amber)">☁️ Cloud push failed (' + escHtml(lastCloudError || 'unknown') + ') — data is safe locally; use Sync → Force Push</span>')
     );
-    showSyncStatus('✅ Rebuild complete');
-    refreshAll();
+    showSyncStatus(cloudOk ? '✅ Rebuild complete' : '⚠️ Rebuild saved locally — cloud push failed, retry Force Push');
   }catch(err){
     console.error(err);
     $('importModalIcon').textContent='❌';

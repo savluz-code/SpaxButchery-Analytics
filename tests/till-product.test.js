@@ -77,6 +77,9 @@ test('headerShortcodeTill reads the labeled shortcode and nothing else', () => {
   assert.equal(run(ctx, `headerShortcodeTill('Business ShortCode:1213294')`), '1213294');
   assert.equal(run(ctx, `headerShortcodeTill('Merchant Number 5803756')`), '5803756');
   assert.equal(run(ctx, `headerShortcodeTill('Store No 1213294')`), '1213294');
+  // Exact wording off the real Safaricom statement header (10 Sept 2026),
+  // approval-stamp P.O. box and all — only the Shortcode line may match.
+  assert.equal(run(ctx, `headerShortcodeTill('M-PESA STATEMENT Organisation Name: SIMON MUSYOKA MBULUNZA Shortcode: 5803756 Statement Period: 06 Sep 2026 - 09 Sep 2026 Request Date: 10 Sep 2026 Approved - 10th September 2026 M-PESA Statement Period: 6th Sep 2026 - 9th Sep 2026 P.O. BOX 66827 - 00800, NAIROBI')`), '5803756');
   // First labeled shortcode wins — the statement's own identity sits at the top.
   assert.equal(run(ctx, `headerShortcodeTill('Till Number 5803756 duplicate Till Number 1213294')`), '5803756');
   // An unknown shortcode (org/head-office code) tags nothing.
@@ -244,6 +247,22 @@ test('a single-till statement shares its header till with rows that name none', 
   const txs = run(ctx, `parseMpesaText(${q(stmt)})`);
   assert.equal(txs.length, 1);
   assert.equal(txs[0].till, '5803756');
+});
+
+test('a real Safaricom header (Shortcode:) tags every row in the file', () => {
+  const ctx = makeParseContext();
+  const stmt =
+    'Page 1 of 3 M-PESA STATEMENT Organisation Name: SIMON MUSYOKA MBULUNZA Shortcode: 5803756 ' +
+    'Statement Period: 06 Sep 2026 - 09 Sep 2026 Request Date: 10 Sep 2026 ' +
+    'Approved - 10th September 2026 SAFARICOM CUSTOMER CARE M-PESA Statement Period: 6th Sep 2026 - 9th Sep 2026 ' +
+    'P.O. BOX 66827 - 00800, NAIROBI Receipt No Completion Time Details Transaction Status Paid In Withdrawn Balance Transaction Type Other Party\n' +
+    'UI9KN68I0U 2026-09-09 18:53:49 Merchant Payment from 254727111222 MARY WANJORA Completed 150.00 0.00 2,981.17 Pay Merchant 5803756\n' +
+    'UI9KN68I0V 2026-09-09 19:10:02 Merchant Payment from 254700111222 JOHN DOE Completed 50.00 0.00 3,031.17';
+  const txs = run(ctx, `parseMpesaText(${q(stmt)})`);
+  assert.equal(txs.length, 2);
+  assert.equal(txs[0].till, '5803756');
+  assert.equal(txs[1].till, '5803756', 'row with no trailing till inherits the header shortcode');
+  assert.equal(run(ctx, `classifyProduct('2026-09-09', 50, ${JSON.stringify({ till: txs[1].till })})`), 'meat', 'KES 50 to the meat till is meat, not soup');
 });
 
 test('the header shortcode wins over a conflicting row Other Party', () => {

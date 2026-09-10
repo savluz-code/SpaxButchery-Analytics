@@ -58,6 +58,8 @@ test('till constants name the meat and soup merchants and the 6 Sept 2026 switch
 test('extractTillNumber finds the receiving till in details, headers and file names', () => {
   const ctx = makeContext();
   assert.equal(run(ctx, `extractTillNumber('Merchant Payment to 5803756 - SPAX BUTCHERY')`), '5803756');
+  assert.equal(run(ctx, `extractTillNumber('5803756 · SIMON MBULLNZA')`), '5803756');
+  assert.equal(run(ctx, `extractTillNumber('Pay Merchant 1213294 · SPAX SOUP')`), '1213294');
   assert.equal(run(ctx, `extractTillNumber('Till Number: 1213294')`), '1213294');
   assert.equal(run(ctx, `extractTillNumber('Statement_Till 5803756_Sep.xlsx')`), '5803756');
   assert.equal(run(ctx, `extractTillNumber('Merchant Payment from JOHN DOE - 0723***321')`), '');
@@ -66,9 +68,11 @@ test('extractTillNumber finds the receiving till in details, headers and file na
   assert.equal(run(ctx, 'extractTillNumber(undefined)'), '');
 });
 
-test('txTillNumber prefers the stamped till, then details/source text', () => {
+test('txTillNumber prefers the stamped till, then Other Party, details, source', () => {
   const ctx = makeContext();
   assert.equal(run(ctx, `txTillNumber({ till: '5803756', details: 'till 1213294' })`), '5803756');
+  assert.equal(run(ctx, `txTillNumber({ otherParty: '5803756 · SIMON MBULLNZA' })`), '5803756');
+  assert.equal(run(ctx, `txTillNumber({ otherParty: 'till 1213294', details: 'till 5803756' })`), '1213294', 'Other Party beats Details');
   assert.equal(run(ctx, `txTillNumber({ details: 'paid to 1213294' })`), '1213294');
   assert.equal(run(ctx, `txTillNumber({ source: 'Till 5803756 statement' })`), '5803756');
   assert.equal(run(ctx, `txTillNumber('raw till 1213294 text')`), '1213294');
@@ -160,11 +164,89 @@ test('countTillUnknown counts post-split rows with no till', () => {
   assert.equal(run(ctx, 'countTillUnknown()'), 1);
 });
 
-test('parseMpesaText stamps the file-level till onto every row', () => {
+test('parseMpesaText captures the Other Party trailing columns per row', () => {
   const body = slice('function parseMpesaText(raw, sourceLabel) {', 'function transactionKey(tx) {');
-  assert.match(body, /fileTill/, 'must detect the header till once per file');
-  assert.match(body, /extractTillNumber\(raw\)/, 'file-level detection reads the whole statement text');
-  assert.match(body, /t\.till = extractTillNumber\(t\.details\) \|\| fileTill/, 'row details win, header is the fallback');
+  assert.match(body, /function trailingAfter\(matchEnd\)/, 'must slice the Transaction Type + Other Party cells after the Balance');
+  assert.match(body, /hasMeat !== hasSoup/, 'file fallback applies only when exactly one till is named file-wide');
+  assert.match(body, /otherParty: trailing1/);
+  assert.match(body, /otherParty: trailing2/);
+  assert.match(body, /otherParty: trailingLine/);
+  assert.match(body, /till: extractTillNumber\(trailing1\)/);
+  assert.match(body, /t\.till = t\.till \|\|/, 'safety net must fill missing tills, never overwrite the row’s own');
+});
+
+// The REAL parseMpesaText + classification block against minimal stubs, fed
+// statement text shaped like the 9 Sept 2026 merchant statement (Receipt,
+// Completion Time, Details, Completed, Paid In, Withdrawn, Balance,
+// Transaction Type, Other Party).
+function makeParseContext() {
+  const ctx = vm.createContext({ console, Date, Math, Number, String, Object, Array, JSON });
+  vm.runInContext(`
+    function normalizeMpesaText(s){ return String(s||''); }
+    function cleanReceipt(r){ return String(r||'').replace(/[^A-Z0-9]/gi,'').toUpperCase(); }
+    function parseDate(v){ const m = String(v||'').match(/(\\d{4}-\\d{2}-\\d{2})/); return m ? m[1] : ''; }
+    function parseAmount(v){ return parseFloat(String(v||'').replace(/[^\\d.]/g,'')) || 0; }
+    function isChargeRow(d){ return /\\bcharges?\\b/i.test(String(d||'')); }
+    function chargeJudgeSegment(d){ const p = String(d||'').split(/\\b\\d{4}[-\\/]\\d{2}[-\\/]\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}\\b/); return p[p.length-1]; }
+    function isIncomingMpesaDetails(d){ return /merchant\\s+payment|pay\\s+merchant|buy\\s+goods|received\\s+from/i.test(String(d||'')); }
+    function extractPerson(){ return { name: 'Test User', contact: '' }; }
+    function isMerchant(){ return false; }
+  `, ctx);
+  vm.runInContext(classificationSource(), ctx);
+  vm.runInContext(slice('function parseMpesaText(raw, sourceLabel) {', 'function transactionKey(tx) {'), ctx);
+  return ctx;
+}
+
+test('each row takes the till from its own Other Party cell', () => {
+  const ctx = makeParseContext();
+  const stmt =
+    'UI9KN68I0U 2026-09-09 18:53:49 Merchant Payment from 254727111222 MARY WANJORA Completed 150.00 0.00 2,981.17 Pay Merchant 5803756 · SIMON MBULLNZA\n' +
+    'UI9KN68I0V 2026-09-09 19:10:02 Merchant Payment from 254700111222 JOHN DOE Completed 50.00 0.00 3,031.17 Pay Merchant 1213294 · SPAX SOUP';
+  const txs = run(ctx, `parseMpesaText(${q(stmt)})`);
+  assert.equal(txs.length, 2);
+  assert.equal(txs[0].till, '5803756');
+  assert.match(txs[0].otherParty, /5803756/);
+  assert.equal(txs[1].till, '1213294');
+  assert.match(txs[1].otherParty, /1213294/);
+  assert.equal(run(ctx, `classifyProduct('2026-09-09', 150, ${JSON.stringify({ till: txs[0].till })})`), 'meat');
+  assert.equal(run(ctx, `classifyProduct('2026-09-09', 50, ${JSON.stringify({ till: txs[1].till })})`), 'soup');
+});
+
+test('a single-till statement shares its header till with rows that name none', () => {
+  const ctx = makeParseContext();
+  const stmt =
+    'M-PESA STATEMENT Till Number 5803756\n' +
+    'UI9KN68I0U 2026-09-09 18:53:49 Merchant Payment from 254727111222 MARY WANJORA Completed 150.00 0.00 2,981.17';
+  const txs = run(ctx, `parseMpesaText(${q(stmt)})`);
+  assert.equal(txs.length, 1);
+  assert.equal(txs[0].till, '5803756');
+});
+
+test('a combined statement never lets rows inherit each other’s till', () => {
+  const ctx = makeParseContext();
+  const stmt =
+    'UI9KN68I0U 2026-09-09 18:53:49 Merchant Payment from 254727111222 MARY WANJORA Completed 150.00 0.00 2,981.17 Pay Merchant 5803756\n' +
+    'UI9KN68I0V 2026-09-09 19:10:02 Merchant Payment from 254700111222 JOHN DOE Completed 50.00 0.00 3,031.17 Pay Merchant 1213294\n' +
+    'UI9KN68I0W 2026-09-09 19:22:40 Merchant Payment from 254711111222 JANE SMITH Completed 5000.00 0.00 8,031.17';
+  const txs = run(ctx, `parseMpesaText(${q(stmt)})`);
+  assert.equal(txs.length, 3);
+  assert.equal(txs[0].till, '5803756', 'explicit row keeps its own till');
+  assert.equal(txs[1].till, '1213294', 'explicit row keeps its own till');
+  assert.equal(txs[2].till, '', 'till-less row in a both-tills file stays untagged, not meat-by-default');
+  assert.equal(run(ctx, `classifyProduct('2026-09-09', 5000, ${JSON.stringify({ till: txs[2].till })})`), 'meat', 'falls back to the amount rule');
+});
+
+test('CSV statement exports read the till off the Other Party column first', () => {
+  const body = slice('if(hasDetails&&hasPaidIn){', 'isAggregate:true');
+  assert.match(body, /Other Party/);
+  assert.match(body, /extractTillNumber\(otherParty\)/);
+  assert.match(body, /otherParty:otherParty/);
+});
+
+test('the legacy sheet parser reads the till off the Other Party column first', () => {
+  const body = slice('function parseSheetRows(raw) {', 'function showPreview(rows, fmt) {');
+  assert.match(body, /iParty = col\(\/other/);
+  assert.match(body, /extractTillNumber\(party\)/);
 });
 
 test('importTransactions classifies with the row and stores the till', () => {
@@ -227,4 +309,5 @@ test('the import tab documents the 6 Sept till rule', () => {
   assert.match(htmlSource, /Till rule \(from 6 Sept 2026\)/);
   assert.match(htmlSource, /5803756.*Meat/);
   assert.match(htmlSource, /1213294.*Soup/);
+  assert.match(htmlSource, /Other Party<\/b> column/);
 });

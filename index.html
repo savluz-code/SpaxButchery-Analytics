@@ -266,7 +266,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
       <b>🛡️ Duplicate guard:</b> every transaction fingerprinted by <b>Receipt No</b> (or date+time+phone+amount).
       Re-importing the same or overlapping statements skips already-loaded rows — flagged in preview.<br>
       <b>📊 CSV / Excel:</b> customer exports, transaction lists, or contact lists (auto-routed to the Resolver).<br>
-      <b>🏪 Till rule (from 6 Sept 2026):</b> the receiving till — not the amount — decides the product: till <b>5803756</b> → 🥩 Meat, till <b>1213294</b> → 🍲 Soup/others. The till is read off each row, the statement header, or the file name.
+      <b>🏪 Till rule (from 6 Sept 2026):</b> the receiving till — not the amount — decides the product: till <b>5803756</b> → 🥩 Meat, till <b>1213294</b> → 🍲 Soup/others. The till is read off each row's <b>Other Party</b> column (the last column), falling back to Details, the statement header, or the file name.
     </div>
     <div class="drop" id="dropZone">
       <div class="big">📂</div>
@@ -4514,12 +4514,15 @@ function extractTillNumber(text){
   if(s.indexOf(SOUP_TILL) !== -1) return SOUP_TILL;
   return '';
 }
-// Pulls the till off a transaction-shaped object (a stored row carries .till;
-// a freshly parsed row may only have it inside .details / .source).
+// Pulls the till off a transaction-shaped object. Precedence mirrors where the
+// till actually lives on a statement: the stamped .till first, then the Other
+// Party column (.otherParty — the LAST column, e.g. "5803756 · SIMON
+// MBULLNZA"), then Details, then the file-level source text.
 function txTillNumber(tx){
   if(!tx) return '';
   if(typeof tx === 'string') return extractTillNumber(tx);
   return String(tx.till || '') ||
+    extractTillNumber(tx.otherParty || '') ||
     extractTillNumber(tx.details || '') ||
     extractTillNumber(tx.source || '');
 }
@@ -6602,11 +6605,29 @@ function parseMpesaText(raw, sourceLabel) {
   const text = normalizeMpesaText(raw).replace(/\n/g, " ").replace(/\s+/g, " ").trim();
   const txs = [];
   const seenKeys = new Set();
-  // Till-based products from 2026-09-06: a statement usually names the
-  // receiving till once in its header ("Till Number 5803756"), not on every
-  // row — detect it file-wide so rows without an explicit till still classify.
+  // Till-based products from 2026-09-06: the receiving till lives in each
+  // row's TRAILING columns (Transaction Type + Other Party, printed AFTER the
+  // Balance — e.g. "Pay Merchant 5803756 · SIMON MBULLNZA"), captured per row
+  // below. A statement header may also name its till once, so a file-wide
+  // fallback exists — but ONLY when exactly one till appears in the whole
+  // file. A combined statement naming both tills leaves the fallback empty so
+  // rows can never inherit each other's till.
   let fileTill = '';
-  try { fileTill = extractTillNumber(raw) || ''; } catch (_) { fileTill = ''; }
+  try {
+    const hasMeat = String(raw).indexOf(MEAT_TILL) !== -1;
+    const hasSoup = String(raw).indexOf(SOUP_TILL) !== -1;
+    fileTill = (hasMeat !== hasSoup) ? (hasMeat ? MEAT_TILL : SOUP_TILL) : '';
+  } catch (_) { fileTill = ''; }
+  // Text between the end of a regex match (just past the Balance cell) and
+  // the next row's receipt anchor = this row's trailing columns. Bounded at
+  // the next anchor (and 200 chars) so a row can never read its neighbour's
+  // Other Party cell.
+  const RECEIPT_AHEAD = /\b[A-Z0-9]{8,11}\s*\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}:\d{2}/;
+  function trailingAfter(matchEnd){
+    const after = text.slice(matchEnd);
+    const cut = after.search(RECEIPT_AHEAD);
+    return (cut === -1 ? after : after.slice(0, cut)).slice(0, 200).trim();
+  }
   // Every row a pass RECOGNIZED (imported OR intentionally skipped as
   // outgoing/charge) owns exactly one "Completed" word. The "possibly missed"
   // warning compares against this, not against txs.length, so intentionally
@@ -6651,12 +6672,16 @@ function parseMpesaText(raw, sourceLabel) {
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
 
+    // The Other Party cell (receiving till) trails the Balance — capture it.
+    const trailing1 = trailingAfter(m.index + m[0].length);
     txs.push({
       receipt, date, time,
       name: person.name,
       contact: person.contact,
       amount,
       details,
+      otherParty: trailing1,
+      till: extractTillNumber(trailing1) || extractTillNumber(details) || fileTill,
       source: sourceLabel
     });
   }
@@ -6699,12 +6724,16 @@ function parseMpesaText(raw, sourceLabel) {
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
 
+    // The Other Party cell (receiving till) trails the Balance — capture it.
+    const trailing2 = trailingAfter(m.index + m[0].length);
     txs.push({
       receipt, date, time,
       name: person.name,
       contact: person.contact,
       amount,
       details,
+      otherParty: trailing2,
+      till: extractTillNumber(trailing2) || extractTillNumber(details) || fileTill,
       source: sourceLabel
     });
   }
@@ -6756,29 +6785,34 @@ function parseMpesaText(raw, sourceLabel) {
 
     const details = cleanLine.split(/Completed/i)[0].replace(fm[1], '').replace(fm[2], '').replace(fm[3], '').replace(/\s+/g, ' ').trim();
     if (!(strictWording ? isIncomingMpesaDetails(details) : /from|received|pay\s+bill|buy\s+goods/i.test(details))) continue;
-    
+
     const person = extractPerson(details || cleanLine);
-    
+
     // EXCLUDE MERCHANT: Simon Musyoka's transactions (internal transfers/withdrawals)
     // must never be counted as revenue or added to the customer list.
     if (isMerchant(person.name) || isMerchant(details) || isMerchant(cleanLine)) continue;
 
+    // OCR fallback rows are one short line each: whatever trails the amounts is
+    // the Transaction Type + Other Party cell (the receiving till).
+    const trailingLine = afterStatus.replace(/[\d,]+\.\d{2}/g, ' ').replace(/[-–—]/g, ' ').replace(/\s+/g, ' ').trim();
     txs.push({
       receipt, date, time,
       name: person.name || 'M-Pesa Customer',
       contact: person.contact,
       amount,
       details: details || cleanLine,
+      otherParty: trailingLine,
+      till: extractTillNumber(trailingLine) || extractTillNumber(details) || fileTill,
       source: sourceLabel + " (fallback)"
     });
   }
 
-  // Stamp the receiving till on every row: a till named in the row's own
-  // Details wins, otherwise the file-level header till applies (a statement
-  // is for one till). Stored on import and decides Meat vs Soup from Sept 6.
+  // Safety net: every row already carries its till from the pushes above
+  // (Other Party → Details → single-till file fallback). Fill in any row that
+  // somehow missed one — never overwrite the row's own trailing columns.
   txs.forEach(t => {
-    try { t.till = extractTillNumber(t.details) || fileTill || ''; }
-    catch (_) { t.till = fileTill || ''; }
+    try { t.till = t.till || extractTillNumber(t.otherParty) || extractTillNumber(t.details) || fileTill || ''; }
+    catch (_) { t.till = t.till || fileTill || ''; }
   });
 
   const completedCount = (text.match(/completed/gi) || []).length;
@@ -7844,10 +7878,12 @@ async function parseAnyFile(file){
         .replace(/[-–—]/g,' ').replace(/\s+/g,' ').trim();
       const amt=parseAmount(pick(row,['Paid In','Credit','Amount','Paid in']));
       if(amt<=0||isMerchant(name)) return;
-      // Till decides Meat vs Soup from 6 Sept 2026 — read it off the Details
-      // cell, falling back to the file name (e.g. "Till 5803756 Aug.xlsx").
+      // Till decides Meat vs Soup from 6 Sept 2026 — read it off the Other
+      // Party cell FIRST (the last column, e.g. "5803756 · SIMON MBULLNZA"),
+      // then Details, then the file name (e.g. "Till 5803756 Aug.xlsx").
+      const otherParty=String(pick(row,['Other Party','OtherParty','Counterparty','Counter Party'])||'');
       let csvTill='';
-      try { csvTill = extractTillNumber(det) || extractTillNumber(file && file.name) || ''; } catch(_){ csvTill=''; }
+      try { csvTill = extractTillNumber(otherParty) || extractTillNumber(det) || extractTillNumber(file && file.name) || ''; } catch(_){ csvTill=''; }
       out.push({
         receipt:pick(row,['Receipt','Receipt No','Transaction ID','Ref']),
         name:toTitleCase(name)||'Unknown',
@@ -7857,6 +7893,7 @@ async function parseAnyFile(file){
         date:parseDate(pick(row,['Date','Completion Time','Transaction Date'])),
         time:String(pick(row,['Time','Completion Time'])||'').match(/(\d{2}:\d{2}:\d{2})/)?.[1]||'',
         details:det,
+        otherParty:otherParty,
         till:csvTill,
         source:'CSV/Excel'
       });
@@ -7938,7 +7975,8 @@ function parseSheetRows(raw) {
   const iDet = col(/details|other party|narration/), iPaid = col(/paid.?in|credit/), iRcpt = col(/receipt|ref/),
     iName = col(/^name$|customer.?name|client/), iPhone = col(/contact|phone|msisdn|mobile|number/),
     iAmt = col(/total_spent|amount|spent|value|paid/), iVis = col(/visits|txns|transactions/),
-    iDate = col(/last_visit|date|visit|time/);
+    iDate = col(/last_visit|date|visit|time/),
+    iParty = col(/other.?party|counterparty/);
   let fmt = 'Transactions', rows = [];
   if (iDet >= 0 && iPaid >= 0) {
     fmt = 'M-Pesa CSV';
@@ -7951,9 +7989,11 @@ function parseSheetRows(raw) {
         .replace(/[-–—]/g, ' ').replace(/\s+/g, ' ').trim();
       const amt = parseFloat(('' + (r[iPaid] || 0)).replace(/[^\d.]/g, '')) || 0;
       if (isMerchant(name)) return;
-      // Till decides Meat vs Soup from 6 Sept 2026 — read it off Details.
+      // Till decides Meat vs Soup from 6 Sept 2026 — read it off the Other
+      // Party cell FIRST (the last column), then Details.
+      const party = iParty >= 0 ? ('' + (r[iParty] || '')) : '';
       let sheetTill = '';
-      try { sheetTill = extractTillNumber(det) || ''; } catch(_){ sheetTill = ''; }
+      try { sheetTill = extractTillNumber(party) || extractTillNumber(det) || ''; } catch(_){ sheetTill = ''; }
       if (amt > 0 && (pm || name)) rows.push({
         receipt: iRcpt >= 0 ? ('' + (r[iRcpt] || '')) : '',
         name: toTitleCase(name) || 'Unknown',
@@ -7961,6 +8001,7 @@ function parseSheetRows(raw) {
         amount: amt, visits: 1,
         date: iDate >= 0 ? parseDate(r[iDate]) : '', time: '',
         details: det,
+        otherParty: party,
         till: sheetTill
       });
     });

@@ -7,7 +7,8 @@
 // From 2026-09-06 the RECEIVING TILL decides Meat vs Soup — not the amount.
 // Rows before the split keep the legacy heuristic (≤ KES 50 → soup from
 // 2026-06-01, everything before that is meat), as do post-split rows whose
-// till could not be detected anywhere (row Details → file header → file name).
+// till could not be detected anywhere (header shortcode → row Other
+// Party/Details → single-till file → file name).
 //
 // These tests run the REAL classification functions from index.html inside a
 // vm sandbox, and pin the wiring (parse → import/backfill → cloud → UI).
@@ -66,6 +67,28 @@ test('extractTillNumber finds the receiving till in details, headers and file na
   assert.equal(run(ctx, `extractTillNumber('')`), '');
   assert.equal(run(ctx, 'extractTillNumber(null)'), '');
   assert.equal(run(ctx, 'extractTillNumber(undefined)'), '');
+});
+
+test('headerShortcodeTill reads the labeled shortcode and nothing else', () => {
+  const ctx = makeContext();
+  assert.equal(run(ctx, `headerShortcodeTill('M-PESA STATEMENT Till Number: 5803756 Period: Sep 2026')`), '5803756');
+  assert.equal(run(ctx, `headerShortcodeTill('Short Code - 1213294')`), '1213294');
+  assert.equal(run(ctx, `headerShortcodeTill('TILL NO. 5803756')`), '5803756');
+  assert.equal(run(ctx, `headerShortcodeTill('Business ShortCode:1213294')`), '1213294');
+  assert.equal(run(ctx, `headerShortcodeTill('Merchant Number 5803756')`), '5803756');
+  assert.equal(run(ctx, `headerShortcodeTill('Store No 1213294')`), '1213294');
+  // First labeled shortcode wins — the statement's own identity sits at the top.
+  assert.equal(run(ctx, `headerShortcodeTill('Till Number 5803756 duplicate Till Number 1213294')`), '5803756');
+  // An unknown shortcode (org/head-office code) tags nothing.
+  assert.equal(run(ctx, `headerShortcodeTill('Short Code: 999999')`), '');
+  // A bare number with no label proves nothing…
+  assert.equal(run(ctx, `headerShortcodeTill('Statement 5803756 Sep')`), '');
+  // …a phone number after a label must not match on its first digits…
+  assert.equal(run(ctx, `headerShortcodeTill('Merchant Number 254722111222')`), '');
+  // …and row-style phrasing without a no/number/id/code word is not a header till.
+  assert.equal(run(ctx, `headerShortcodeTill('Pay Merchant 5803756')`), '');
+  assert.equal(run(ctx, `headerShortcodeTill('')`), '');
+  assert.equal(run(ctx, 'headerShortcodeTill(null)'), '');
 });
 
 test('txTillNumber prefers the stamped till, then Other Party, details, source', () => {
@@ -164,15 +187,16 @@ test('countTillUnknown counts post-split rows with no till', () => {
   assert.equal(run(ctx, 'countTillUnknown()'), 1);
 });
 
-test('parseMpesaText captures the Other Party trailing columns per row', () => {
+test('parseMpesaText stamps the header shortcode first, Other Party per row', () => {
   const body = slice('function parseMpesaText(raw, sourceLabel) {', 'function transactionKey(tx) {');
+  assert.match(body, /headerTill = headerShortcodeTill\(/, 'must read the labeled header shortcode once per file');
+  assert.match(body, /till: headerTill \|\| extractTillNumber\(trailing1\)/, 'header shortcode beats per-row evidence');
   assert.match(body, /function trailingAfter\(matchEnd\)/, 'must slice the Transaction Type + Other Party cells after the Balance');
   assert.match(body, /hasMeat !== hasSoup/, 'file fallback applies only when exactly one till is named file-wide');
   assert.match(body, /otherParty: trailing1/);
   assert.match(body, /otherParty: trailing2/);
   assert.match(body, /otherParty: trailingLine/);
-  assert.match(body, /till: extractTillNumber\(trailing1\)/);
-  assert.match(body, /t\.till = t\.till \|\|/, 'safety net must fill missing tills, never overwrite the row’s own');
+  assert.match(body, /t\.till = t\.till \|\| headerTill/, 'safety net must fill missing tills, never overwrite the row’s own');
 });
 
 // The REAL parseMpesaText + classification block against minimal stubs, fed
@@ -220,6 +244,19 @@ test('a single-till statement shares its header till with rows that name none', 
   const txs = run(ctx, `parseMpesaText(${q(stmt)})`);
   assert.equal(txs.length, 1);
   assert.equal(txs[0].till, '5803756');
+});
+
+test('the header shortcode wins over a conflicting row Other Party', () => {
+  const ctx = makeParseContext();
+  const stmt =
+    'M-PESA STATEMENT Short Code: 1213294 Period 01-09-2026 to 09-09-2026\n' +
+    'UI9KN68I0U 2026-09-09 18:53:49 Merchant Payment from 254727111222 MARY WANJORA Completed 150.00 0.00 2,981.17 Pay Merchant 5803756\n' +
+    'UI9KN68I0V 2026-09-09 19:10:02 Merchant Payment from 254700111222 JOHN DOE Completed 50.00 0.00 3,031.17 Till to Till transfer';
+  const txs = run(ctx, `parseMpesaText(${q(stmt)})`);
+  assert.equal(txs.length, 2);
+  assert.equal(txs[0].till, '1213294', 'header shortcode beats the row’s own Other Party cell');
+  assert.equal(txs[1].till, '1213294', 'till-less rows inherit the header shortcode');
+  assert.equal(run(ctx, `classifyProduct('2026-09-09', 150, ${JSON.stringify({ till: txs[0].till })})`), 'soup');
 });
 
 test('a combined statement never lets rows inherit each other’s till', () => {
@@ -309,5 +346,6 @@ test('the import tab documents the 6 Sept till rule', () => {
   assert.match(htmlSource, /Till rule \(from 6 Sept 2026\)/);
   assert.match(htmlSource, /5803756.*Meat/);
   assert.match(htmlSource, /1213294.*Soup/);
+  assert.match(htmlSource, /header shortcode<\/b>/);
   assert.match(htmlSource, /Other Party<\/b> column/);
 });

@@ -266,7 +266,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
       <b>🛡️ Duplicate guard:</b> every transaction fingerprinted by <b>Receipt No</b> (or date+time+phone+amount).
       Re-importing the same or overlapping statements skips already-loaded rows — flagged in preview.<br>
       <b>📊 CSV / Excel:</b> customer exports, transaction lists, or contact lists (auto-routed to the Resolver).<br>
-      <b>🏪 Till rule (from 6 Sept 2026):</b> the receiving till — not the amount — decides the product: till <b>5803756</b> → 🥩 Meat, till <b>1213294</b> → 🍲 Soup/others. The till is read off each row's <b>Other Party</b> column (the last column), falling back to Details, the statement header, or the file name.
+      <b>🏪 Till rule (from 6 Sept 2026):</b> the receiving till — not the amount — decides the product: till <b>5803756</b> → 🥩 Meat, till <b>1213294</b> → 🍲 Soup/others. The till is read from the statement <b>header shortcode</b> (Till Number / Short Code), which tags every row in the file; statements without a header fall back to each row's <b>Other Party</b> column, Details, or the file name.
     </div>
     <div class="drop" id="dropZone">
       <div class="big">📂</div>
@@ -4514,6 +4514,22 @@ function extractTillNumber(text){
   if(s.indexOf(SOUP_TILL) !== -1) return SOUP_TILL;
   return '';
 }
+// A statement is pulled FOR one till, and its header names that till as the
+// shortcode (\"Till Number\", \"Short Code\", \"Merchant Number\" …). That
+// labeled shortcode is the authority for the whole file: returns the KNOWN
+// till it names, or '' when the header names none — or an unknown shortcode
+// (an org/head-office code must never tag rows). The label anchor matters: a
+// bare number in the header proves nothing, row-style phrasing (\"Pay
+// Merchant 5803756\") carries no no/number/id/code word so it never matches,
+// and the (?!\d) guard stops a phone number after a label from matching on
+// its first digits. First labeled shortcode wins (the statement's own
+// identity sits at the top).
+function headerShortcodeTill(headerText){
+  try {
+    const hm = /\b(?:till(?:\s*(?:nos?|numbers?))?|short[\s-]*codes?|merchant\s*(?:nos?|numbers?|ids?)|store\s*(?:nos?|numbers?))[\s:;.\-]*(\d{6,7})(?!\d)/i.exec(String(headerText || ''));
+    return hm ? (extractTillNumber(hm[1]) || '') : '';
+  } catch (_) { return ''; }
+}
 // Pulls the till off a transaction-shaped object. Precedence mirrors where the
 // till actually lives on a statement: the stamped .till first, then the Other
 // Party column (.otherParty — the LAST column, e.g. "5803756 · SIMON
@@ -6605,13 +6621,27 @@ function parseMpesaText(raw, sourceLabel) {
   const text = normalizeMpesaText(raw).replace(/\n/g, " ").replace(/\s+/g, " ").trim();
   const txs = [];
   const seenKeys = new Set();
-  // Till-based products from 2026-09-06: the receiving till lives in each
-  // row's TRAILING columns (Transaction Type + Other Party, printed AFTER the
-  // Balance — e.g. "Pay Merchant 5803756 · SIMON MBULLNZA"), captured per row
-  // below. A statement header may also name its till once, so a file-wide
-  // fallback exists — but ONLY when exactly one till appears in the whole
-  // file. A combined statement naming both tills leaves the fallback empty so
-  // rows can never inherit each other's till.
+  // Row anchors (receipt + date + time) start every transaction row — used to
+  // find where the header ends and to bound each row's trailing columns.
+  const RECEIPT_AHEAD = /\b[A-Z0-9]{8,11}\s*\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}:\d{2}/;
+  // Till-based products from 2026-09-06: a statement is pulled FOR one till,
+  // and its header names that till as the shortcode ("Till Number" / "Short
+  // Code" / ...). That header shortcode is the authority for the whole file:
+  // every row inherits it — even rows whose own Other Party cell names no
+  // till (transfers, charges, reversals) or the other one (a till-to-till
+  // movement is still this till's activity). Files with no parseable header
+  // (CSV exports, pasted row snippets) fall back to per-row evidence: Other
+  // Party → Details → single-till file → file name.
+  let headerTill = '';
+  try {
+    const firstRow = text.search(RECEIPT_AHEAD);
+    // The header is whatever precedes the first transaction row (capped: a
+    // real header fits in the first ~2 KB — anything past that is row data).
+    headerTill = headerShortcodeTill((firstRow === -1 ? text : text.slice(0, firstRow)).slice(0, 2000));
+  } catch (_) { headerTill = ''; }
+  // File-wide fallback for headerless statements — but ONLY when exactly one
+  // till appears in the whole file. A combined statement naming both tills
+  // leaves this empty so rows can never inherit each other's till.
   let fileTill = '';
   try {
     const hasMeat = String(raw).indexOf(MEAT_TILL) !== -1;
@@ -6622,7 +6652,6 @@ function parseMpesaText(raw, sourceLabel) {
   // the next row's receipt anchor = this row's trailing columns. Bounded at
   // the next anchor (and 200 chars) so a row can never read its neighbour's
   // Other Party cell.
-  const RECEIPT_AHEAD = /\b[A-Z0-9]{8,11}\s*\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}:\d{2}/;
   function trailingAfter(matchEnd){
     const after = text.slice(matchEnd);
     const cut = after.search(RECEIPT_AHEAD);
@@ -6681,7 +6710,7 @@ function parseMpesaText(raw, sourceLabel) {
       amount,
       details,
       otherParty: trailing1,
-      till: extractTillNumber(trailing1) || extractTillNumber(details) || fileTill,
+      till: headerTill || extractTillNumber(trailing1) || extractTillNumber(details) || fileTill,
       source: sourceLabel
     });
   }
@@ -6733,7 +6762,7 @@ function parseMpesaText(raw, sourceLabel) {
       amount,
       details,
       otherParty: trailing2,
-      till: extractTillNumber(trailing2) || extractTillNumber(details) || fileTill,
+      till: headerTill || extractTillNumber(trailing2) || extractTillNumber(details) || fileTill,
       source: sourceLabel
     });
   }
@@ -6802,17 +6831,17 @@ function parseMpesaText(raw, sourceLabel) {
       amount,
       details: details || cleanLine,
       otherParty: trailingLine,
-      till: extractTillNumber(trailingLine) || extractTillNumber(details) || fileTill,
+      till: headerTill || extractTillNumber(trailingLine) || extractTillNumber(details) || fileTill,
       source: sourceLabel + " (fallback)"
     });
   }
 
   // Safety net: every row already carries its till from the pushes above
-  // (Other Party → Details → single-till file fallback). Fill in any row that
-  // somehow missed one — never overwrite the row's own trailing columns.
+  // (header shortcode → Other Party → Details → single-till file fallback).
+  // Fill in any row that somehow missed one — never overwrite a stamped till.
   txs.forEach(t => {
-    try { t.till = t.till || extractTillNumber(t.otherParty) || extractTillNumber(t.details) || fileTill || ''; }
-    catch (_) { t.till = t.till || fileTill || ''; }
+    try { t.till = t.till || headerTill || extractTillNumber(t.otherParty) || extractTillNumber(t.details) || fileTill || ''; }
+    catch (_) { t.till = t.till || headerTill || fileTill || ''; }
   });
 
   const completedCount = (text.match(/completed/gi) || []).length;

@@ -1,5 +1,5 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.2  (2026-09-08)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.3  (2026-09-10)
  * ─────────────────────────────────────────────────────────────────
  * MOBILE: can't edit script.google.com on your phone? Open
  *   https://savluz-code.github.io/SpaxButchery-Analytics/code.html
@@ -66,8 +66,11 @@ var TABLE_HEADERS = {
   ],
   monthly: ['label', 'revenue'],
   settings: ['key', 'value'],
-  transactions: ['date', 'time', 'amount', 'name', 'phone', 'product', 'receipt', 'source', 'importedAt', 'backfillOnly'],
-  customerTx: ['customer', 'date', 'amount', 'product', 'receipt', 'importedAt'],
+  // v3.3: `till` = the receiving M-Pesa merchant number (5803756 → Meat,
+  // 1213294 → Soup/others from 2026-09-06). Old sheets without the column
+  // keep loading (till reads as '') and gain it on the next save.
+  transactions: ['date', 'time', 'amount', 'name', 'phone', 'product', 'till', 'receipt', 'source', 'importedAt', 'backfillOnly'],
+  customerTx: ['customer', 'date', 'amount', 'product', 'till', 'receipt', 'importedAt'],
   seen: ['key', 'value']
 };
 
@@ -222,6 +225,7 @@ function loadAll_() {
       date: dateOnly_(r.date),
       amount: Number(r.amount) || 0,
       product: r.product || '',
+      till: r.till || '',
       receipt: r.receipt || '',
       importedAt: r.importedAt || ''
     });
@@ -418,6 +422,7 @@ function flattenCustomerTx_(customerTx) {
         date: t.date || '',
         amount: t.amount || 0,
         product: t.product || '',
+        till: t.till || '',
         receipt: t.receipt || '',
         importedAt: t.importedAt || ''
       });

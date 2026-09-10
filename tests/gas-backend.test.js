@@ -624,6 +624,7 @@ test('code.html reads the backend version from the file, not from hard-coded mar
   assert.strictEqual(current.ver, header[1]);
   assert.strictEqual(current.date, header[2]);
 
-  // …and the version it reports is the one that fixes the chunk mismatch.
-  assert.strictEqual(current.ver, 'v3.2', 'code.html must be offering the fixed backend');
+  // …and the version it reports is the one that carries the till column
+  // (v3.3 supersedes the v3.2 chunk-mismatch fix).
+  assert.strictEqual(current.ver, 'v3.3', 'code.html must be offering the fixed backend');
 });

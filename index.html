@@ -265,7 +265,8 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
       wrapped receipt numbers &amp; multi-line names. OCR misreads of masked numbers (<code>***</code> read as <code>#**</code>/<code>xxx</code>) are auto-repaired.<br>
       <b>🛡️ Duplicate guard:</b> every transaction fingerprinted by <b>Receipt No</b> (or date+time+phone+amount).
       Re-importing the same or overlapping statements skips already-loaded rows — flagged in preview.<br>
-      <b>📊 CSV / Excel:</b> customer exports, transaction lists, or contact lists (auto-routed to the Resolver).
+      <b>📊 CSV / Excel:</b> customer exports, transaction lists, or contact lists (auto-routed to the Resolver).<br>
+      <b>🏪 Till rule (from 6 Sept 2026):</b> the receiving till — not the amount — decides the product: till <b>5803756</b> → 🥩 Meat, till <b>1213294</b> → 🍲 Soup/others. The till is read off each row, the statement header, or the file name.
     </div>
     <div class="drop" id="dropZone">
       <div class="big">📂</div>
@@ -287,7 +288,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     <h3>Preview — <span id="pvCount"></span> rows <span class="badge b-valid" id="pvFormat"></span> <span class="badge b-dup" id="pvDups" style="display:none"></span></h3>
     <div class="hint">Duplicates are skipped automatically on confirm</div>
     <div class="scroll-y" style="max-height:340px"><table id="pvTable">
-      <thead><tr><th>Receipt</th><th>Name</th><th>Phone</th><th>Amount</th><th>Date</th><th>Match</th></tr></thead><tbody></tbody></table></div>
+      <thead><tr><th>Receipt</th><th>Name</th><th>Phone</th><th>Amount</th><th>Date</th><th>Till</th><th>Match</th></tr></thead><tbody></tbody></table></div>
     <div class="flex" style="margin-top:14px">
       <button class="btn green" id="confirmImport">✅ Confirm Import</button>
       <button class="btn ghost" id="cancelImport">Cancel</button>
@@ -648,6 +649,9 @@ function doPost(e) {
         <option value="all">All transactions</option>
         <option value="meat">🥩 Meat only</option>
         <option value="soup">🍲 Soup only</option>
+        <option value="tillMeat">🏪 Till 5803756 (Meat)</option>
+        <option value="tillSoup">🏪 Till 1213294 (Soup)</option>
+        <option value="tillUnknown">❓ Sept 6+ without till</option>
         <option value="pdf">📄 From PDF</option>
         <option value="csv">📊 From CSV/Excel</option>
         <option value="image">🖼️ From Image</option>
@@ -661,7 +665,7 @@ function doPost(e) {
     </div>
     <div id="txStats" style="font-size:.8rem;color:var(--muted);margin-bottom:8px"></div>
     <div class="scroll-y" style="max-height:520px"><table id="txTable">
-      <thead><tr><th>Date</th><th>Name</th><th>Phone</th><th>Receipt</th><th>Amount</th><th>Product</th><th>Source</th></tr></thead>
+      <thead><tr><th>Date</th><th>Name</th><th>Phone</th><th>Receipt</th><th>Amount</th><th>Product</th><th>Till</th><th>Source</th></tr></thead>
       <tbody></tbody></table></div>
   </div>
 </section>
@@ -788,6 +792,7 @@ function doPost(e) {
       <h3 id="importModalTitle" style="margin-bottom:6px">Importing…</h3>
       <div id="importModalBody" style="color:var(--muted);font-size:.9rem;line-height:1.6;margin-bottom:16px">Please wait</div>
       <div class="prog-bar" style="margin-bottom:16px"><div id="importModalBar" style="width:0%"></div></div>
+      <div style="font-size:.75rem;color:var(--muted)">🔒 The app stays active until the task completes — you can switch apps, just don’t close this tab.</div>
     </div>
     <div class="modal-foot">
       <button class="btn" id="importModalClose" style="display:none" onclick="closeImportModal()">Done</button>
@@ -1269,6 +1274,153 @@ let cloudSaveBatch = [];
 // guessing at "another save".
 let cloudStoppedUpload = null;
 
+// ── BACKGROUND PERSISTENCE ──
+// A long save (chunked upload, busy retries) must survive the app being
+// minimized or covered by another app: the upload keeps running and finishes
+// instead of stalling halfway. Four guards work together, all best-effort
+// and all sandboxed-safe (every browser API is feature-detected):
+//   1. Screen Wake Lock while a save (or an import task) runs, re-acquired
+//      whenever the page becomes visible again — stops the OS sleeping the
+//      CPU mid-upload while the app is in the foreground.
+//   2. A `spaxPendingSync` flag in localStorage, set the moment a save is
+//      queued and cleared only when the queue drains. If the browser kills
+//      the page mid-save, the next load sees the flag and pushes automatically.
+//   3. A beforeunload guard so closing/navigating mid-save asks first, plus a
+//      Background Sync registration so the OS can wake the app to finish.
+//   4. Progress mirrored into document.title (visible in the task switcher)
+//      and a completion notification if the save finished while hidden.
+const SPAX_PENDING_KEY = 'spaxPendingSync';
+let spaxWakeLock = null;
+let spaxSaveWanted = false;   // a cloud save is queued or running
+let spaxModalWanted = false;  // an import/parse task (modal or file handler) is running
+let spaxHiddenDuringSave = false;
+
+function spaxUpdateWakeLock() {
+  if (typeof navigator === 'undefined' || !navigator.wakeLock || !navigator.wakeLock.request) return;
+  if ((spaxSaveWanted || spaxModalWanted) && !spaxWakeLock) {
+    try {
+      navigator.wakeLock.request('screen').then(lock => {
+        // The queue may have drained while the request was in flight — never
+        // hold a lock nobody wants anymore.
+        if (!(spaxSaveWanted || spaxModalWanted)) { try { lock.release(); } catch (_) {} return; }
+        spaxWakeLock = lock;
+        try { lock.addEventListener('release', () => { spaxWakeLock = null; }); } catch (_) {}
+      }).catch(() => { spaxWakeLock = null; });
+    } catch (_) { spaxWakeLock = null; }
+  } else if (!(spaxSaveWanted || spaxModalWanted) && spaxWakeLock) {
+    try { spaxWakeLock.release(); } catch (_) {}
+    spaxWakeLock = null;
+  }
+}
+function spaxMarkPending() {
+  spaxSaveWanted = true;
+  try { localStorage.setItem(SPAX_PENDING_KEY, String(Date.now())); } catch (_) {}
+  spaxUpdateWakeLock();
+  spaxRegisterBackgroundSync();
+}
+function spaxClearPending() {
+  spaxSaveWanted = false;
+  try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
+  spaxUpdateWakeLock();
+  try {
+    if (typeof document !== 'undefined' && document.title && document.title.indexOf('⏳') === 0) {
+      document.title = document.title.replace(/^⏳\s*/, '');
+    }
+  } catch (_) {}
+  // If the queue drained while the app was hidden, say so out loud — the
+  // user may be sitting in another app waiting for it to be safe to return.
+  if (spaxHiddenDuringSave) {
+    spaxHiddenDuringSave = false;
+    spaxNotifySaveDone();
+  }
+}
+// Import/parse tasks (PDF parse, OCR, rebuild modal) hold the same lock as
+// saves so minimizing mid-import doesn't sleep the worker either.
+function spaxModalTask(running) {
+  spaxModalWanted = !!running;
+  spaxUpdateWakeLock();
+}
+function spaxRegisterBackgroundSync() {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.serviceWorker && typeof SyncManager !== 'undefined') {
+      navigator.serviceWorker.ready.then(reg => {
+        if (reg && reg.sync) reg.sync.register('spax-save').catch(() => {});
+      }).catch(() => {});
+    }
+  } catch (_) {}
+}
+function spaxNotifySaveDone() {
+  try {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted' &&
+        typeof navigator !== 'undefined' && navigator.serviceWorker && navigator.serviceWorker.ready) {
+      navigator.serviceWorker.ready.then(reg => {
+        if (reg && reg.showNotification) {
+          reg.showNotification('SpaxButchery — save complete', {
+            body: 'All changes are saved to the cloud. Safe to close the app.',
+            icon: 'icon-192.png', tag: 'spax-save-done'
+          }).catch(() => {});
+        }
+      }).catch(() => {});
+    }
+  } catch (_) {}
+}
+// Mirrors save progress into the tab title so it stays visible in the task
+// switcher while the app is covered by another app.
+function spaxTitleProgress(msg) {
+  try {
+    if (typeof document === 'undefined' || !document || !('title' in document)) return;
+    if (msg && String(msg).indexOf('⏳') >= 0) {
+      document.title = '⏳ ' + String(msg).replace(/\s+/g, ' ').slice(0, 80);
+    }
+  } catch (_) {}
+}
+// A save that never drained (page killed while minimized) resumes with one
+// forced push on the next boot. The flag is consumed FIRST so a failed resume
+// can't loop on every load; the new save re-marks it and clears it on drain.
+function spaxResumeInterruptedSave() {
+  let pending = null;
+  try { pending = localStorage.getItem(SPAX_PENDING_KEY); } catch (_) { pending = null; }
+  if (!pending) return false;
+  try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
+  if (typeof SYNC_MODE !== 'undefined' && SYNC_MODE === 'local') return false;
+  if (typeof toast === 'function') toast('🔄 Resuming the save that was interrupted…');
+  try { showSyncStatus('🔄 Resuming interrupted save…'); } catch (_) {}
+  try { saveToCloud(true, (typeof CLOUD_SAVE_NAMES !== 'undefined' ? CLOUD_SAVE_NAMES.save : '💾 Save')); } catch (_) {}
+  return true;
+}
+// Warn before the tab is closed mid-save; track hidden saves so the finish is
+// announced; re-hold the wake lock on return (the browser drops it on hide).
+try {
+  if (typeof window !== 'undefined' && window && window.addEventListener) {
+    window.addEventListener('beforeunload', (e) => {
+      try {
+        if (cloudSaveRunning || cloudSaveQueue.length) { e.preventDefault(); e.returnValue = ''; }
+      } catch (_) {}
+    });
+  }
+  if (typeof document !== 'undefined' && document && document.addEventListener) {
+    document.addEventListener('visibilitychange', () => {
+      try {
+        if (document.hidden) {
+          if (cloudSaveRunning || cloudSaveQueue.length) {
+            spaxHiddenDuringSave = true;
+            spaxRegisterBackgroundSync();
+          }
+        } else if (cloudSaveRunning || cloudSaveQueue.length) {
+          spaxUpdateWakeLock();
+        }
+      } catch (_) {}
+    });
+  }
+  if (typeof navigator !== 'undefined' && navigator.serviceWorker && navigator.serviceWorker.addEventListener) {
+    navigator.serviceWorker.addEventListener('message', (e) => {
+      try {
+        if (e && e.data && e.data.type === 'spax-resume-save') spaxResumeInterruptedSave();
+      } catch (_) {}
+    });
+  }
+} catch (_) {}
+
 // The names shown in the pill, in toasts and in the sync panel. Every save
 // that reaches the cloud is one of these, so nothing is ever "unknown".
 const CLOUD_SAVE_NAMES = {
@@ -1337,6 +1489,9 @@ function saveToCloud(force = false, name) {
   const job = { force: !!force, auto: !force, name: label, cancelled: false, resolve: resolveJob };
   if (!force) cloudSaveAutoPromise = promise;
   cloudSaveQueue.push(job);
+  // From here the save must survive minimizing/covering: hold the wake lock,
+  // plant the resume flag and register for Background Sync.
+  try { spaxMarkPending(); } catch (_) {}
   if (cloudSaveRunning) {
     // The running save started before these tasks arrived — refresh its label
     // so the pill names it AND the jobs now waiting behind it.
@@ -1387,6 +1542,9 @@ function cloudSavePump() {
     }
     cloudSavePos = 0;
     cloudSaveBatch = [];
+    // Nothing left to protect: release the wake lock, clear the resume flag
+    // and restore the tab title (announcing first if we finished hidden).
+    try { spaxClearPending(); } catch (_) {}
     return;
   }
   const job = cloudSaveQueue.shift();
@@ -1543,6 +1701,7 @@ async function performSaveToCloud(busyRetry = 0) {
         date: t.date || '',
         amount: t.amount || 0,
         product: t.product || '',
+        till: t.till || '',
         receipt: t.receipt || '',
         importedAt: t.importedAt || ''
       }));
@@ -1776,6 +1935,8 @@ function showSyncStatus(msg) {
   }
   el.textContent = msg;
   el.style.opacity = '1';
+  // Mirror in-progress saves into the tab title (task-switcher visibility).
+  try { spaxTitleProgress(msg); } catch (_) {}
   if (!msg.includes('⏳')) {
     setTimeout(() => { el.style.opacity = '0.6'; }, 3000);
   }
@@ -3723,7 +3884,10 @@ async function load(){
       // with the user's first deliberate push (Delete All / Force Push) and
       // made the backend look permanently busy — the "background save" was
       // this startup heal. The next real edit / Force Push carries the data.
+      // Exception: a previous session that died mid-save (minimized app killed
+      // by the OS) left the resume flag set — that save goes up now, once.
       if (healed > 0 || fixed > 0) persistDB();
+      try { spaxResumeInterruptedSave(); } catch (_) {}
       return cloudLoaded;
     }).catch(() => {
       refreshAll();
@@ -3731,6 +3895,7 @@ async function load(){
       const fixed = repairDates();
       if (fixed > 0) console.log('Date repair: fixed', fixed, 'customers');
       if (healed > 0 || fixed > 0) persistDB();
+      try { spaxResumeInterruptedSave(); } catch (_) {}
     });
   }catch(e){
     DB=await seedDB();
@@ -4330,9 +4495,82 @@ function customerIPI(c) {
 
 /* ══════════ PRODUCT CLASSIFICATION (Meat vs Soup) ══════════ */
 const SOUP_START_DATE = '2026-06-01';
-function classifyProduct(dateStr, amount){
+// From 6 Sept 2026 the RECEIVING TILL decides the product, not the amount:
+// every payment to Merchant 5803756 is Meat, and Soup (+ other small items)
+// is collected on Merchant 1213294. Rows before the split keep the legacy
+// amount heuristic (≤ KES 50 → soup), as do post-split rows whose till could
+// not be detected (e.g. a statement that names no till anywhere).
+const MEAT_TILL = '5803756';
+const SOUP_TILL = '1213294';
+const TILL_RULE_DATE = '2026-09-06';
+// Finds the receiving till in any free text: a Details cell, a statement
+// header ("Till Number 5803756"), or a file name. Returns MEAT_TILL,
+// SOUP_TILL, or '' when neither is mentioned.
+function extractTillNumber(text){
+  if(text === null || text === undefined) return '';
+  const s = String(text);
+  if(!s) return '';
+  if(s.indexOf(MEAT_TILL) !== -1) return MEAT_TILL;
+  if(s.indexOf(SOUP_TILL) !== -1) return SOUP_TILL;
+  return '';
+}
+// Pulls the till off a transaction-shaped object (a stored row carries .till;
+// a freshly parsed row may only have it inside .details / .source).
+function txTillNumber(tx){
+  if(!tx) return '';
+  if(typeof tx === 'string') return extractTillNumber(tx);
+  return String(tx.till || '') ||
+    extractTillNumber(tx.details || '') ||
+    extractTillNumber(tx.source || '');
+}
+function classifyProduct(dateStr, amount, txOrDetails){
+  const d = String(dateStr || '');
+  if(d && d >= TILL_RULE_DATE){
+    const till = txTillNumber(txOrDetails);
+    if(till === MEAT_TILL) return 'meat';
+    if(till === SOUP_TILL) return 'soup';
+    // Post-split row with no detectable till — fall back to the amount
+    // heuristic so it still lands somewhere sensible instead of defaulting.
+    return Number(amount) <= 50 ? 'soup' : 'meat';
+  }
   if(!dateStr || dateStr < SOUP_START_DATE) return 'meat';
   return amount <= 50 ? 'soup' : 'meat';
+}
+// Re-stamps every stored row dated on/after the till split whose product
+// disagrees with its till (e.g. rows imported by the amount rule before this
+// build learned the tills, then synced in with a till attached). Rows without
+// a detectable till are left alone — only a re-import of the Sept 6+
+// statements can tag those (see countTillUnknown). Idempotent; returns the
+// number of rows corrected.
+function reclassifyTillProducts(){
+  if(typeof DB === 'undefined' || !DB) return 0;
+  let fixed = 0;
+  const fixRow = (t) => {
+    if(!t) return;
+    const d = String(t.date || '');
+    if(!d || d < TILL_RULE_DATE) return;
+    const till = txTillNumber(t);
+    if(till !== MEAT_TILL && till !== SOUP_TILL) return;
+    const want = till === MEAT_TILL ? 'meat' : 'soup';
+    if(t.product !== want){ t.product = want; fixed++; }
+  };
+  (DB.transactions || []).forEach(fixRow);
+  Object.keys(DB.customerTx || {}).forEach(name => {
+    (DB.customerTx[name] || []).forEach(fixRow);
+  });
+  return fixed;
+}
+// Post-split rows that carry NO till (imported before till tagging, or from a
+// statement that names none). Shown in the Transactions tab as a nudge to
+// re-import the Sept 6+ statements so Meat/Soup is decided by till.
+function countTillUnknown(){
+  if(typeof DB === 'undefined' || !DB) return 0;
+  let n = 0;
+  (DB.transactions || []).forEach(t => {
+    const d = String((t && t.date) || '');
+    if(d && d >= TILL_RULE_DATE && !txTillNumber(t)) n++;
+  });
+  return n;
 }
 // Splits ONE customer's reconciled lifetime totals (c.spent / c.visits — see
 // CUSTOMER TALLY below) into meat vs soup. The itemised part of the total is
@@ -4347,7 +4585,9 @@ function customerProductSplit(c){
   let rowMeat = 0, rowSoup = 0, nMeat = 0, nSoup = 0;
   customerHistoryFor(c).forEach(t => {
     const a = Math.max(0, Number(t.amount) || 0);
-    const p = t.product || classifyProduct(t.date, a);
+    // Pass the row itself so a post-split row with a till but no stamped
+    // product still classifies by till (5803756 → meat, 1213294 → soup).
+    const p = t.product || classifyProduct(t.date, a, t);
     if (p === 'soup') { rowSoup += a; nSoup++; } else { rowMeat += a; nMeat++; }
   });
   const rowSum = rowMeat + rowSoup, rowN = nMeat + nSoup;
@@ -4895,6 +5135,10 @@ function mergeBaselineFields(a, b){
 }
 function repairDates(){
   let fixed = 0;
+  // Till-based products (6 Sept 2026+): re-stamp any stored row whose product
+  // disagrees with its till. Runs here so imports, merges, pulls and loads
+  // all converge on till-first classification.
+  try { fixed += reclassifyTillProducts(); } catch (_) {}
   // Remove any digits after a date EVERYWHERE it is stored (customers below,
   // plus transaction rows, per-customer history, ledgers, expenses and the
   // dedup seen-map) so no timestamp can ever reach the UI.
@@ -5633,10 +5877,14 @@ function renderTransactions(){
     (t.name||'').toLowerCase().includes(q) ||
     (t.phone||'').toLowerCase().includes(q) ||
     (t.receipt||'').toLowerCase().includes(q) ||
-    (t.date||'').toLowerCase().includes(q));
+    (t.date||'').toLowerCase().includes(q) ||
+    (t.till||'').toLowerCase().includes(q));
   rows=rows.filter(t=>{
     if(f==='meat')return t.product==='meat';
     if(f==='soup')return t.product==='soup';
+    if(f==='tillMeat')return (t.till||'')==='5803756';
+    if(f==='tillSoup')return (t.till||'')==='1213294';
+    if(f==='tillUnknown'){const d=String(t.date||'');return d && d>='2026-09-06' && !(t.till||'');}
     if(f==='pdf')return (t.source||'').includes('PDF');
     if(f==='csv')return (t.source||'').includes('CSV');
     if(f==='image')return (t.source||'').includes('Image');
@@ -5647,9 +5895,15 @@ function renderTransactions(){
     if(s==='amountAsc')return (a.amount||0)-(b.amount||0);
     return (b.date||'').localeCompare(a.date||'');});
   const totalAmt=rows.reduce((s,t)=>s+(t.amount||0),0);
-  $('txStats').innerHTML=`<b>${rows.length.toLocaleString()}</b> transaction(s) · ${kes(totalAmt)} total`;
+  let tillNote='';
+  try{
+    const unknown=countTillUnknown();
+    if(unknown>0) tillNote=` · ⚠️ <b>${unknown}</b> Sept 6+ row(s) have no till — re-import those statements so Meat/Soup is decided by till (5803756 🥩 / 1213294 🍲)`;
+  }catch(_){}
+  $('txStats').innerHTML=`<b>${rows.length.toLocaleString()}</b> transaction(s) · ${kes(totalAmt)} total${tillNote}`;
   $('txTable').querySelector('tbody').innerHTML = rows.length ? rows.map(t=>{
     const prod = t.product==='meat' ? '🥩 Meat' : t.product==='soup' ? '🍲 Soup' : '—';
+    const till = t.till ? `<span class="badge b-valid">${t.till}</span>` : '—';
     return `<tr>
     <td>${stripTime(t.date)||'—'}</td>
     <td>${t.name||'—'}</td>
@@ -5657,6 +5911,7 @@ function renderTransactions(){
     <td>${t.receipt||'—'}</td>
     <td>${kes(t.amount||0)}</td>
     <td>${prod}</td>
+    <td>${till}</td>
     <td>${t.source||'—'}</td></tr>`;}).join('')
     : '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:20px">No transactions match your filters</td></tr>';
 }
@@ -6347,6 +6602,11 @@ function parseMpesaText(raw, sourceLabel) {
   const text = normalizeMpesaText(raw).replace(/\n/g, " ").replace(/\s+/g, " ").trim();
   const txs = [];
   const seenKeys = new Set();
+  // Till-based products from 2026-09-06: a statement usually names the
+  // receiving till once in its header ("Till Number 5803756"), not on every
+  // row — detect it file-wide so rows without an explicit till still classify.
+  let fileTill = '';
+  try { fileTill = extractTillNumber(raw) || ''; } catch (_) { fileTill = ''; }
   // Every row a pass RECOGNIZED (imported OR intentionally skipped as
   // outgoing/charge) owns exactly one "Completed" word. The "possibly missed"
   // warning compares against this, not against txs.length, so intentionally
@@ -6512,6 +6772,14 @@ function parseMpesaText(raw, sourceLabel) {
       source: sourceLabel + " (fallback)"
     });
   }
+
+  // Stamp the receiving till on every row: a till named in the row's own
+  // Details wins, otherwise the file-level header till applies (a statement
+  // is for one till). Stored on import and decides Meat vs Soup from Sept 6.
+  txs.forEach(t => {
+    try { t.till = extractTillNumber(t.details) || fileTill || ''; }
+    catch (_) { t.till = fileTill || ''; }
+  });
 
   const completedCount = (text.match(/completed/gi) || []).length;
   // Only rows the regexes failed on can be genuinely missed — recognized rows
@@ -6861,7 +7129,10 @@ function importTransactions(txs, opts = {}) {
   };
 
   txFresh.forEach(tx => {
-    const product = classifyProduct(tx.date, tx.amount);
+    // The receiving till is stamped at parse time (row Details → file header →
+    // file name). From 6 Sept 2026 it — not the amount — decides Meat vs Soup.
+    const till = txTillNumber(tx);
+    const product = classifyProduct(tx.date, tx.amount, tx);
     const txAmount = Math.max(0, Number(tx.amount || 0));
     const normDate = stripTime(tx.date) || '';
     const nowISO = new Date().toISOString();
@@ -6872,11 +7143,12 @@ function importTransactions(txs, opts = {}) {
       name: tx.name || '',
       phone: normalizeContact(tx.phone || tx.contact || ''),
       product: product,
+      till: till,
       receipt: tx.receipt || '',
       source: tx.source || '',
       importedAt: nowISO
     });
-    const histRow = { date: normDate, amount: txAmount, product: product, receipt: tx.receipt || '', importedAt: nowISO };
+    const histRow = { date: normDate, amount: txAmount, product: product, till: till, receipt: tx.receipt || '', importedAt: nowISO };
 
     const date = txDate(tx);
     const match = findCustomerMatch(tx);
@@ -7438,6 +7710,9 @@ async function handleFiles(fileList) {
   const files = Array.from(fileList || []).filter(Boolean);
   if (!files.length) return;
 
+  // Hold the app active for the whole parse (scanned-PDF OCR takes minutes).
+  try { spaxModalTask(true); } catch (_) {}
+  try {
   const rows = [];
   let possibleMissed = 0;
   const errors = [];
@@ -7466,6 +7741,7 @@ async function handleFiles(fileList) {
   rows.possibleMissed = possibleMissed;
   showPreview(rows, files.length === 1 ? files[0].name : `${files.length} selected files`);
   if (errors.length) toast(`⚠️ ${errors.length} file(s) could not be read. The readable files are shown in the preview.`);
+  } finally { try { spaxModalTask(false); } catch (_) {} }
 }
 
 // Keep this single-file alias for any callers outside the multi-file picker.
@@ -7568,6 +7844,10 @@ async function parseAnyFile(file){
         .replace(/[-–—]/g,' ').replace(/\s+/g,' ').trim();
       const amt=parseAmount(pick(row,['Paid In','Credit','Amount','Paid in']));
       if(amt<=0||isMerchant(name)) return;
+      // Till decides Meat vs Soup from 6 Sept 2026 — read it off the Details
+      // cell, falling back to the file name (e.g. "Till 5803756 Aug.xlsx").
+      let csvTill='';
+      try { csvTill = extractTillNumber(det) || extractTillNumber(file && file.name) || ''; } catch(_){ csvTill=''; }
       out.push({
         receipt:pick(row,['Receipt','Receipt No','Transaction ID','Ref']),
         name:toTitleCase(name)||'Unknown',
@@ -7576,6 +7856,8 @@ async function parseAnyFile(file){
         visits:1,
         date:parseDate(pick(row,['Date','Completion Time','Transaction Date'])),
         time:String(pick(row,['Time','Completion Time'])||'').match(/(\d{2}:\d{2}:\d{2})/)?.[1]||'',
+        details:det,
+        till:csvTill,
         source:'CSV/Excel'
       });
     });
@@ -7669,12 +7951,17 @@ function parseSheetRows(raw) {
         .replace(/[-–—]/g, ' ').replace(/\s+/g, ' ').trim();
       const amt = parseFloat(('' + (r[iPaid] || 0)).replace(/[^\d.]/g, '')) || 0;
       if (isMerchant(name)) return;
+      // Till decides Meat vs Soup from 6 Sept 2026 — read it off Details.
+      let sheetTill = '';
+      try { sheetTill = extractTillNumber(det) || ''; } catch(_){ sheetTill = ''; }
       if (amt > 0 && (pm || name)) rows.push({
         receipt: iRcpt >= 0 ? ('' + (r[iRcpt] || '')) : '',
         name: toTitleCase(name) || 'Unknown',
         phone: pm ? normalizeContact(pm[0]) : '',
         amount: amt, visits: 1,
-        date: iDate >= 0 ? parseDate(r[iDate]) : '', time: ''
+        date: iDate >= 0 ? parseDate(r[iDate]) : '', time: '',
+        details: det,
+        till: sheetTill
       });
     });
   } else if (iName >= 0 && iAmt >= 0) {
@@ -7727,8 +8014,9 @@ function showPreview(rows, fmt) {
       tag = m ? `<span class="badge b-active">Existing — ${m.masked ? 'masked' : 'matched'}</span>`
         : '<span class="badge b-new">New customer</span>';
     }
+    const tillBadge = r.till ? `<span class="badge b-valid">${r.till}</span>` : '—';
     return `<tr style="${r.dup ? 'opacity:.45' : ''}"><td>${r.receipt || '—'}</td><td>${r.name}</td><td>${r.phone || '—'}</td>
-    <td>${kes(r.amount)}</td><td>${stripTime(r.date) || '—'}${r.time ? ' ' + r.time : ''}</td><td>${tag}</td></tr>`;
+    <td>${kes(r.amount)}</td><td>${stripTime(r.date) || '—'}${r.time ? ' ' + r.time : ''}</td><td>${tillBadge}</td><td>${tag}</td></tr>`;
   }).join('');
   $('previewCard').style.display = 'block';
   $('previewCard').scrollIntoView({ behavior: 'smooth' });
@@ -8880,9 +9168,15 @@ function updateSyncDetails(){
     : queuedNames.length
       ? `<span style="color:var(--amber)">⏳ Waiting to start: ${escHtml(queuedNames.join(', '))}</span>`
       : '<span style="color:var(--green)">Idle</span>';
+  const guardLine = (cloudSaveRunning || cloudSaveQueue.length)
+    ? (spaxWakeLock
+        ? '<span style="color:var(--green)">🔒 Holding active until done — safe to switch apps, don’t close the tab</span>'
+        : '<span style="color:var(--amber)">⏳ Save running (this browser can’t hold a wake lock — keep the tab open)</span>')
+    : '<span style="color:var(--muted)">Idle — nothing to protect</span>';
   el.innerHTML = `
     <b>Sync Mode:</b> ${mode}<br>
     <b>Saving Now:</b> ${savingLine}<br>
+    <b>Background guard:</b> ${guardLine}<br>
     <b>Last Sync:</b> ${lastSync}<br>
     <b>Local Customers:</b> ${DB.customers.length.toLocaleString()}<br>
     <b>Local Transactions:</b> ${(DB.transactions || []).length.toLocaleString()}<br>
@@ -8993,7 +9287,7 @@ function showCustomerDetail(name){
           <div style="display:flex;flex-direction:column;gap:4px;">
             ${monthTxs.map(t => `
               <div style="display:flex;justify-content:space-between;padding:6px 10px;background:rgba(255,255,255,.03);border-radius:4px;">
-                <span style="color:var(--muted);">${stripTime(t.date) || '—'} ${t.product==='soup'?'🍲':'🥩'}</span>
+                <span style="color:var(--muted);">${stripTime(t.date) || '—'} ${t.product==='soup'?'🍲':'🥩'}${t.till ? ` <span style="font-size:.72rem;opacity:.75">· ${t.till}</span>` : ''}</span>
                 <span style="font-weight:600;">${kes(t.amount)}</span>
               </div>
             `).join('')}
@@ -9029,7 +9323,8 @@ function backfillTransactions(txs){
     if (isSeen(tx)){ dupes++; return; }
     markSeen(tx);
 
-    const product = classifyProduct(tx.date, tx.amount);
+    const till = txTillNumber(tx);
+    const product = classifyProduct(tx.date, tx.amount, tx);
     const ntx = {
       date: stripTime(tx.date) || '',
       time: tx.time || '',
@@ -9037,6 +9332,7 @@ function backfillTransactions(txs){
       name: tx.name || '',
       phone: normalizeContact(tx.phone || tx.contact || ''),
       product: product,
+      till: till,
       receipt: tx.receipt || '',
       // Marks a history-only row: under storage pressure the quota path sheds
       // these global copies first (the per-customer history keeps them). It is
@@ -9058,6 +9354,7 @@ function backfillTransactions(txs){
         date: ntx.date,
         amount: ntx.amount,
         product: ntx.product,
+        till: ntx.till || '',
         receipt: ntx.receipt,
         importedAt: ntx.importedAt
       });
@@ -9117,6 +9414,7 @@ async function handleBackfill(input){
   input.value = '';
   if(files.length === 0) return;
   showSyncStatus('📥 Backfilling...');
+  try { spaxModalTask(true); } catch (_) {}
   try{
     let totalImported = 0, totalDupes = 0;
     for(const file of files){
@@ -9150,6 +9448,8 @@ async function handleBackfill(input){
     console.error(err);
     toast('❌ Backfill failed: ' + err.message);
     showSyncStatus('❌ Backfill failed');
+  }finally{
+    try { spaxModalTask(false); } catch (_) {}
   }
 }
 
@@ -9435,6 +9735,7 @@ function recalcFromHistory(){
 
 /* ══════════ IMPORT MODAL HELPERS ══════════ */
 function showImportModal(icon, title, body, pct){
+  try { spaxModalTask(true); } catch (_) {}
   $('importModal').style.display = 'flex';
   $('importModalIcon').textContent = icon || '⏳';
   $('importModalTitle').textContent = title || 'Importing…';
@@ -9450,6 +9751,7 @@ function updateImportModal(body, pct){
 }
 
 function finishImportModal(body){
+  try { spaxModalTask(false); } catch (_) {}
   $('importModalIcon').textContent = '✅';
   $('importModalTitle').textContent = 'Complete';
   $('importModalBody').innerHTML = body || 'Done';
@@ -9458,6 +9760,7 @@ function finishImportModal(body){
 }
 
 function closeImportModal(){
+  try { spaxModalTask(false); } catch (_) {}
   $('importModal').style.display = 'none';
 }
 

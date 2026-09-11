@@ -251,7 +251,7 @@ test('boot resumes a save a killed session left behind', () => {
 });
 
 test('the service worker never caches saves and handles background sync', () => {
-  assert.match(SW, /const CACHE_NAME = 'spax-v21';/);
+  assert.match(SW, /const CACHE_NAME = 'spax-v22';/);
   assert.match(SW, /event\.request\.method !== 'GET'/);
   assert.match(SW, /script\.google\.com/);
   assert.match(SW, /addEventListener\('sync'/);

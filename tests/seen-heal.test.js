@@ -83,12 +83,18 @@ test('healOrphanedSeenKeys tolerates a missing seen map', () => {
 });
 
 test('load path wires healOrphanedSeenKeys into startup and cloud merge', () => {
-  // The heal must run both after the cloud union (so a manual 🔄 sync also
+  // The heal must run both after the cloud merge (so a manual 🔄 sync also
   // heals) and after load() settles (local-only / cloud-failed paths).
   const loadTail = htmlSource.slice(
     htmlSource.indexOf('return loadFromCloud().then(cloudLoaded =>'),
     htmlSource.indexOf('}function save(){')
   );
   assert.match(loadTail, /healOrphanedSeenKeys\(\)/);
-  assert.match(htmlSource, /DB\.seen = \{\s*\.\.\.cloudSeen, \.\.\.localSeenSnap\};[\s\S]*?healOrphanedSeenKeys\(\);/);
+  // The guard is REBUILT from the merged transactions (it is no longer
+  // synced — the cloud seen sheet stays empty), and the merge must still be
+  // followed by the heal as the safety net.
+  assert.match(
+    htmlSource,
+    /DB\.seen = \{\};\s*\n\s*DB\.transactions\.forEach\(tx => \{ markSeen\(tx\); \}\);[\s\S]*?healOrphanedSeenKeys\(\);/
+  );
 });

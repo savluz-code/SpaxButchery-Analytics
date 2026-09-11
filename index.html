@@ -951,6 +951,10 @@ let lastCloudError = '';
 // session and every save then uses the single saveAll POST that has always
 // worked — syncing never hard-requires a Code.gs redeploy, and a chunked
 // backend deployed later is picked up automatically on the next session.
+// Interrupted uploads RESUME from the last acknowledged slice (see the
+// CHUNKED UPLOAD section below), and the derivable `seen` dedup table is
+// no longer uploaded at all — both cut the "large upload" that kept
+// restarting from zero on every boot.
 const CHUNK_ROWS = 2000; // rows per chunked upload request
 let cloudChunks = false;      // true once the backend proves it speaks the chunked actions
 let cloudChunkProbed = false; // one probe per session is enough
@@ -1114,7 +1118,6 @@ async function loadFromCloud() {
       const localMonthlySnap = DB.monthly && DB.monthly.labels ? {labels: DB.monthly.labels.slice(), revenue: DB.monthly.revenue.slice()} : {labels:[], revenue:[]};
       const localTxSnap = Array.isArray(DB.transactions) ? DB.transactions.slice() : [];
       const localCustTxSnap = DB.customerTx ? JSON.parse(JSON.stringify(DB.customerTx)) : {};
-      const localSeenSnap = DB.seen ? {...DB.seen} : {};
       const localResolvedSnap = Number(DB.resolved) || 0;
       const localImportBatchSnap = Number(DB.importBatch) || 0;
 
@@ -1201,13 +1204,19 @@ async function loadFromCloud() {
       });
       DB.customerTx = mergedCustTx;
 
-      // Seen map: union (local wins on overlap, both are 1 anyway)
-      const cloudSeen = (data.seen && typeof data.seen === 'object') ? data.seen : {};
-      DB.seen = {...cloudSeen, ...localSeenSnap};
-      if (!Object.keys(DB.seen).length && DB.transactions.length) {
-        DB.seen = {};
-        DB.transactions.forEach(tx=>{ markSeen(tx); });
-      }
+      // Seen map: rebuilt from the FINAL merged transactions, not unioned
+      // from a cloud copy. The guard is fully derivable from the rows it
+      // protects (markSeenInto writes the same key set an import would, and
+      // healOrphanedSeenKeys enforces that invariant on every boot), so the
+      // seen table is no longer synced at all — its sheet stays empty and
+      // every device rebuilds its guard from the transactions it holds.
+      // Rebuilding (rather than unioning) is also what makes a fresh
+      // device's guard complete after its first pull: cloud-only rows used
+      // to arrive without their keys unless the cloud sheet happened to
+      // carry them, and a re-import of the same statement would then
+      // double-book them.
+      DB.seen = {};
+      DB.transactions.forEach(tx => { markSeen(tx); });
       // Transactions are now final (local ∪ cloud): drop any seen-key that has
       // no backing transaction so re-importing a previously-lost statement
       // re-books its rows rather than skipping them as "already imported".
@@ -1383,7 +1392,7 @@ function spaxResumeInterruptedSave() {
   if (!pending) return false;
   try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
   if (typeof SYNC_MODE !== 'undefined' && SYNC_MODE === 'local') return false;
-  if (typeof toast === 'function') toast('🔄 Resuming the save that was interrupted…');
+  if (typeof toast === 'function') toast('🔄 Resuming the save that was interrupted — it continues from where it stopped; keep the app open until the pill shows ✅');
   try { showSyncStatus('🔄 Resuming interrupted save…'); } catch (_) {}
   try { saveToCloud(true, (typeof CLOUD_SAVE_NAMES !== 'undefined' ? CLOUD_SAVE_NAMES.save : '💾 Save')); } catch (_) {}
   return true;
@@ -1583,6 +1592,10 @@ function cloudSavePump() {
 // what was cut short instead of "another save".
 function cloudSavePreempt(reasonName) {
   const stopped = [];
+  // A pre-empted upload is dead: the save taking over pushes its own state
+  // and must never continue the stopped upload's staging area — even if the
+  // data happens to be identical, the takeover owns the slot from here.
+  try { spaxClearUploadSession(); } catch (_) {}
   const running = cloudSaveRunningJob;
   if (running) {
     stopped.push(running.name);
@@ -1674,11 +1687,17 @@ async function performSaveToCloud(busyRetry = 0) {
       customerTx: Object.fromEntries(
         Object.entries(DB.customerTx || {}).filter(([name]) => !isMerchant(name))
       ),
-      // Send the dedup map verbatim (same format as transactionKey) so every
-      // device restores an identical guard. Previously the seen-map was flattened
-      // into fake transaction rows, which corrupted the cloud transactions list
-      // and produced keys ('R:'/'C:') that never matched the local guard format.
-      seen: DB.seen || {},
+      // The `seen` dedup map is NOT uploaded. It is fully derivable from the
+      // transactions table (every key is written by markSeenInto at import
+      // time, and healOrphanedSeenKeys enforces seen ≡ derive(transactions)
+      // on every boot), so syncing it re-sent ~half the database on every
+      // save — thousands of rows that could never carry information the
+      // transactions sheet doesn't already hold. The cloud copy is left
+      // empty and every device rebuilds its guard from the transactions it
+      // holds on load. Backends already tolerate the absent table: saveAll
+      // stages `body.seen || {}`, and saveCommit counts `expect.seen || 0`
+      // against a staging sheet that saveBegin just reset — no Code.gs
+      // redeploy is required for this change.
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
 
@@ -1706,13 +1725,11 @@ async function performSaveToCloud(busyRetry = 0) {
         importedAt: t.importedAt || ''
       }));
     });
-    const seenRows = Object.keys(payload.seen).map(k => ({ key: k, value: 1 }));
     const bigTables = {
       transactions: payload.transactions,
-      customerTx: ctxRows,
-      seen: seenRows
+      customerTx: ctxRows
     };
-    const totalBigRows = bigTables.transactions.length + ctxRows.length + seenRows.length;
+    const totalBigRows = bigTables.transactions.length + ctxRows.length;
 
     // Large payloads try the chunked upload first — but only if the backend is
     // known (or not yet known) to support it. A saveAll-only backend answers
@@ -1770,6 +1787,9 @@ async function performSaveToCloud(busyRetry = 0) {
       }
     }
     if (result.success) {
+      // saveAll swapped every live sheet for a freshly staged copy, so any
+      // half-finished chunked session's staging area is gone with it.
+      try { spaxClearUploadSession(); } catch (_) {}
       lastSyncTime = new Date();
       showSyncStatus(cloudSaveDoneMessage());
       lastCloudError = '';
@@ -1823,7 +1843,7 @@ async function performSaveToCloud(busyRetry = 0) {
 
 // ── CHUNKED UPLOAD ──
 // saveBegin  → small tables (customers/monthly/settings) + staging reset
-// saveChunk  → one slice of a big table (transactions/customerTx/seen),
+// saveChunk  → one slice of a big table (transactions/customerTx),
 //              numbered with a per-table `seq`
 // saveCommit → backend verifies every promised row landed before it swaps the
 //              staging sheets over the live ones, so a dropped connection
@@ -1833,7 +1853,169 @@ async function performSaveToCloud(busyRetry = 0) {
 // already seen, so a slice delivered twice (a retry, a proxy replay, the app
 // open in two tabs) no longer inflates the staged row count and fails the
 // commit with "chunk mismatch … staged N rows, expected M".
+//
+// ── INTERRUPTED UPLOADS RESUME WHERE THEY STOPPED ──
+// A big database takes many minutes to upload on weak mobile signal, and a
+// phone regularly kills the tab long before the commit. Restarting from zero
+// on every boot is why "Resuming the interrupted save…" could go on forever:
+// the upload needed more CONTINUOUS foreground time than the user ever gave
+// it, so it never finished. The upload session (uploadId, per-table seq
+// cursors, promised counts and a fingerprint of the data being sent) is
+// therefore persisted to localStorage after every acknowledged slice, and the
+// next save — including the automatic resume on boot — CONTINUES from the
+// last acknowledged slice against the same staging sheets instead of
+// replaying the whole database. A session the server no longer recognises
+// (another device saved over the staging area, the promised counts no longer
+// match the data, the session is stale) is discarded and the save restarts
+// from saveBegin exactly as before, so the resume path can never lose data —
+// the commit's row-count verification remains the safety net.
+const SPAX_UPLOAD_SESSION_KEY = 'spaxUploadSession';
+const CHUNK_SESSION_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+// Cheap fingerprint of a big table's CONTENT (not just its size): row count,
+// cents-sum of amounts and a rolling hash over the identifying field. A DB
+// that changed in any way (import, Delete All, cloud merge) produces a
+// different basis, so a stale session can never resume over different data.
+function spaxTableBasis(rows) {
+  let sum = 0, h = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i] || {};
+    sum += Number(r.amount) || 0;
+    const s = String(r.receipt || r.customer || r.key || r.date || '');
+    for (let j = 0; j < s.length; j++) { h = (h * 31 + s.charCodeAt(j)) | 0; }
+  }
+  return rows.length + ':' + Math.round(sum * 100) + ':' + (h >>> 0);
+}
+
+function spaxLoadUploadSession() {
+  try { return JSON.parse(localStorage.getItem(SPAX_UPLOAD_SESSION_KEY) || 'null'); } catch (_) { return null; }
+}
+function spaxSaveUploadSession(session) {
+  try { localStorage.setItem(SPAX_UPLOAD_SESSION_KEY, JSON.stringify(session)); } catch (_) {}
+}
+function spaxClearUploadSession() {
+  try { localStorage.removeItem(SPAX_UPLOAD_SESSION_KEY); } catch (_) {}
+}
+
+// A persisted session is only usable when it describes THIS database (same
+// fingerprint, same promised counts), is fresh enough that the server's
+// staging area plausibly still holds its slices, and its cursors point at
+// slices that still exist. Anything else falls back to a full saveBegin.
+function spaxSessionUsable(session, bigTables, expect, basis, tables) {
+  if (!session || !session.cursors || !session.expect || !session.basis) return false;
+  if (session.uploadId === undefined || session.uploadId === null) return false;
+  if (Date.now() - (Number(session.ts) || 0) > CHUNK_SESSION_MAX_AGE_MS) return false;
+  for (let i = 0; i < tables.length; i++) {
+    const t = tables[i];
+    if (Number(session.expect[t]) !== expect[t]) return false;
+    if (session.basis[t] !== basis[t]) return false;
+    const cursor = Number(session.cursors[t]) || 0;
+    // A cursor may legitimately equal the slice count ("everything sent,
+    // the commit never happened") — that session resumes straight to the
+    // commit. Beyond that it describes a database this save cannot have.
+    if (cursor < 0 || cursor > Math.ceil(bigTables[t].length / CHUNK_ROWS)) return false;
+  }
+  return true;
+}
+
+// Errors that mean the server no longer holds (or no longer accepts) this
+// session's staging area: another saveBegin superseded it, the staging sheets
+// were reset under it, or the staged counts no longer match the promise. All
+// of them are answered by restarting the save from saveBegin — never by
+// failing the user's data.
+function isDeadUploadSessionError(msg) {
+  return /no upload in progress|superseded by a newer save|chunk mismatch/i.test(String(msg || ''));
+}
+
+// Sends every slice still owed (from the session's cursors) and commits.
+// Each acknowledged slice advances and re-persists the session, so a page
+// death at ANY point leaves a valid resume point behind.
+async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tables) {
+  for (const table of tables) {
+    const rows = bigTables[table];
+    let seq = Number(session.cursors[table]) || 0;
+    for (let i = seq * CHUNK_ROWS; i < rows.length; i += CHUNK_ROWS, seq++) {
+      // Check between slices rather than relying on the abort alone: a cancel
+      // that lands while this slice is in flight must stop the NEXT one, so a
+      // pre-empting save never waits for the rest of a long upload.
+      if (cloudSaveIsCancelled()) throw cloudSaveCancelledError();
+      const slice = rows.slice(i, i + CHUNK_ROWS);
+      let res;
+      try {
+        res = await post({ action: 'saveChunk', table, rows: slice, uploadId: session.uploadId, seq }, CLOUD_TIMEOUT_CHUNK);
+      } catch (err) {
+        // cloudRequest throws on success:false, so app-level refusals (a
+        // superseded uploadId, a reset staging area) arrive here — flag them
+        // so the caller can restart from saveBegin instead of failing.
+        if (err && isDeadUploadSessionError(err.message)) err.spaxSessionDead = true;
+        throw err;
+      }
+      if (!res.success) {
+        const err = new Error(res.error || ('Chunk failed on ' + table));
+        if (isDeadUploadSessionError(err.message)) err.spaxSessionDead = true;
+        throw err;
+      }
+      session.cursors[table] = seq + 1;
+      session.sent = (Number(session.sent) || 0) + slice.length;
+      session.ts = Date.now();
+      spaxSaveUploadSession(session);
+      // Absolute rows, not just a percentage: on a multi-minute upload the
+      // user needs to see the counter moving to know it is worth keeping the
+      // app open.
+      showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · ' +
+        Math.round(session.sent / totalBigRows * 100) + '% · ' +
+        session.sent.toLocaleString() + '/' + totalBigRows.toLocaleString() + ' rows');
+    }
+  }
+
+  // The backend verifies the staged row counts before it swaps anything in,
+  // so a lost chunk aborts the commit and leaves the good data in place.
+  let commit;
+  try {
+    commit = await post({ action: 'saveCommit', expect: session.expect, uploadId: session.uploadId });
+  } catch (err) {
+    if (err && isDeadUploadSessionError(err.message)) err.spaxSessionDead = true;
+    throw err;
+  }
+  if (commit.success) {
+    spaxClearUploadSession();
+    lastSyncTime = new Date();
+    showSyncStatus(cloudSaveDoneMessage());
+    lastCloudError = '';
+    cloudStoppedUpload = null; // this device's stopped upload is no longer the suspect
+    return true;
+  }
+  const err = new Error(commit.error || 'Cloud rejected the save');
+  if (isDeadUploadSessionError(err.message)) err.spaxSessionDead = true;
+  throw err;
+}
+
 async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
+  const tables = ['transactions', 'customerTx'];
+  const expect = {};
+  const basis = {};
+  tables.forEach(t => { expect[t] = bigTables[t].length; basis[t] = spaxTableBasis(bigTables[t]); });
+
+  // Resume an interrupted upload if — and only if — the database it describes
+  // is byte-for-byte the one this save is about to send.
+  const saved = spaxLoadUploadSession();
+  if (spaxSessionUsable(saved, bigTables, expect, basis, tables)) {
+    showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · resuming interrupted upload — keep the app open');
+    try {
+      return await spaxRunChunkedUpload(post, saved, bigTables, totalBigRows, tables);
+    } catch (err) {
+      if (err && err.spaxSessionDead) {
+        // The server no longer holds that staging area. Start over — this is
+        // not a failure of the save, only of the shortcut.
+        spaxClearUploadSession();
+      } else {
+        // Network/timeout: the cursors were persisted after every ack, so the
+        // next save picks up from the last acknowledged slice.
+        throw err;
+      }
+    }
+  }
+
   showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · large upload, sending in parts');
   let begin;
   try {
@@ -1860,42 +2042,24 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
   // Backend v3.0 mints an uploadId per upload session so a second device's
   // save can't interleave slices with ours. Older backends return none —
   // echo '' and they ignore the field.
-  const uploadId = begin && begin.uploadId ? String(begin.uploadId) : '';
-
-  const expect = {};
-  let sent = 0;
-  for (const table of ['transactions', 'customerTx', 'seen']) {
-    const rows = bigTables[table];
-    expect[table] = rows.length;
-    // `seq` numbers this table's slices within this upload session. The
-    // backend skips a slice it has already staged, so a request delivered
-    // twice (a retry, a proxy replay, the app open in two tabs) can no longer
-    // double the staged row count and fail the commit with "staged N rows,
-    // expected M". Older backends ignore the extra field.
-    for (let i = 0, seq = 0; i < rows.length; i += CHUNK_ROWS, seq++) {
-      // Check between slices rather than relying on the abort alone: a cancel
-      // that lands while this slice is in flight must stop the NEXT one, so a
-      // pre-empting save never waits for the rest of a long upload.
-      if (cloudSaveIsCancelled()) throw cloudSaveCancelledError();
-      const slice = rows.slice(i, i + CHUNK_ROWS);
-      const res = await post({ action: 'saveChunk', table, rows: slice, uploadId, seq }, CLOUD_TIMEOUT_CHUNK);
-      if (!res.success) throw new Error(res.error || ('Chunk failed on ' + table));
-      sent += slice.length;
-      showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · ' + Math.round(sent / totalBigRows * 100) + '%');
-    }
+  const session = {
+    v: 1,
+    uploadId: begin && begin.uploadId ? String(begin.uploadId) : '',
+    ts: Date.now(),
+    expect,
+    basis,
+    cursors: { transactions: 0, customerTx: 0 },
+    sent: 0
+  };
+  spaxSaveUploadSession(session);
+  try {
+    return await spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tables);
+  } catch (err) {
+    // A session the server refuses is useless — clear it so the next save
+    // starts clean instead of resuming into the same refusal.
+    if (err && err.spaxSessionDead) spaxClearUploadSession();
+    throw err;
   }
-
-  // The backend verifies the staged row counts before it swaps anything in,
-  // so a lost chunk aborts the commit and leaves the good data in place.
-  const commit = await post({ action: 'saveCommit', expect, uploadId });
-  if (commit.success) {
-    lastSyncTime = new Date();
-    showSyncStatus(cloudSaveDoneMessage());
-    lastCloudError = '';
-    cloudStoppedUpload = null; // this device's stopped upload is no longer the suspect
-    return true;
-  }
-  throw new Error(commit.error || 'Cloud rejected the save');
 }
 
 // A save may fail without touching any sheet when another device/tab owns
@@ -9102,13 +9266,12 @@ async function forcePullFromCloud(){
     if(data.customerTx){
       DB.customerTx = data.customerTx;
     }
-    // Restore the dedup map in the local key format so re-imports stay guarded
-    if(data.seen && typeof data.seen === 'object' && Object.keys(data.seen).length){
-      DB.seen = data.seen;
-    } else if(data.transactions){
-      DB.seen = {};
-      data.transactions.forEach(tx => { markSeen(tx); });
-    }
+    // Restore the dedup map by REBUILDING it from the pulled transactions —
+    // the guard is derivable from the rows it protects and is no longer
+    // synced (see performSaveToCloud). Ignoring any stale cloud copy also
+    // means a pull can never import phantom keys for rows that were wiped.
+    DB.seen = {};
+    (data.transactions || []).forEach(tx => { markSeen(tx); });
 
     sanitizeNegativeTotals();
     repairDates(); // re-derive spent/visits from the pulled baseline + history

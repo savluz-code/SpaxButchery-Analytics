@@ -25,6 +25,17 @@
  *     90 s load, 180 s one-shot big save) instead of a blanket 30 s.
  *   • Saves are serialized client-side so two POSTs never fight over the
  *     backend script lock.
+ *   • The `seen` dedup map is NOT uploaded: it is derivable from the
+ *     transactions table (healOrphanedSeenKeys enforces that invariant on
+ *     every boot), so syncing it re-sent ~half the database on every save.
+ *     The cloud sheet stays empty and every device rebuilds its guard from
+ *     the transactions it holds on load.
+ *   • An interrupted upload RESUMES from the last acknowledged slice: the
+ *     upload session (uploadId, per-table seq cursors, promised counts and
+ *     a fingerprint of the data) is persisted after every ack, so the
+ *     "Resuming the interrupted save…" on boot continues the upload instead
+ *     of restarting the whole database from zero — the loop that made big
+ *     saves look like they never end.
  *
  * Backend behaviour itself is pinned in tests/gas-backend.test.js.
  */
@@ -211,21 +222,24 @@ test('large save uses saveBegin → saveChunk×N → saveCommit on a chunk-capab
   assert.strictEqual(begin.seen, undefined);
 
   // The big tables are sliced, in a stable order, never over CHUNK_ROWS.
+  // `seen` is deliberately absent: the dedup map is derivable from the
+  // transactions table, so it is no longer uploaded (the cloud sheet stays
+  // empty and each device rebuilds its guard on load).
   const chunks = cloud.calls.filter((c) => c.action === 'saveChunk');
   assert.deepStrictEqual(
     chunks.map((c) => c.table),
-    ['transactions', 'transactions', 'customerTx', 'seen']
+    ['transactions', 'transactions', 'customerTx']
   );
   chunks.forEach((c) => assert.ok(c.rows.length <= 2000, 'chunk over CHUNK_ROWS: ' + c.rows.length));
   assert.strictEqual(chunks.filter((c) => c.table === 'transactions').flatMap((c) => c.rows).length, 3000);
   assert.strictEqual(chunks.filter((c) => c.table === 'customerTx').flatMap((c) => c.rows).length, 50);
-  assert.strictEqual(chunks.filter((c) => c.table === 'seen').flatMap((c) => c.rows).length, 100);
+  assert.strictEqual(chunks.filter((c) => c.table === 'seen').length, 0, 'the seen map must not be uploaded');
+  cloud.calls.forEach((c) => assert.strictEqual(c.seen, undefined, c.action + ' must not carry a seen table'));
 
   // saveCommit promises exactly what was sent.
   assert.deepStrictEqual(cloud.calls[cloud.calls.length - 1].expect, {
     transactions: 3000,
-    customerTx: 50,
-    seen: 100
+    customerTx: 50
   });
 
   // Live progress is shown and the capability is remembered.
@@ -263,10 +277,10 @@ test('every slice carries a per-table seq, so the backend can recognise a replay
   assert.strictEqual(first, true);
 
   const chunks = cloud.calls.filter((c) => c.action === 'saveChunk');
-  // 3000 transactions → 2 slices, then customerTx (50) and seen (100) → 1 each.
+  // 3000 transactions → 2 slices, then customerTx (50) → 1.
   assert.deepStrictEqual(
     chunks.map((c) => [c.table, c.seq]),
-    [['transactions', 0], ['transactions', 1], ['customerTx', 0], ['seen', 0]]
+    [['transactions', 0], ['transactions', 1], ['customerTx', 0]]
   );
   assert.ok(chunks.every((c) => Number.isInteger(c.seq)), 'seq must be a number, not undefined');
 });
@@ -304,7 +318,7 @@ test('a saveAll-only backend still saves: probe falls back to one full saveAll P
   assert.strictEqual(save.action, 'saveAll');
   assert.strictEqual(save.customers.length, 1);
   assert.strictEqual(save.transactions.length, 3000);
-  assert.strictEqual(Object.keys(save.seen).length, 100);
+  assert.strictEqual(save.seen, undefined, 'the one-shot save must not carry the derivable seen map either');
   assert.strictEqual(save.customerTx.C0.length, 1);
 
   // The second large save in the same session skips the doomed probe.
@@ -532,7 +546,13 @@ test('a backend-busy response retries a small save automatically', async () => {
   assert.ok(status.some((message) => /retrying/.test(message)), 'the retry should be visible');
 });
 
-test('a busy response during a chunked upload restarts from saveBegin', async () => {
+test('a busy response during a chunked upload resumes the same session once the lock frees', async () => {
+  // "backend busy" means the backend refused the request WITHOUT touching the
+  // staging area (waitLock honouring), so the retry has nothing to reset: it
+  // picks the upload back up from the last acknowledged slice and continues
+  // under the same uploadId. A writer that DID reset the staging area is
+  // caught by the server (supersession / commit count check) and answered
+  // with a fresh saveBegin — that path is pinned below.
   const cloud = makeCloud({ chunked: true });
   const inner = cloud.fetchImpl;
   let busy = true;
@@ -554,8 +574,12 @@ test('a busy response during a chunked upload restarts from saveBegin', async ()
   assert.strictEqual(lastCloudError, '');
   const actions = cloud.calls.map((c) => c.action);
   assert.strictEqual(actions[0], 'saveBegin');
-  assert.strictEqual(actions[1], 'saveChunk');
-  assert.strictEqual(actions[2], 'saveBegin', 'retry must reset the chunked upload');
+  assert.strictEqual(actions[1], 'saveChunk', 'the busy refusal happens on the first slice');
+  assert.strictEqual(
+    actions.filter((a) => a === 'saveBegin').length,
+    1,
+    'a refused-before-write busy needs no fresh saveBegin — the session resumes'
+  );
   assert.strictEqual(actions[actions.length - 1], 'saveCommit');
 });
 
@@ -617,6 +641,111 @@ test('busy retries keep isSyncing true so a concurrent save cannot start', async
   assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 0);
   // One failed attempt ×2 busy, then one success — never two concurrent POSTs.
   assert.ok(cloud.calls.filter((c) => c.action === 'saveAll').length >= 3);
+});
+
+/* ── interrupted uploads resume from the last acknowledged slice ─────────── */
+
+test('an upload interrupted mid-flight resumes from the last acknowledged slice', async () => {
+  // The phone kills the tab mid-upload (the 3rd slice dies). The next save
+  // must CONTINUE from the slice that was never acknowledged — not restart
+  // the whole database from saveBegin, which is what made "Resuming the
+  // interrupted save…" go on forever: the upload needed more continuous
+  // foreground time than the user ever gave it, so starting over never won.
+  const cloud = makeCloud({ chunked: true, failChunk: 3 });
+  const db = bigDB();
+  const run1 = await runClient(cloud, db);
+  assert.strictEqual(run1.first, false, 'the interrupted save fails');
+  assert.match(run1.lastCloudError, /chunk write failed/);
+  // The session survived: both transactions slices (2,000 + 1,000 rows)
+  // acknowledged, customerTx never started.
+  const session = JSON.parse(cloud.store.spaxUploadSession);
+  assert.deepStrictEqual(session.cursors, { transactions: 2, customerTx: 0 });
+  assert.strictEqual(session.sent, 3000);
+
+  // Where run 1's requests end — everything after this is the resumed save.
+  const callsAfterRun1 = cloud.calls.length;
+  const run2 = await runClient(cloud, db);
+  assert.strictEqual(run2.first, true, 'the resumed save completes');
+  assert.ok(run2.status.some((m) => /resuming interrupted upload/.test(m)), 'the resume must be announced');
+  // Exactly ONE saveBegin across both runs — the second save never restarted.
+  assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveBegin').length, 1);
+  // Run 2 sends exactly ONE slice — the one that was never acknowledged —
+  // and then commits. The two acknowledged slices are not re-sent.
+  const run2Calls = cloud.calls.slice(callsAfterRun1);
+  assert.deepStrictEqual(
+    run2Calls.map((c) => c.action),
+    ['saveChunk', 'saveCommit'],
+    'the resumed save must be one owed slice + the commit, nothing more'
+  );
+  assert.deepStrictEqual([run2Calls[0].table, run2Calls[0].seq], ['customerTx', 0]);
+  assert.deepStrictEqual(run2Calls[1].expect, { transactions: 3000, customerTx: 50 });
+  // Progress is legible in absolute rows, not just a percentage.
+  assert.ok(run2.status.some((m) => /3,050\/3,050 rows/.test(m)), 'progress must show absolute rows');
+  // A finished upload leaves no session behind.
+  assert.strictEqual(cloud.store.spaxUploadSession, undefined);
+});
+
+test('a session the server no longer holds falls back to a fresh saveBegin', async () => {
+  const cloud = makeCloud({ chunked: true, failChunk: 1 });
+  const db = bigDB();
+  const run1 = await runClient(cloud, db);
+  assert.strictEqual(run1.first, false);
+  assert.ok(cloud.store.spaxUploadSession, 'session persisted after the interrupted upload');
+
+  // Another device saveBegin'd in the meantime: our uploadId is stale and
+  // the server answers the commit with "upload superseded by a newer save".
+  // That must not fail the save — it restarts from saveBegin, in the same
+  // save, and still lands the data.
+  const session = JSON.parse(cloud.store.spaxUploadSession);
+  session.uploadId = 'someone-elses-upload';
+  session.cursors = { transactions: 2, customerTx: 1 }; // everything "sent"
+  cloud.store.spaxUploadSession = JSON.stringify(session);
+
+  const run2 = await runClient(cloud, db);
+  assert.strictEqual(run2.first, true, 'the save recovers by restarting from saveBegin');
+  const actions = cloud.calls.map((c) => c.action);
+  assert.strictEqual(actions.filter((a) => a === 'saveBegin').length, 2, 'the fallback starts a fresh session');
+  assert.strictEqual(actions.filter((a) => a === 'saveCommit').length, 2, 'the superseded commit was attempted first');
+  assert.strictEqual(actions[actions.length - 1], 'saveCommit');
+  assert.strictEqual(cloud.store.spaxUploadSession, undefined, 'the finished save leaves no session behind');
+});
+
+test('a database that changed since the session started does not resume', async () => {
+  const cloud = makeCloud({ chunked: true, failChunk: 1 });
+  const db = bigDB();
+  const run1 = await runClient(cloud, db);
+  assert.strictEqual(run1.first, false);
+  assert.ok(cloud.store.spaxUploadSession);
+
+  // The user imported more rows before the retry: the fingerprint no longer
+  // matches, so resuming the old session would stitch two different
+  // snapshots into one sheet.
+  db.transactions.push({ date: '2026-09-11', time: '09:00:00', amount: 420, name: 'C9', phone: '254799', receipt: 'R9Z' });
+
+  const run2 = await runClient(cloud, db);
+  assert.strictEqual(run2.first, true);
+  assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveBegin').length, 2,
+    'a changed database must start a fresh upload, not resume');
+  assert.ok(!run2.status.some((m) => /resuming interrupted upload/.test(m)), 'no resume may be attempted');
+  assert.deepStrictEqual(cloud.calls[cloud.calls.length - 1].expect, { transactions: 3001, customerTx: 50 });
+});
+
+test('a successful one-shot saveAll discards any interrupted chunked session', async () => {
+  const cloud = makeCloud({ chunked: true, failChunk: 1 });
+  const db = bigDB();
+  const run1 = await runClient(cloud, db);
+  assert.strictEqual(run1.first, false);
+  assert.ok(cloud.store.spaxUploadSession, 'session persisted after the interrupted upload');
+
+  // The database shrinks below the chunk threshold (Delete All, or a smaller
+  // rebuild): the save goes up as ONE saveAll whose swap wiped the staging
+  // area — the stale session must not survive it.
+  db.transactions = db.transactions.slice(0, 10);
+  db.customerTx = {};
+  const run2 = await runClient(cloud, db);
+  assert.strictEqual(run2.first, true);
+  assert.strictEqual(cloud.calls[cloud.calls.length - 1].action, 'saveAll');
+  assert.strictEqual(cloud.store.spaxUploadSession, undefined, 'saveAll swapped every sheet — the session is dead');
 });
 
 /* ── source-level pins ───────────────────────────────────────────────────── */

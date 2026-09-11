@@ -1,4 +1,4 @@
-const CACHE_NAME = 'spax-v21';
+const CACHE_NAME = 'spax-v22';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

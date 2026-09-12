@@ -75,17 +75,51 @@ function syncLayerSource() {
  * error — a transient failure that must fall back to saveAll without
  * poisoning the capability cache.
  */
-function makeCloud({ chunked = true, uploadIds = true, failChunk = 0, dropChunk = 0, doubleSend = 0, failBeginTimes = 0 } = {}) {
+function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDeltaMode = false, failChunk = 0, dropChunk = 0, doubleSend = 0, failBeginTimes = 0 } = {}) {
   const calls = [];
   const staged = { transactions: [], customerTx: [], seen: [] };
   const stagedSeqs = new Set(); // (table, seq) pairs already staged this session
   const store = {};
+  // What the LIVE Transactions sheet holds. Full saves replace it (swap);
+  // deltas append with identity dedup.
+  const live = { transactions: [], mode: 'full' };
   let chunkNo = 0;
   let beginNo = 0;
   const respond = (body) => ({ ok: true, text: async () => JSON.stringify(body) });
+  const txKey = (r) => {
+    const rc = String(r.receipt || '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    if (rc) return 'R|' + rc + '|' + String(r.date || '') + '|' + (r.time || '');
+    return 'C|' + String(r.date || '') + '|' + (r.time || '') + '|' + (Number(r.amount) || 0) + '|' + String(r.name || '') + '|' + String(r.phone || r.contact || '');
+  };
+  // Same identity set the real v3.4 backend builds (receipt rows also match
+  // the time-less variant after a cloud round-trip).
+  const identitiesOf = (r) => {
+    const rc = String(r.receipt || '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    if (!rc) return [txKey(r)];
+    const d = String(r.date || '');
+    return ['R|' + rc + '|' + d + '|' + (r.time || ''), 'R|' + rc + '|' + d + '|'];
+  };
+  const appendLive = (rows) => {
+    const have = new Set();
+    live.transactions.forEach((r) => identitiesOf(r).forEach((k) => have.add(k)));
+    let added = 0, skipped = 0;
+    rows.forEach((r) => {
+      const keys = identitiesOf(r);
+      if (keys.some((k) => have.has(k))) { skipped += 1; return; }
+      keys.forEach((k) => have.add(k));
+      live.transactions.push(r);
+      added += 1;
+    });
+    return { added, skipped };
+  };
   const fetchImpl = async (url, options) => {
     const body = options && options.body ? JSON.parse(options.body) : {};
     calls.push(body);
+    if (body.action === 'saveDelta') {
+      if (!delta) return respond({ success: false, error: 'unknown action' });
+      const result = appendLive(body.txAdd || []);
+      return respond({ success: true, added: result.added, skippedDuplicates: result.skipped, transactions: live.transactions.length });
+    }
     if (body.action === 'saveBegin') {
       if (!chunked) return respond({ success: false, error: 'unknown action' });
       beginNo += 1;
@@ -93,10 +127,21 @@ function makeCloud({ chunked = true, uploadIds = true, failChunk = 0, dropChunk 
       // A new upload session stages from empty, exactly like the real backend.
       staged.transactions = []; staged.customerTx = []; staged.seen = [];
       stagedSeqs.clear();
-      return respond({ success: true, ...(uploadIds ? { uploadId: 'upload-123' } : {}) });
+      live.mode = body.mode === 'delta' ? 'delta' : 'full';
+      // A pre-v3.4 chunked backend accepts saveBegin but silently ignores the
+      // unknown `mode` field: it answers WITHOUT the delta echo, which is how
+      // the client tells the two apart.
+      const wantsDelta = body.mode === 'delta';
+      const echoDelta = wantsDelta && delta && !ignoreDeltaMode;
+      return respond({ success: true, ...(uploadIds ? { uploadId: 'upload-123' } : {}), ...(echoDelta ? { delta: true } : {}) });
     }
     if (body.action === 'saveChunk') {
       chunkNo += 1;
+      // v3.4: a delta session appends transactions — the derivable caches
+      // never ride one.
+      if (live.mode === 'delta' && body.table !== 'transactions') {
+        return respond({ success: false, error: 'delta uploads append transactions only' });
+      }
       if (failChunk === chunkNo) return respond({ success: false, error: 'chunk write failed' });
       // `doubleSend` hands the SAME POST to the backend twice — what a
       // retrying proxy or a second tab does. The v3.2 seq bookkeeping makes the
@@ -120,6 +165,19 @@ function makeCloud({ chunked = true, uploadIds = true, failChunk = 0, dropChunk 
       if (uploadIds && body.uploadId !== 'upload-123') {
         return respond({ success: false, error: 'upload superseded by a newer save — please retry the whole save' });
       }
+      if (body.mode === 'delta' || live.mode === 'delta') {
+        const want = Number((body.expect || {}).transactions || 0);
+        if (staged.transactions.length !== want) {
+          return respond({
+            success: false,
+            error: 'chunk mismatch on transactions: staged ' + staged.transactions.length + ' rows, expected ' + want +
+                   ' — live data left untouched, please retry the save'
+          });
+        }
+        const result = appendLive(staged.transactions);
+        staged.transactions = [];
+        return respond({ success: true, added: result.added, skippedDuplicates: result.skipped, transactions: live.transactions.length });
+      }
       for (const t of ['transactions', 'customerTx', 'seen']) {
         const want = Number((body.expect || {})[t] || 0);
         if (staged[t].length !== want) {
@@ -130,9 +188,16 @@ function makeCloud({ chunked = true, uploadIds = true, failChunk = 0, dropChunk 
           });
         }
       }
+      // A full commit swaps every sheet — the live Transactions sheet becomes
+      // exactly what was staged.
+      live.transactions = staged.transactions.slice();
       return respond({ success: true });
     }
-    if (body.action === 'saveAll') return respond({ success: true });
+    if (body.action === 'saveAll') {
+      // Atomic stage+swap, exactly like the real backend.
+      live.transactions = (body.transactions || []).slice();
+      return respond({ success: true });
+    }
     return respond({ success: false, error: 'unknown action' });
   };
   const localStorage = {
@@ -140,7 +205,7 @@ function makeCloud({ chunked = true, uploadIds = true, failChunk = 0, dropChunk 
     setItem: (k, v) => { store[k] = String(v); },
     removeItem: (k) => { delete store[k]; }
   };
-  return { calls, staged, store, localStorage, fetchImpl };
+  return { calls, staged, live, store, localStorage, fetchImpl };
 }
 
 function makeSandbox(cloud, db, status) {
@@ -221,26 +286,29 @@ test('large save uses saveBegin → saveChunk×N → saveCommit on a chunk-capab
   assert.strictEqual(begin.customerTx, undefined);
   assert.strictEqual(begin.seen, undefined);
 
-  // The big tables are sliced, in a stable order, never over CHUNK_ROWS.
-  // `seen` is deliberately absent: the dedup map is derivable from the
-  // transactions table, so it is no longer uploaded (the cloud sheet stays
-  // empty and each device rebuilds its guard on load).
+  // Transactions is the ONLY big table sliced: the per-customer history and
+  // the `seen` dedup map are both derivable from it (each device rebuilds
+  // both on load; the cloud sheets stay empty), so neither is uploaded.
   const chunks = cloud.calls.filter((c) => c.action === 'saveChunk');
   assert.deepStrictEqual(
     chunks.map((c) => c.table),
-    ['transactions', 'transactions', 'customerTx']
+    ['transactions', 'transactions']
   );
   chunks.forEach((c) => assert.ok(c.rows.length <= 2000, 'chunk over CHUNK_ROWS: ' + c.rows.length));
   assert.strictEqual(chunks.filter((c) => c.table === 'transactions').flatMap((c) => c.rows).length, 3000);
-  assert.strictEqual(chunks.filter((c) => c.table === 'customerTx').flatMap((c) => c.rows).length, 50);
+  assert.strictEqual(chunks.filter((c) => c.table === 'customerTx').length, 0, 'the derived history must not be uploaded');
   assert.strictEqual(chunks.filter((c) => c.table === 'seen').length, 0, 'the seen map must not be uploaded');
-  cloud.calls.forEach((c) => assert.strictEqual(c.seen, undefined, c.action + ' must not carry a seen table'));
+  cloud.calls.forEach((c) => {
+    assert.strictEqual(c.seen, undefined, c.action + ' must not carry a seen table');
+    assert.strictEqual(c.customerTx, undefined, c.action + ' must not carry the derived history');
+  });
 
   // saveCommit promises exactly what was sent.
   assert.deepStrictEqual(cloud.calls[cloud.calls.length - 1].expect, {
-    transactions: 3000,
-    customerTx: 50
+    transactions: 3000
   });
+  // A full commit publishes the staged rows as the live sheet.
+  assert.strictEqual(cloud.live.transactions.length, 3000);
 
   // Live progress is shown and the capability is remembered.
   assert.ok(status.some((m) => /%/.test(m)), 'no percentage progress shown during upload');
@@ -277,10 +345,10 @@ test('every slice carries a per-table seq, so the backend can recognise a replay
   assert.strictEqual(first, true);
 
   const chunks = cloud.calls.filter((c) => c.action === 'saveChunk');
-  // 3000 transactions → 2 slices, then customerTx (50) → 1.
+  // 3000 transactions → 2 slices; the derived history/seen tables never ride.
   assert.deepStrictEqual(
     chunks.map((c) => [c.table, c.seq]),
-    [['transactions', 0], ['transactions', 1], ['customerTx', 0]]
+    [['transactions', 0], ['transactions', 1]]
   );
   assert.ok(chunks.every((c) => Number.isInteger(c.seq)), 'seq must be a number, not undefined');
 });
@@ -302,28 +370,36 @@ test('a slice delivered twice still saves — the seq stops it staging twice', a
 
 /* ── behaviour against the unchanged saveAll-only backend ───────────────── */
 
-test('a saveAll-only backend still saves: probe falls back to one full saveAll POST', async () => {
-  const cloud = makeCloud({ chunked: false });
+test('a saveAll-only backend still saves: probes fall back to one full saveAll POST', async () => {
+  // Pre-v3.0: no chunked actions and no saveDelta — every probe answers
+  // "unknown action".
+  const cloud = makeCloud({ chunked: false, delta: false });
   const { first, second } = await runClient(cloud, bigDB(), { saveTwice: true });
 
   assert.strictEqual(first, true);
-  // First save: the tiny saveBegin probe is answered "unknown action", so the
-  // whole database goes up as ONE saveAll — nothing is chunked, nothing lost.
-  assert.deepStrictEqual(
-    cloud.calls.map((c) => c.action),
-    ['saveBegin', 'saveAll', 'saveAll'],
-    'expected probe + fallback save, then a probe-free second save'
-  );
+  // First save: no pushed state yet, so no delta is attempted; the saveBegin
+  // probe is answered "unknown action" and the whole database goes up as ONE
+  // saveAll — nothing is chunked, nothing lost.
+  const firstCalls = cloud.calls.slice(0, 2).map((c) => c.action);
+  assert.deepStrictEqual(firstCalls, ['saveBegin', 'saveAll']);
   const save = cloud.calls[1];
   assert.strictEqual(save.action, 'saveAll');
   assert.strictEqual(save.customers.length, 1);
   assert.strictEqual(save.transactions.length, 3000);
-  assert.strictEqual(save.seen, undefined, 'the one-shot save must not carry the derivable seen map either');
-  assert.strictEqual(save.customerTx.C0.length, 1);
+  assert.strictEqual(save.seen, undefined, 'the one-shot save must not carry the derivable seen map');
+  assert.strictEqual(save.customerTx, undefined, 'the one-shot save must not carry the derived history');
 
-  // The second large save in the same session skips the doomed probe.
+  // The second save now HAS pushed state, so it probes saveDelta first:
+  // "unknown action" is remembered, then it falls straight to saveAll
+  // (the doomed chunked probe is cached from the first save).
   assert.strictEqual(second, true);
+  assert.deepStrictEqual(
+    cloud.calls.slice(2).map((c) => c.action),
+    ['saveDelta', 'saveAll'],
+    'the second save probes the delta action once, then uses saveAll'
+  );
   assert.strictEqual(cloud.store.spaxCloudChunked, '0', 'one-shot backend must be remembered');
+  assert.strictEqual(cloud.store.spaxCloudDelta, '0', 'pre-v3.4 backend must be remembered');
 });
 
 test('a new session re-probes a remembered one-shot backend (a later chunked deploy is picked up)', async () => {
@@ -354,6 +430,224 @@ test('small saves stay a single saveAll request on every backend', async () => {
   );
 });
 
+/* ── incremental saves (backend v3.4) ───────────────────────────────────── */
+
+async function seedPushedSet(cloud, db) {
+  // Simulate "everything in db is already on the sheet": the pushed set is
+  // exactly what a successful full save records.
+  const store = cloud.store;
+  const keys = db.transactions.map((t) => {
+    const rc = String(t.receipt || '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    if (rc) return 'receipt|' + rc + '|' + String(t.date || '') + '|' + (t.time || '');
+    return 'composite|' + String(t.date || '') + '|' + (t.time || '') + '|' + Number(t.amount).toFixed(2) + '|' +
+      String(t.name || '').toLowerCase().replace(/[^a-z0-9\s']/g, ' ').replace(/\s+/g, ' ').trim() + '|' +
+      String(t.phone || t.contact || '');
+  });
+  store.spaxPushedTx_v1 = JSON.stringify({ v: 1, keys });
+}
+
+test('a routine save after a full push uploads only the new transactions (one-shot saveDelta)', async () => {
+  const cloud = makeCloud({ chunked: true, delta: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 10); // small full save first
+  db.customerTx = {};
+  db.seen = {};
+  const run1 = await runClient(cloud, db);
+  assert.strictEqual(run1.first, true);
+  assert.strictEqual(cloud.calls[0].action, 'saveAll', 'the first save has no pushed state → full save');
+  assert.strictEqual(cloud.live.transactions.length, 10);
+
+  // A daily statement adds three rows — the second save must append only them.
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+  vm.runInContext(syncLayerSource(), ctx);
+  for (let i = 0; i < 3; i++) {
+    db.transactions.push({ date: '2026-09-11', time: '08:0' + i, amount: 250, name: 'New' + i, phone: '25479' + i, receipt: 'NEW' + i });
+  }
+  const result = await ctx.saveToCloud(true);
+  assert.strictEqual(result, true);
+
+  const deltas = cloud.calls.filter((c) => c.action === 'saveDelta');
+  assert.strictEqual(deltas.length, 1, 'the routine save must be a single saveDelta');
+  const delta = deltas[0];
+  assert.strictEqual((delta.txAdd || []).length, 3, 'only the three new rows travel');
+  assert.deepStrictEqual(delta.txAdd.map((t) => t.receipt), ['NEW0', 'NEW1', 'NEW2']);
+  assert.strictEqual(delta.transactions, undefined, 'saveDelta never carries a full transactions table');
+  assert.strictEqual(delta.customerTx, undefined, 'the derived history never travels');
+  assert.strictEqual(delta.seen, undefined);
+  // Small tables always ride along in full.
+  assert.strictEqual(delta.customers.length, 1);
+  assert.ok(delta.settings && delta.settings.importBatch === 1);
+  // The sheet holds the ten originals plus the three appended rows, and no
+  // full replace happened in between.
+  assert.strictEqual(cloud.live.transactions.length, 13);
+  assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveAll').length, 1, 'no full fallback may run');
+  assert.strictEqual(cloud.store.spaxCloudDelta, '1', 'the delta capability must be remembered');
+});
+
+test('the sync layer\'s identity helpers match the dedup guard\'s transactionKey byte-for-byte', () => {
+  // The pushed set / delta selection live in the standalone sync slice, but
+  // they must produce the same identity strings the import guard and the
+  // Apps Script backend use, or a routine delta would re-send (or fail to
+  // send) rows. Slice the twins out and compare them over shared fixtures.
+  const syncSrc = syncLayerSource();
+  const helpers = syncSrc.slice(syncSrc.indexOf('function spaxCleanReceipt'), syncSrc.indexOf('// Identity of a customer RECORD'));
+  const syncCtx = vm.createContext({ localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} } });
+  vm.runInContext(helpers, syncCtx);
+
+  // The real guard functions with the same stubs seen-heal uses.
+  const dedup = html => html.slice(html.indexOf('function transactionKey(tx)'), html.indexOf('function normalizeSeenDates'));
+  const guardCtx = vm.createContext({});
+  vm.runInContext(`
+    function stripTime(d){ var m = String(d||'').match(/(\\d{4}-\\d{2}-\\d{2})/); return m ? m[1] : String(d||''); }
+    function cleanReceipt(r){ return String(r||'').replace(/\\s+/g,'').replace(/[^A-Z0-9]/gi,'').toUpperCase(); }
+    function normalizeName(n){ return String(n==null?'':n).toLowerCase().replace(/[^a-z0-9\\s']/g,' ').replace(/\\s+/g,' ').trim(); }
+    function normalizeContact(c){
+      c = String(c==null?'':c).trim(); if(!c||/missing/i.test(c)) return '';
+      c = c.replace(/\\s+/g,'');
+      if(c.indexOf('***')>=0){ if(c.indexOf('254')===0) return '0'+c.slice(3); return c; }
+      c = c.replace(/[^\\d+]/g,'');
+      if(c.indexOf('+254')===0) return '0'+c.slice(4);
+      if(c.indexOf('254')===0) return '0'+c.slice(3);
+      return c;
+    }
+    ${dedup(HTML)}
+  `, guardCtx);
+
+  const fixtures = [
+    { receipt: 'SAJ4K9X28H', date: '2026-09-11T08:15:00', time: '08:15', amount: 123.4, name: 'Alice Achieng', phone: '+254722000001' },
+    { receipt: 'SAJ4K9X28H', date: '2026-09-11T08:15:00.000Z', time: '08:15', amount: 123.4, name: 'alice achieng', contact: '254722000001' },
+    { receipt: 'saj4k9x28h ', date: '2026-09-11', time: '08:15:00', amount: 123.4, name: 'ALICE  ACHIENG', phone: '0722 000 001' },
+    { receipt: '', date: '2026-09-11', time: '12:00:00', amount: 70, name: 'Cash Buyer', phone: '0733***222' },
+    { receipt: null, date: '2026-09-11 09:00', time: '', amount: -3.85, name: 'M-PESA Charge', contact: 'Missing' },
+    // Dates are always ISO by the time a row is saved (repairDates strips
+    // them); both helpers must agree on that common shape.
+    { receipt: 'QGH7XTRN7YA', date: '2026-08-31', time: '09:00', amount: 50, name: 'O\'Brien Co-op', phone: '0700 000 000' }
+  ];
+  fixtures.forEach((t) => {
+    const syncKey = syncCtx.spaxTxIdentity(t);
+    const guardKey = guardCtx.transactionKey(t);
+    assert.strictEqual(syncKey, guardKey, 'identity mismatch for ' + JSON.stringify(t) + ': ' + syncKey + ' vs ' + guardKey);
+  });
+  // The time-less receipt check used to recognise cloud round-trips: the
+  // sheet round-trips rows with no `time`, so a local row that still has it is
+  // already pushed when the set only holds the time-less identity.
+  const timed = { receipt: 'UHVH4T4SL28', date: '2026-08-31T16:52:19', time: '16:52:19', amount: 50, name: 'Elena', phone: '0711' };
+  const timeless = { ...timed, time: '' };
+  assert.strictEqual(syncCtx.spaxTxAlreadyPushed(new Set([syncCtx.spaxTxIdentity(timeless)]), timed), true);
+  assert.strictEqual(guardCtx.txKeyNoTime(timeless), 'receipt|UHVH4T4SL28|2026-08-31|');
+});
+
+test('a save with nothing new still lands the small tables via an empty saveDelta', async () => {
+  const cloud = makeCloud({ delta: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 5);
+  db.customerTx = {};
+  db.seen = {};
+  await runClient(cloud, db); // full save → pushed set populated
+
+  const ctx = vm.createContext(makeSandbox(cloud, db, []));
+  vm.runInContext(syncLayerSource(), ctx);
+  // A contact/baseline edit is the only thing this save carries.
+  db.resolved = 7;
+  const result = await ctx.saveToCloud(true);
+  assert.strictEqual(result, true);
+  const delta = cloud.calls.filter((c) => c.action === 'saveDelta').pop();
+  assert.ok(delta, 'an unchanged-transactions save still saves (the small tables)');
+  assert.deepStrictEqual(delta.txAdd, []);
+  assert.strictEqual(delta.settings.resolved, 7);
+  assert.strictEqual(cloud.live.transactions.length, 5, 'transactions are untouched');
+});
+
+test('a pre-v3.4 deployment answers unknown action on saveDelta — the save falls back to a full saveAll', async () => {
+  const cloud = makeCloud({ chunked: false, delta: false });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 10);
+  db.customerTx = {};
+  db.seen = {};
+  await seedPushedSet(cloud, db); // device thinks a push happened on an older deployment
+
+  const { first } = await runClient(cloud, db);
+  assert.strictEqual(first, true, 'old backend must never lose a save');
+  const actions = cloud.calls.map((c) => c.action);
+  // Small database: the delta probe is refused ("unknown action"), the
+  // payload is under the chunk threshold so no saveBegin probe is needed, and
+  // the whole database lands in one atomic saveAll.
+  assert.deepStrictEqual(actions, ['saveDelta', 'saveAll'],
+    'delta probe → one full saveAll on a pre-v3.4 deployment');
+  const fallback = cloud.calls[cloud.calls.length - 1];
+  assert.strictEqual(fallback.transactions.length, 10, 'the full payload lands');
+  assert.strictEqual(cloud.store.spaxCloudDelta, '0', 'the unsupported capability is cached');
+});
+
+test('a chunk-capable backend that ignores the delta mode echo is treated as pre-v3.4 and falls back to a full chunked save', async () => {
+  // v3.0–v3.3 speak saveBegin but silently drop the unknown `mode` field.
+  const cloud = makeCloud({ chunked: true, delta: false, ignoreDeltaMode: true });
+  const db = bigDB(); // 3,000 rows → would chunk either way
+  await seedPushedSet(cloud, db);
+  // 2,500 rows are "new" — large enough to force the chunked delta path.
+  const partial = JSON.parse(cloud.store.spaxPushedTx_v1);
+  partial.keys = partial.keys.slice(0, 500);
+  cloud.store.spaxPushedTx_v1 = JSON.stringify(partial);
+  // The backend cannot append — the 2,500-row delta must instead be abandoned
+  // and the whole database re-staged as a full chunked session.
+  const { first } = await runClient(cloud, db);
+  assert.strictEqual(first, true);
+  const beginBodies = cloud.calls.filter((c) => c.action === 'saveBegin');
+  assert.deepStrictEqual(beginBodies.map((b) => b.mode || null), ['delta', null],
+    'first begin asks for delta, the fallback begin is a full session');
+  assert.ok(cloud.calls.some((c) => c.action === 'saveCommit' && !c.mode), 'a full commit must land');
+  assert.strictEqual(cloud.live.transactions.length, 3000, 'the full chunked save replaced the sheet');
+});
+
+test('a first large delta is sliced as a mode:delta chunked session and appended', async () => {
+  const cloud = makeCloud({ chunked: true, delta: true });
+  const db = bigDB(); // 3,000 transactions
+  await seedPushedSet(cloud, db);
+  // Pretend the sheet only ever held the first 500: 2,500 rows are new.
+  // (Adjust the seeded set accordingly.)
+  const partial = JSON.parse(cloud.store.spaxPushedTx_v1);
+  partial.keys = partial.keys.slice(0, 500);
+  cloud.store.spaxPushedTx_v1 = JSON.stringify(partial);
+  // The live sheet genuinely holds those same 500 originals.
+  cloud.live.transactions = db.transactions.slice(0, 500);
+
+  const { first, lastCloudError } = await runClient(cloud, db);
+  assert.strictEqual(first, true, lastCloudError || 'the large delta must succeed');
+  const begin = cloud.calls.find((c) => c.action === 'saveBegin');
+  assert.strictEqual(begin.mode, 'delta');
+  const chunks = cloud.calls.filter((c) => c.action === 'saveChunk');
+  assert.ok(chunks.length >= 2, 'the delta is sliced');
+  assert.ok(chunks.every((c) => c.table === 'transactions'), 'only transactions ride a delta session');
+  assert.ok(chunks.every((c) => c.mode === 'delta'), 'every delta slice echoes its mode');
+  assert.ok(cloud.calls.filter((c) => c.action === 'saveCommit').every((c) => c.mode === 'delta'));
+  const sentRows = chunks.flatMap((c) => c.rows).length;
+  assert.strictEqual(sentRows, 2500, 'only the rows the sheet lacks are staged');
+  const commit = cloud.calls.filter((c) => c.action === 'saveCommit').pop();
+  assert.strictEqual(commit.mode, 'delta');
+  assert.deepStrictEqual(commit.expect, { transactions: 2500 });
+  assert.strictEqual(cloud.live.transactions.length, 3000, 'append never replaces: 500 originals + 2,500 new');
+});
+
+test('a destructive edit (full-replace latch) makes the next save a full upload even with pushed state', async () => {
+  const cloud = makeCloud({ chunked: true, delta: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 10);
+  db.customerTx = {};
+  db.seen = {};
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+  vm.runInContext(syncLayerSource(), ctx);
+  assert.strictEqual(await ctx.saveToCloud(true), true); // full saveAll
+  assert.strictEqual(vm.runInContext('spaxMarkTxFullReplace(); spaxTxFullReplaceRequired()', ctx), true);
+  assert.strictEqual(await ctx.saveToCloud(true), true);
+  const afterLatch = cloud.calls.filter((c) => c.action === 'saveAll' || c.action === 'saveDelta');
+  assert.deepStrictEqual(afterLatch.map((c) => c.action), ['saveAll', 'saveAll'],
+    'the latched save must not append — deletions need a full replace');
+  assert.strictEqual(vm.runInContext('spaxTxFullReplaceRequired()', ctx), false,
+    'a completed full save clears the latch');
+});
+
 /* ── source-level pins ───────────────────────────────────────────────────── */
 
 /* ── upload session guard + probe resilience (backend v3.0 era) ──────────── */
@@ -379,12 +673,15 @@ test('a chunk-capable backend that predates uploadIds still syncs (uploadId: "")
 });
 
 test('a transient probe failure falls back to one saveAll without poisoning the capability cache', async () => {
-  const cloud = makeCloud({ chunked: true, failBeginTimes: 1 });
+  // The deployment speaks chunks but predates deltas: this exercises both
+  // probe kinds and the "transient ≠ unsupported" distinction in one pass.
+  const cloud = makeCloud({ chunked: true, delta: false, failBeginTimes: 1 });
   const { first, second } = await runClient(cloud, bigDB(), { saveTwice: true });
 
-  // First save: the probe died with HTTP 500 (NOT "unknown action"), so the
-  // client must not conclude the backend is saveAll-only — it saves via the
-  // one-shot path this once and leaves the cache alone.
+  // First save (no pushed state yet → no delta probe): saveBegin dies with
+  // HTTP 500 (NOT "unknown action"), so the client must not conclude the
+  // backend is saveAll-only — it saves via the one-shot path this once and
+  // leaves the cache alone.
   assert.strictEqual(first, true);
   assert.deepStrictEqual(
     cloud.calls.map((c) => c.action).slice(0, 2),
@@ -392,12 +689,16 @@ test('a transient probe failure falls back to one saveAll without poisoning the 
   );
   assert.notStrictEqual(cloud.store.spaxCloudChunked, '0', 'transient probe failure must not be cached as one-shot');
 
-  // Second save in the same session: still unprobed, so it tries chunked
-  // again — and this time the backend answers, so it goes up in slices.
+  // Second save in the same session now has pushed state: it probes
+  // saveDelta (answered "unknown action" once, then cached), retries the
+  // chunked protocol — which answers this time — and goes up in slices.
   const actions = cloud.calls.map((c) => c.action);
+  assert.ok(actions.includes('saveDelta'), 'the second save probes the delta action');
+  assert.strictEqual(cloud.store.spaxCloudDelta, '0', 'the "unknown action" answer must be cached');
   assert.ok(actions.includes('saveChunk'), 'second save should retry the chunked protocol');
   assert.strictEqual(actions[actions.length - 1], 'saveCommit');
   assert.strictEqual(second, true);
+  assert.strictEqual(cloud.store.spaxCloudChunked, '1');
 });
 
 test('forced saves queue behind each other — never two requests in flight', async () => {
@@ -428,7 +729,13 @@ test('forced saves queue behind each other — never two requests in flight', as
   assert.strictEqual(a, true);
   assert.strictEqual(b, true);
   assert.strictEqual(maxInFlight, 1, 'saves must be serialized — overlapping POSTs fight over the backend script lock');
-  assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveAll').length, 2);
+  // The first save replaces the sheet (no pushed state yet); the second has
+  // nothing new and rides the incremental action — either way exactly one
+  // mutating POST per queued task.
+  assert.strictEqual(
+    cloud.calls.filter((c) => c.action === 'saveAll' || c.action === 'saveDelta' || c.action === 'saveCommit').length,
+    2
+  );
 });
 
 test('background saves coalesce into ONE queued slot while forced saves queue individually — shown as 1/3…3/3', async () => {
@@ -466,7 +773,8 @@ test('background saves coalesce into ONE queued slot while forced saves queue in
   const results = await Promise.all([first, bgA, bgB, forced2]);
   assert.deepStrictEqual(results, [true, true, true, true]);
   assert.strictEqual(maxInFlight, 1, 'the queue must keep saves strictly serialized');
-  assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveAll').length, 3,
+  const mutating = (c) => c.action === 'saveAll' || c.action === 'saveDelta' || c.action === 'saveCommit';
+  assert.strictEqual(cloud.calls.filter(mutating).length, 3,
     '3 uploads: forced #1, ONE coalesced background save, forced #2');
   assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 0);
   assert.strictEqual(vm.runInContext('cloudSaveRunning', ctx), false);
@@ -491,12 +799,22 @@ test('a queued save that fails stays visible and the queue keeps going for the n
   const ctx = vm.createContext(makeSandbox(cloud, db, status));
 
   let saveAllNo = 0;
+  let deltaNo = 0;
   const inner = cloud.fetchImpl;
   cloud.fetchImpl = async (url, options) => {
     const body = JSON.parse(options.body);
+    if (body.action === 'saveDelta') {
+      deltaNo += 1;
+      if (deltaNo === 1) {
+        // Task 2 is the middle job and the first to have pushed state: make
+        // its delta probe unsupported so it falls back to a full saveAll…
+        cloud.calls.push(body);
+        return { ok: true, text: async () => JSON.stringify({ success: false, error: 'unknown action' }) };
+      }
+    }
     if (body.action === 'saveAll') {
       saveAllNo += 1;
-      if (saveAllNo === 2) { // the middle task of three
+      if (saveAllNo === 2) { // …then reject the full fallback for that same middle task
         cloud.calls.push(body);
         return { ok: true, text: async () => JSON.stringify({ success: false, error: 'cloud rejected the save' }) };
       }
@@ -646,21 +964,23 @@ test('busy retries keep isSyncing true so a concurrent save cannot start', async
 /* ── interrupted uploads resume from the last acknowledged slice ─────────── */
 
 test('an upload interrupted mid-flight resumes from the last acknowledged slice', async () => {
-  // The phone kills the tab mid-upload (the 3rd slice dies). The next save
-  // must CONTINUE from the slice that was never acknowledged — not restart
-  // the whole database from saveBegin, which is what made "Resuming the
-  // interrupted save…" go on forever: the upload needed more continuous
-  // foreground time than the user ever gave it, so starting over never won.
-  const cloud = makeCloud({ chunked: true, failChunk: 3 });
+  // The phone kills the tab mid-upload (the 2nd of the two transactions
+  // slices dies). The next save must CONTINUE from the slice that was never
+  // acknowledged — not restart the whole database from saveBegin, which is
+  // what made "Resuming the interrupted save…" go on forever: the upload
+  // needed more continuous foreground time than the user ever gave it, so
+  // starting over never won.
+  const cloud = makeCloud({ chunked: true, failChunk: 2 });
   const db = bigDB();
   const run1 = await runClient(cloud, db);
   assert.strictEqual(run1.first, false, 'the interrupted save fails');
   assert.match(run1.lastCloudError, /chunk write failed/);
-  // The session survived: both transactions slices (2,000 + 1,000 rows)
-  // acknowledged, customerTx never started.
+  // The session survived: the first transactions slice (2,000 rows) was
+  // acknowledged, the second never was. Only transactions ride uploads now.
   const session = JSON.parse(cloud.store.spaxUploadSession);
-  assert.deepStrictEqual(session.cursors, { transactions: 2, customerTx: 0 });
-  assert.strictEqual(session.sent, 3000);
+  assert.deepStrictEqual(session.cursors, { transactions: 1 });
+  assert.strictEqual(session.sent, 2000);
+  assert.strictEqual(session.mode, 'full');
 
   // Where run 1's requests end — everything after this is the resumed save.
   const callsAfterRun1 = cloud.calls.length;
@@ -670,17 +990,17 @@ test('an upload interrupted mid-flight resumes from the last acknowledged slice'
   // Exactly ONE saveBegin across both runs — the second save never restarted.
   assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveBegin').length, 1);
   // Run 2 sends exactly ONE slice — the one that was never acknowledged —
-  // and then commits. The two acknowledged slices are not re-sent.
+  // and then commits. The acknowledged slice is not re-sent.
   const run2Calls = cloud.calls.slice(callsAfterRun1);
   assert.deepStrictEqual(
     run2Calls.map((c) => c.action),
     ['saveChunk', 'saveCommit'],
     'the resumed save must be one owed slice + the commit, nothing more'
   );
-  assert.deepStrictEqual([run2Calls[0].table, run2Calls[0].seq], ['customerTx', 0]);
-  assert.deepStrictEqual(run2Calls[1].expect, { transactions: 3000, customerTx: 50 });
+  assert.deepStrictEqual([run2Calls[0].table, run2Calls[0].seq], ['transactions', 1]);
+  assert.deepStrictEqual(run2Calls[1].expect, { transactions: 3000 });
   // Progress is legible in absolute rows, not just a percentage.
-  assert.ok(run2.status.some((m) => /3,050\/3,050 rows/.test(m)), 'progress must show absolute rows');
+  assert.ok(run2.status.some((m) => /3,000\/3,000 rows/.test(m)), 'progress must show absolute rows');
   // A finished upload leaves no session behind.
   assert.strictEqual(cloud.store.spaxUploadSession, undefined);
 });
@@ -698,7 +1018,7 @@ test('a session the server no longer holds falls back to a fresh saveBegin', asy
   // save, and still lands the data.
   const session = JSON.parse(cloud.store.spaxUploadSession);
   session.uploadId = 'someone-elses-upload';
-  session.cursors = { transactions: 2, customerTx: 1 }; // everything "sent"
+  session.cursors = { transactions: 2 }; // everything "sent"
   cloud.store.spaxUploadSession = JSON.stringify(session);
 
   const run2 = await runClient(cloud, db);
@@ -727,7 +1047,7 @@ test('a database that changed since the session started does not resume', async 
   assert.strictEqual(cloud.calls.filter((c) => c.action === 'saveBegin').length, 2,
     'a changed database must start a fresh upload, not resume');
   assert.ok(!run2.status.some((m) => /resuming interrupted upload/.test(m)), 'no resume may be attempted');
-  assert.deepStrictEqual(cloud.calls[cloud.calls.length - 1].expect, { transactions: 3001, customerTx: 50 });
+  assert.deepStrictEqual(cloud.calls[cloud.calls.length - 1].expect, { transactions: 3001 });
 });
 
 test('a successful one-shot saveAll discards any interrupted chunked session', async () => {
@@ -787,8 +1107,23 @@ test('client keeps payload-aware timeouts and wires the chunked actions + fallba
   assert.match(HTML, /action: 'saveBegin'/);
   assert.match(HTML, /action: 'saveChunk'/);
   assert.match(HTML, /action: 'saveCommit'/);
+  // Delta chunks/commits echo their mode so lost session bookkeeping can
+  // never misroute an append to a live-sheet-replacing full commit.
+  assert.match(HTML, /if \(session\.mode === 'delta'\) chunkBody\.mode = 'delta'/);
+  assert.match(HTML, /if \(session\.mode === 'delta'\) commitBody\.mode = 'delta'/);
   assert.match(HTML, /isUnknownActionError/, 'the unknown-action fallback must stay wired');
   assert.match(HTML, /spaxCloudChunked/, 'backend capability must be cached');
+  // v3.4 incremental saves: one-shot and chunked deltas, a persisted pushed
+  // set, a full-replace latch for destructive edits, and a fallback.
+  assert.match(HTML, /action: 'saveDelta'/);
+  assert.match(HTML, /mode: 'delta'/);
+  assert.match(HTML, /begin\.delta !== true/, 'a mode-echoing-less backend must be detected and fall back');
+  assert.match(HTML, /spaxCloudDelta/, 'delta capability must be cached');
+  assert.match(HTML, /spaxPushedTx_v1/, 'the pushed-transaction set must be persisted');
+  assert.match(HTML, /spaxMarkTxFullReplace/, 'destructive edits must force the full path');
+  assert.match(HTML, /spaxNotePushedTransactions\(allTx\)/, 'a successful save records the pushed rows');
+  // customerTx joined seen in the "derived locally, never uploaded" set.
+  assert.match(HTML, /function rebuildCustomerHistory\(\)/, 'history must be re-derived on load');
   assert.match(HTML, /uploadId/, 'the upload session id must be echoed');
   assert.match(HTML, /isBackendBusyError/, 'a lock collision must be retried');
   assert.match(HTML, /CLOUD_BUSY_RETRIES/, 'busy retries must be bounded');

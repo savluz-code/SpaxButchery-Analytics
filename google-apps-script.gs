@@ -1,5 +1,5 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.3  (2026-09-10)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.4  (2026-09-11)
  * ─────────────────────────────────────────────────────────────────
  * MOBILE: can't edit script.google.com on your phone? Open
  *   https://savluz-code.github.io/SpaxButchery-Analytics/code.html
@@ -18,9 +18,20 @@
  * Paste the /exec URL into index.html as GAS_URL.
  *
  * ALREADY DEPLOYED? Re-deploy this version (Deploy → Manage deployments →
- * ✏️ edit → Version: New version → Deploy). v3.1 adds the seedLastVisit
- * customer column (baseline cut-off for the derived spent/visits tally; a
- * v3.0 sheet keeps working — the client re-stamps it locally). v3.0 completed the chunked save
+ * ✏️ edit → Version: New version → Deploy). v3.4 adds INCREMENTAL SAVES:
+ * the client appends only transactions new since the last push (saveDelta,
+ * and saveBegin/saveCommit with mode:"delta") instead of re-uploading the
+ * whole sheet on every save. The append de-duplicates against the live
+ * Transactions sheet (same receipt/date/time/amount/contact identity the
+ * client uses), so a retried or replayed delta can never double-count
+ * revenue; deletions still go up as a full (atomic) save. The CustomerTx
+ * history table is no longer written by current clients — it is derived on
+ * each device from Transactions — and delta commits empty it (and Seen), as
+ * full saves already do. v3.4 speaks every older action unchanged: old
+ * clients (saveAll / full chunked saves, customerTx uploads) keep working,
+ * and new clients probe for saveDelta and fall back to a full save against a
+ * pre-v3.4 deployment, so the redeploy is never a hard requirement. v3.1
+ * adds the seedLastVisit customer column; v3.0 completed the chunked save
  * protocol the client has spoken since PR #41: large saves stop dying at the
  * client's one-shot timeout and no aborted save can truncate a live sheet
  * anymore. Clients that only know saveAll keep working unchanged.
@@ -146,6 +157,15 @@ function doPost(e) {
       return json_(saveAll_(body) || { success: true });
     }
 
+    if (action === 'saveDelta') {
+      // Incremental one-shot: small tables replaced (stage + swap), new
+      // transactions appended to the live sheet. A busy result means the
+      // script lock could not be taken; the client retries (and a deployment
+      // that predates this action answers "unknown action", which is the
+      // client's signal to fall back to a full save).
+      return json_(saveDelta_(body));
+    }
+
     if (action === 'saveBegin') {
       return json_(saveBegin_(body));
     }
@@ -267,6 +287,53 @@ function saveAll_(body) {
   }
 }
 
+/* ── incremental save (v3.4) ──
+   Routine saves only add transactions (a daily statement imports hundreds
+   of rows; the whole sheet is tens of thousands). A delta therefore carries
+   the small tables in full — Customers/Monthly/Settings are cheap and stay
+   exact — plus ONLY the transactions the client has not pushed before. The
+   new rows are appended to the LIVE Transactions sheet and de-duplicated
+   against every row already there (txIdentityKeys_ uses the same receipt /
+   date+time+amount+name+contact identity the client's dedup guard writes),
+   so a retried, replayed or two-device delta can never double-count — an
+   append that loses its response simply appends nothing the second time.
+   The CustomerTx and Seen sheets are caches the client derives locally
+   (v3.4 stops syncing them): every delta swaps header-only copies over
+   them, as full saves already did. Deletions cannot be expressed as an
+   append — the client takes the full stage-and-swap path for those (Delete
+   All, a scoped Rebuild, duplicate rollback, a rename).
+   Appends go straight to the live sheet on purpose: an append can never
+   TRUNCATE it, so a killed execution leaves at most some rows already
+   appended — idempotency absorbs the retry — instead of the half-written
+   sheet that made the stage-then-swap protocol necessary for full saves. */
+
+function saveDelta_(body) {
+  var lock = LockService.getScriptLock();
+  if (!lock.waitLock(30000)) return backendBusy_();
+  try {
+    prepareStaging_();
+    stageSmallTables_(body);
+    var addRows = body.txAdd || body.transactions || [];
+    var result = appendNewTransactions_(addRows);
+    // The derivable caches are no longer synced — empty them via the same
+    // atomic swap the small tables use.
+    writeObjects_(stagingSheet_(SHEETS.customerTx), [], TABLE_HEADERS.customerTx);
+    writeObjects_(stagingSheet_(SHEETS.seen), [], TABLE_HEADERS.seen);
+    swapSheets_(['customers', 'monthly', 'settings', 'customerTx', 'seen']);
+    // Transactions were appended live (not swapped); leave their staging
+    // sheet header-only for the next chunked session.
+    writeObjects_(stagingSheet_(SHEETS.transactions), [], TABLE_HEADERS.transactions);
+    return {
+      success: true,
+      added: result.added,
+      skippedDuplicates: result.skipped,
+      transactions: result.total
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 /* ── chunked actions ── */
 
 function saveBegin_(body) {
@@ -281,8 +348,17 @@ function saveBegin_(body) {
     try {
       CacheService.getScriptCache().put(UPLOAD_KEY, uploadId, 3600);
     } catch (cacheErr) { /* best-effort session guard only */ }
-    resetChunkSeqs_(uploadId);
-    return { success: true, uploadId: uploadId };
+    // A delta session chunks ONLY new transactions and appends them at
+    // commit; a full (default) session stages every big table and swaps the
+    // live sheets. The mode rides the same per-upload Script Properties
+    // record as the chunk seqs, so saveChunk/saveCommit know which one they
+    // are completing. Echo `delta: true` so the client can tell a backend
+    // that honoured the mode from one that ignores the field (pre-v3.4).
+    var isDelta = String(body.mode || '') === 'delta';
+    resetChunkSeqs_(uploadId, isDelta);
+    var answer = { success: true, uploadId: uploadId };
+    if (isDelta) answer.delta = true;
+    return answer;
   } finally {
     lock.releaseLock();
   }
@@ -302,6 +378,15 @@ function saveChunk_(body) {
     var sheet = stagingSheet_(SHEETS[table]);
     if (!sheet) {
       return { success: false, error: 'no upload in progress — saveBegin must run before saveChunk' };
+    }
+    // A delta session appends transactions only — the other big tables are
+    // derivable caches the client never uploads anymore. Routing one of them
+    // here would stage rows the delta commit neither counts nor swaps. The
+    // client echoes mode on every chunk, so a lost session record can't let a
+    // cache table slip into a delta staging area either.
+    var chunkIsDelta = body.mode === 'delta' || sessionIsDelta_(body.uploadId);
+    if (chunkIsDelta && table !== 'transactions') {
+      return { success: false, error: 'delta uploads append transactions only' };
     }
     var seq = body.seq;
     var hasSeq = seq !== undefined && seq !== null && seq !== '';
@@ -333,6 +418,13 @@ function saveCommit_(body) {
   var lock = LockService.getScriptLock();
   if (!lock.waitLock(30000)) return backendBusy_();
   try {
+    // Delta sessions append new transactions instead of swapping tables —
+    // they have their own commit (append + dedup, then swap only the small
+    // and derivable-cache sheets). The client's explicit mode is honoured
+    // too, so losing the session bookkeeping can never make a delta commit
+    // swap the live Transactions sheet for a staging sheet holding only the
+    // appended rows.
+    if (body.mode === 'delta' || sessionIsDelta_(body.uploadId)) return commitDelta_(body);
     // 1) Verify every promised row landed BEFORE touching any live sheet.
     var expect = body.expect || {};
     var tables = Object.keys(BIG_TABLES);
@@ -355,10 +447,48 @@ function saveCommit_(body) {
     // 2) Counts are exact — swap every live sheet for its staging copy.
     swapAllSheets_();
     try { CacheService.getScriptCache().remove(UPLOAD_KEY); } catch (cacheErr) {}
+    try { PropertiesService.getScriptProperties().deleteProperty(CHUNK_SEQ_KEY); } catch (propsErr) {}
     return { success: true };
   } finally {
     lock.releaseLock();
   }
+}
+
+// Delta commit: every promised APPENDED row is in the transactions staging
+// sheet (strict count — records, like a full save), then the new-only rows
+// are appended to the LIVE Transactions sheet after de-duplicating against
+// everything already there. The small tables and the (now-empty) derivable
+// caches swap atomically; Transactions itself is never replaced.
+function commitDelta_(body) {
+  var want = Number((body.expect || {}).transactions || 0);
+  var staged = stagingSheet_(SHEETS.transactions);
+  var count = stagedRowCount_('transactions');
+  if (count !== want) {
+    // Same contract as a full commit: refuse before touching anything live.
+    resetStaging_();
+    return {
+      success: false,
+      error: 'chunk mismatch on transactions: staged ' + count + ' rows, expected ' + want +
+             ' — live data left untouched, please retry the save'
+    };
+  }
+  var stagedRows = rowsToObjects_(staged);
+  var result = appendNewTransactions_(stagedRows);
+  // Small tables were staged at saveBegin; the derivable caches are empty by
+  // contract — stage them so the same swap publishes all four.
+  writeObjects_(stagingSheet_(SHEETS.customerTx), [], TABLE_HEADERS.customerTx);
+  writeObjects_(stagingSheet_(SHEETS.seen), [], TABLE_HEADERS.seen);
+  swapSheets_(['customers', 'monthly', 'settings', 'customerTx', 'seen']);
+  // Transactions appended live rather than swapped — clear its staging area.
+  writeObjects_(stagingSheet_(SHEETS.transactions), [], TABLE_HEADERS.transactions);
+  try { CacheService.getScriptCache().remove(UPLOAD_KEY); } catch (cacheErr) {}
+  try { PropertiesService.getScriptProperties().deleteProperty(CHUNK_SEQ_KEY); } catch (propsErr) {}
+  return {
+    success: true,
+    added: result.added,
+    skippedDuplicates: result.skipped,
+    transactions: result.total
+  };
 }
 
 // waitLock returning false means another writer still holds the script lock.
@@ -495,15 +625,29 @@ function dedupeStaged_(table) {
    predate `seq` send none: they are appended as before and the commit's row
    count stays the safety net. */
 
-function chunkSeqState_(uploadId) {
+function chunkSeqStateRecord_(uploadId) {
   try {
     var raw = PropertiesService.getScriptProperties().getProperty(CHUNK_SEQ_KEY);
     if (raw) {
       var state = JSON.parse(raw);
-      if (state && String(state.uploadId) === String(uploadId || '')) return state.seqs || {};
+      if (state && String(state.uploadId) === String(uploadId || '')) return state;
     }
   } catch (err) { /* unreadable state — treat as nothing staged yet */ }
-  return {};
+  return null;
+}
+
+function chunkSeqState_(uploadId) {
+  var state = chunkSeqStateRecord_(uploadId);
+  return state ? (state.seqs || {}) : {};
+}
+
+// Whether this upload session is an incremental delta (append transactions)
+// rather than a full stage-and-swap. Sessions without stored state (legacy
+// clients send no uploadId) are always full saves.
+function sessionIsDelta_(uploadId) {
+  if (!uploadId) return false;
+  var state = chunkSeqStateRecord_(uploadId);
+  return !!(state && state.delta);
 }
 
 function chunkAlreadyStaged_(uploadId, table, seq) {
@@ -512,32 +656,35 @@ function chunkAlreadyStaged_(uploadId, table, seq) {
 }
 
 function recordChunkSeq_(uploadId, table, seq) {
-  var seqs = chunkSeqState_(uploadId);
-  if (!seqs[table]) seqs[table] = [];
-  seqs[table].push(String(seq));
+  var state = chunkSeqStateRecord_(uploadId) || { uploadId: String(uploadId || ''), seqs: {}, delta: false };
+  if (!state.seqs) state.seqs = {};
+  if (!state.seqs[table]) state.seqs[table] = [];
+  state.seqs[table].push(String(seq));
   try {
-    PropertiesService.getScriptProperties().setProperty(
-      CHUNK_SEQ_KEY, JSON.stringify({ uploadId: String(uploadId || ''), seqs: seqs })
-    );
+    PropertiesService.getScriptProperties().setProperty(CHUNK_SEQ_KEY, JSON.stringify(state));
   } catch (err) { /* best-effort: the commit count check still catches trouble */ }
 }
 
-function resetChunkSeqs_(uploadId) {
+function resetChunkSeqs_(uploadId, isDelta) {
   try {
     PropertiesService.getScriptProperties().setProperty(
-      CHUNK_SEQ_KEY, JSON.stringify({ uploadId: String(uploadId || ''), seqs: {} })
+      CHUNK_SEQ_KEY,
+      JSON.stringify({ uploadId: String(uploadId || ''), seqs: {}, delta: !!isDelta })
     );
   } catch (err) { /* best-effort */ }
 }
 
-// Atomically-ish replace every live sheet with its staging copy. Renames are
-// metadata-only, so no data is copied twice; the window where a table has no
-// live-named sheet is a few milliseconds, and ensureSheets_ recovers it if an
-// execution dies inside that window.
-function swapAllSheets_() {
+// Atomically-ish replace the named live sheets with their staging copies.
+// Renames are metadata-only, so no data is copied twice; the window where a
+// table has no live-named sheet is a few milliseconds, and ensureSheets_
+// recovers it if an execution dies inside that window. A delta commit swaps
+// only the small tables + derivable caches (Transactions is appended to
+// live, never replaced); a full save swaps every table.
+function swapSheets_(keys) {
   var ss = getSpreadsheet_();
-  Object.keys(SHEETS).forEach(function (k) {
+  keys.forEach(function (k) {
     var liveName = SHEETS[k];
+    if (!liveName) return;
     var staging = ss.getSheetByName(liveName + STAGE_SUFFIX);
     if (!staging) throw new Error('missing staging sheet for ' + liveName);
     var live = ss.getSheetByName(liveName);
@@ -550,6 +697,95 @@ function swapAllSheets_() {
       tmp.clearContents();
     }
   });
+}
+
+// Every table — the full stage-and-swap used by saveAll and a full commit.
+function swapAllSheets_() {
+  swapSheets_(Object.keys(SHEETS));
+}
+
+/* ── incremental (delta) transaction append ── */
+
+// Identity keys for a transaction row, mirroring the client's
+// transactionKey / txKeyNoTime / legacyReceiptKeys exactly: a receipt row is
+// keyed by its cleaned receipt + date (with and without the time, plus the
+// old 10-char truncation); a receipt-less row is a strict
+// date+time+amount+name+contact composite, so two genuinely different
+// same-day/same-amount payments never collapse together.
+function txIdentityKeys_(r) {
+  r = r || {};
+  var keys = [];
+  var rc = String(r.receipt == null ? '' : r.receipt).replace(/\s+/g, '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
+  var d = dateOnly_(r.date);
+  var tm = String(r.time || '');
+  if (rc) {
+    keys.push('receipt|' + rc + '|' + d + '|' + tm);
+    keys.push('receipt|' + rc + '|' + d + '|');
+    if (rc.length > 10) keys.push('receipt|' + rc.substring(0, 10) + '|' + d + '|' + tm);
+  } else {
+    keys.push('composite|' + d + '|' + tm + '|' + (Number(r.amount) || 0).toFixed(2) + '|' +
+      gasNormName_(r.name) + '|' + gasNormContact_(r.phone != null ? r.phone : r.contact));
+  }
+  return keys;
+}
+
+function gasNormName_(name) {
+  return String(name == null ? '' : name).toLowerCase().replace(/[^a-z0-9\s']/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Same normalisation as the client's normalizeContact: Kenyan number
+// variants (+254…/254…/0…) collapse to the 0… form; masked numbers and
+// blanks pass through.
+function gasNormContact_(contact) {
+  var c = String(contact == null ? '' : contact).trim();
+  if (!c || /missing/i.test(c)) return '';
+  c = c.replace(/\s+/g, '');
+  if (c.indexOf('***') >= 0) {
+    if (c.indexOf('254') === 0) c = '0' + c.substring(3);
+    return c;
+  }
+  c = c.replace(/[^\d+]/g, '');
+  if (c.indexOf('+254') === 0) c = '0' + c.substring(4);
+  else if (c.indexOf('254') === 0) c = '0' + c.substring(3);
+  return c;
+}
+
+// Write the header row on a still-empty sheet (a brand-new deployment has
+// never held a full save). Without this an append would land at row 1 and
+// look like the header on the next load.
+function ensureSheetHeader_(sheet, headers) {
+  if (!sheet) return;
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+}
+
+// Append the transactions the live sheet does not already hold. Returns
+// {added, skipped, total} — the skip count includes duplicates inside the
+// batch itself, so a retried delivery of the same delta appends nothing.
+function appendNewTransactions_(rows) {
+  var live = getSpreadsheet_().getSheetByName(SHEETS.transactions);
+  if (!live) throw new Error('missing live Transactions sheet');
+  ensureSheetHeader_(live, TABLE_HEADERS.transactions);
+  var have = {};
+  rowsToObjects_(live).forEach(function (r) {
+    txIdentityKeys_(r).forEach(function (k) { have[k] = 1; });
+  });
+  var fresh = [];
+  var seenInBatch = {};
+  var skipped = 0;
+  (rows || []).forEach(function (r) {
+    var keys = txIdentityKeys_(r);
+    var dup = false;
+    for (var i = 0; i < keys.length; i++) {
+      if (have[keys[i]] || seenInBatch[keys[i]]) { dup = true; break; }
+    }
+    if (dup) { skipped++; return; }
+    keys.forEach(function (k) { seenInBatch[k] = 1; });
+    fresh.push(r);
+  });
+  if (fresh.length) appendObjects_(live, fresh, TABLE_HEADERS.transactions);
+  return { added: fresh.length, skipped: skipped, total: Math.max(0, live.getLastRow() - 1) };
 }
 
 // A chunk belongs to the newest saveBegin. Legacy clients that never saw the

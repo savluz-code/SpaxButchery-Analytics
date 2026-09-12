@@ -326,9 +326,16 @@ test('unstamped history rows still classify by till through the product split', 
   assert.match(body, /classifyProduct\(t\.date, a, t\)/, 'must pass the row, not just date+amount');
 });
 
-test('the cloud upload carries the till on per-customer rows', () => {
-  const body = slice('const ctxRows = [];', 'const totalBigRows');
-  assert.match(body, /till: t\.till \|\| ''/);
+test('the derived per-customer history keeps the till column', () => {
+  // customerTx stopped being uploaded: it is projected from the synced
+  // Transactions rows on every load, so the till must survive that
+  // projection (Transactions itself still uploads with the till).
+  const rebuild = slice('function rebuildCustomerHistory()', '/* ══════════ NEW-CUSTOMER FLAG');
+  assert.match(rebuild, /till: t\.till \|\| ''/);
+  // The synced payload still carries transactions (with their tills).
+  const payload = slice('const payload = {', 'const allTx = payload.transactions;');
+  assert.match(payload, /transactions: \(DB\.transactions/);
+  assert.doesNotMatch(payload, /customerTx:/, 'the per-customer history must not be uploaded');
 });
 
 test('repairDates re-stamps till products on every derive pass', () => {

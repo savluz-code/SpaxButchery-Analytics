@@ -952,13 +952,27 @@ let lastCloudError = '';
 // worked — syncing never hard-requires a Code.gs redeploy, and a chunked
 // backend deployed later is picked up automatically on the next session.
 // Interrupted uploads RESUME from the last acknowledged slice (see the
-// CHUNKED UPLOAD section below), and the derivable `seen` dedup table is
-// no longer uploaded at all — both cut the "large upload" that kept
-// restarting from zero on every boot.
+// CHUNKED UPLOAD section below). The derivable `seen` dedup table and the
+// `customerTx` history table are no longer uploaded at all — each device
+// rebuilds both locally from transactions on load (see
+// rebuildCustomerHistory) — which cut the routine full save from ~35k rows
+// to ~17k.
+//
+// Backend v3.4 (2026-09-11) adds INCREMENTAL SAVES on top: routine saves send
+// only the transactions added since the last confirmed push (saveDelta, or a
+// mode:"delta" chunked upload), appended to the live sheet and de-duplicated
+// server-side. Destructive changes (Delete All, a scoped Rebuild, duplicate
+// rollback, customer rename/merge) cannot be expressed as an append, so they
+// take the full replace path. A pre-v3.4 deployment answers "unknown action"
+// and the save falls back to a full upload exactly as the chunked fallback
+// does — redeploying Code.gs is never a hard requirement.
 const CHUNK_ROWS = 2000; // rows per chunked upload request
 let cloudChunks = false;      // true once the backend proves it speaks the chunked actions
 let cloudChunkProbed = false; // one probe per session is enough
 try { cloudChunks = localStorage.getItem('spaxCloudChunked') === '1'; } catch (_) {}
+let cloudDelta = false;       // true once the backend proves it speaks saveDelta / mode:"delta"
+let cloudDeltaProbed = false;
+try { cloudDelta = localStorage.getItem('spaxCloudDelta') === '1'; } catch (_) {}
 
 // Per-request timeouts. 30s is plenty for a probe, a commit or a small save,
 // but a one-shot saveAll of the whole database (weak signal + Apps Script
@@ -1025,6 +1039,113 @@ async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT
 async function cloudLoad() {
   if (!GAS_URL || GAS_URL.includes('YOUR_SCRIPT')) throw new Error('Cloud URL is not configured. Paste your Apps Script /exec URL into GAS_URL.');
   return cloudRequest(GAS_URL + (GAS_URL.includes('?') ? '&' : '?') + 'action=load', {}, CLOUD_TIMEOUT_LOAD);
+}
+
+// ══════════ INCREMENTAL-SAVE STATE ══════════
+// Routine saves append ONLY the transactions the cloud does not already
+// hold. The set of identities the cloud is known to contain is persisted
+// alongside the other per-device sync state (a set of transactionKey
+// strings — one per row, so a few hundred KB even for tens of thousands of
+// transactions) and refreshed in three places:
+//   • after every successful save (full or delta) — the cloud then holds
+//     every transaction this device holds;
+//   • after a load/merge — the rows the cloud returned become known too,
+//     while local-only rows stay queued as a delta;
+//   • a Force Pull REPLACES the set, since the local copy just became the
+//     cloud's copy verbatim.
+// Deletions / renames are not append-shaped (an append can never remove a
+// row), so every code path that removes transactions or changes an identity
+// field calls spaxMarkTxFullReplace: the next save does a full replace, and
+// appends resume afterwards.
+const SPAX_PUSHED_TX_KEY = 'spaxPushedTx_v1';
+const SPAX_FULL_REPLACE_KEY = 'spaxTxFullReplace';
+
+// Local copies of the global identity helpers, kept here so the sync slice
+// has no load-order dependency on functions defined later in the file (and
+// so the sync-layer tests can run it standalone). They MUST stay byte-for-byte
+// identical to cleanReceipt / transactionKey / normalizeName /
+// normalizeContact — a source-level test pins them on the same fixtures.
+function spaxCleanReceipt(r) {
+  return String(r || '').replace(/\s+/g, '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
+}
+function spaxDateOnly(v) {
+  const m = String(v == null ? '' : v).match(/(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : String(v || '');
+}
+function spaxNormName(name) {
+  return String(name == null ? '' : name).toLowerCase().replace(/[^a-z0-9\s']/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function spaxNormContact(contact) {
+  let c = String(contact == null ? '' : contact).trim();
+  if (!c || c.toLowerCase().includes('missing')) return '';
+  c = c.replace(/\s+/g, '');
+  if (c.includes('***')) {
+    if (c.startsWith('254')) c = '0' + c.slice(3);
+    return c;
+  }
+  c = c.replace(/[^\d+]/g, '');
+  if (c.startsWith('+254')) c = '0' + c.slice(4);
+  else if (c.startsWith('254')) c = '0' + c.slice(3);
+  return c;
+}
+// Same key string the client's dedup guard and the Apps Script backend use.
+function spaxTxIdentity(t) {
+  t = t || {};
+  const receipt = spaxCleanReceipt(t.receipt);
+  const d = spaxDateOnly(t.date);
+  if (receipt) return ['receipt', receipt, d, t.time || ''].join('|');
+  return ['composite', d, t.time || '', (Number(t.amount) || 0).toFixed(2), spaxNormName(t.name), spaxNormContact(t.contact || t.phone)].join('|');
+}
+// The pushed set stores full keys, but a receipt row whose time got stripped
+// on a cloud round-trip must still count as pushed via the time-less key.
+function spaxTxAlreadyPushed(set, t) {
+  if (set.has(spaxTxIdentity(t))) return true;
+  if (spaxCleanReceipt(t && t.receipt)) {
+    if (set.has(['receipt', spaxCleanReceipt(t.receipt), spaxDateOnly(t && t.date), ''].join('|'))) return true;
+  }
+  return false;
+}
+function spaxLoadPushedTx() {
+  try {
+    const raw = localStorage.getItem(SPAX_PUSHED_TX_KEY);
+    const s = raw ? JSON.parse(raw) : null;
+    return s && Array.isArray(s.keys) ? s.keys : null;
+  } catch (_) { return null; }
+}
+function spaxSavePushedTx(keys) {
+  try { localStorage.setItem(SPAX_PUSHED_TX_KEY, JSON.stringify({ v: 1, keys: keys })); return true; }
+  catch (_) { return false; }
+}
+function spaxPushedSet() {
+  const keys = spaxLoadPushedTx();
+  return keys ? new Set(keys) : null;
+}
+function spaxMarkTxFullReplace() {
+  try { localStorage.setItem(SPAX_FULL_REPLACE_KEY, '1'); } catch (_) {}
+}
+function spaxTxFullReplaceRequired() {
+  try { return localStorage.getItem(SPAX_FULL_REPLACE_KEY) === '1'; } catch (_) { return false; }
+}
+function spaxClearTxFullReplace() {
+  try { localStorage.removeItem(SPAX_FULL_REPLACE_KEY); } catch (_) {}
+}
+// The cloud now holds exactly these rows (a completed full or delta save).
+function spaxNotePushedTransactions(rows) {
+  const keys = (rows || []).map(spaxTxIdentity).filter(Boolean);
+  spaxSavePushedTx(keys);
+  spaxClearTxFullReplace();
+}
+// A load showed these rows already live in the cloud: add them to the known
+// set without dropping knowledge of anything this device pushed earlier.
+function spaxNoteCloudTransactions(rows) {
+  const have = new Set(spaxLoadPushedTx() || []);
+  (rows || []).forEach(t => { const k = spaxTxIdentity(t); if (k) have.add(k); });
+  spaxSavePushedTx(Array.from(have));
+}
+// A Force Pull made the local sheet an exact copy of the cloud one.
+function spaxReplacePushedFromCloud(rows) {
+  spaxSavePushedTx((rows || []).map(spaxTxIdentity).filter(Boolean));
+  spaxClearTxFullReplace();
 }
 
 // Identity of a customer RECORD for merge purposes: name + contact.
@@ -1116,8 +1237,6 @@ async function loadFromCloud() {
       // cloud on the next auto-save, avoiding the sync-wedge that PR #38's push-back
       // caused.
       const localMonthlySnap = DB.monthly && DB.monthly.labels ? {labels: DB.monthly.labels.slice(), revenue: DB.monthly.revenue.slice()} : {labels:[], revenue:[]};
-      const localTxSnap = Array.isArray(DB.transactions) ? DB.transactions.slice() : [];
-      const localCustTxSnap = DB.customerTx ? JSON.parse(JSON.stringify(DB.customerTx)) : {};
       const localResolvedSnap = Number(DB.resolved) || 0;
       const localImportBatchSnap = Number(DB.importBatch) || 0;
 
@@ -1159,54 +1278,26 @@ async function loadFromCloud() {
         }
       }
 
-      // Transactions: union by receipt|date|time keys (including legacy 10-char variant)
-      const txNorm = t => ({...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0});
-      const cloudTx = Array.isArray(data.transactions) ? data.transactions.map(txNorm) : [];
-      const localTx = localTxSnap.map(txNorm);
-      const cloudTxKeys = new Set();
-      cloudTx.forEach(t=>{
-        cloudTxKeys.add(transactionKey(t));
-        const k2 = txKeyNoTime(t);
-        if (k2) cloudTxKeys.add(k2);
-        try { legacyReceiptKeys(t).forEach(k=>cloudTxKeys.add(k)); } catch(_) {}
-      });
-      const keptTx = cloudTx.slice();
-      localTx.forEach(t=>{
-        const k = transactionKey(t);
-        const k2 = txKeyNoTime(t);
-        let leg = [];
-        try { leg = legacyReceiptKeys(t); } catch(_) {}
-        if (cloudTxKeys.has(k) || (k2 && cloudTxKeys.has(k2)) || leg.some(x=>cloudTxKeys.has(x))) return;
-        keptTx.push(t);
-        cloudTxKeys.add(k);
-        if (k2) cloudTxKeys.add(k2);
-        leg.forEach(x=>cloudTxKeys.add(x));
-      });
-      DB.transactions = keptTx;
+      // Transactions: union by receipt|date|time keys (including legacy
+      // 10-char variants). Smart Merge uses the SAME helper
+      // (mergeCloudTransactionsIntoDB) so the two paths can never drift.
+      const cloudTx = mergeCloudTransactionsIntoDB(data.transactions);
+      // Record exactly which rows the cloud copy contained (the union above
+      // keeps them all): the cloud rows are already pushed, the local-only
+      // rows are not, so the next delta appends only the local-only ones.
+      spaxNoteCloudTransactions(cloudTx);
 
-      // Per-customer history: union by date|amount|receipt
-      const histKey = t => ((t.date||'')+'|'+Number(t.amount||0).toFixed(2)+'|'+String(t.receipt||'').toLowerCase());
-      const mergedCustTx = {};
-      if (data.customerTx) {
-        Object.keys(data.customerTx).forEach(name=>{
-          mergedCustTx[name] = (data.customerTx[name]||[]).map(t=>({...t, date: stripTime(t.date)||''}));
-        });
-      }
-      Object.keys(localCustTxSnap||{}).forEach(name=>{
-        const existing = mergedCustTx[name] || (mergedCustTx[name]=[]);
-        const have = new Set(existing.map(histKey));
-        (localCustTxSnap[name]||[]).forEach(t=>{
-          const k = histKey(t);
-          if (have.has(k)) return;
-          existing.push({...t, date: stripTime(t.date)||''});
-          have.add(k);
-        });
-      });
-      DB.customerTx = mergedCustTx;
+      // Per-customer history is a PROJECTION of the transactions table, so
+      // it is rebuilt locally instead of being merged from the (possibly
+      // stale) cloud copy. Rows with no global transaction survive as
+      // history-only (a localStorage compaction can shed their global copy)
+      // — rebuildCustomerHistory keeps those; see its notes.
+      rebuildCustomerHistory();
 
       // Seen map: rebuilt from the FINAL merged transactions, not unioned
-      // from a cloud copy. The guard is fully derivable from the rows it
-      // protects (markSeenInto writes the same key set an import would, and
+      // from a cloud copy — same derivation rule as the history rebuild just
+      // above. The guard is fully derivable from the rows it protects
+      // (markSeenInto writes the same key set an import would, and
       // healOrphanedSeenKeys enforces that invariant on every boot), so the
       // seen table is no longer synced at all — its sheet stays empty and
       // every device rebuilds its guard from the transactions it holds.
@@ -1392,7 +1483,8 @@ function spaxResumeInterruptedSave() {
   if (!pending) return false;
   try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
   if (typeof SYNC_MODE !== 'undefined' && SYNC_MODE === 'local') return false;
-  if (typeof toast === 'function') toast('🔄 Resuming the save that was interrupted — it continues from where it stopped; keep the app open until the pill shows ✅');
+  // No popup toast on resume — the sync pill already announces and tracks the
+  // resumed upload, and a boot-time toast made every restart feel like an error.
   try { showSyncStatus('🔄 Resuming interrupted save…'); } catch (_) {}
   try { saveToCloud(true, (typeof CLOUD_SAVE_NAMES !== 'undefined' ? CLOUD_SAVE_NAMES.save : '💾 Save')); } catch (_) {}
   return true;
@@ -1684,22 +1776,21 @@ async function performSaveToCloud(busyRetry = 0) {
         // wiped-then-pushed database stays wiped on every device that pulls.
         baselineCleared: DB.baselineCleared ? 1 : 0
       },
-      customerTx: Object.fromEntries(
-        Object.entries(DB.customerTx || {}).filter(([name]) => !isMerchant(name))
-      ),
-      // The `seen` dedup map is NOT uploaded. It is fully derivable from the
-      // transactions table (every key is written by markSeenInto at import
-      // time, and healOrphanedSeenKeys enforces seen ≡ derive(transactions)
-      // on every boot), so syncing it re-sent ~half the database on every
-      // save — thousands of rows that could never carry information the
-      // transactions sheet doesn't already hold. The cloud copy is left
-      // empty and every device rebuilds its guard from the transactions it
-      // holds on load. Backends already tolerate the absent table: saveAll
-      // stages `body.seen || {}`, and saveCommit counts `expect.seen || 0`
-      // against a staging sheet that saveBegin just reset — no Code.gs
-      // redeploy is required for this change.
+      // The `customerTx` history table and the `seen` dedup map are NOT
+      // uploaded. Both are fully derivable from the transactions table
+      // (rebuildCustomerHistory re-projects the history on every load;
+      // markSeenInto/healOrphanedSeenKeys rebuild and heal the guard), so
+      // syncing them re-sent ~two extra copies of the database on every
+      // save — tens of thousands of rows that carried nothing the
+      // transactions sheet didn't already hold. Every device rebuilds both
+      // locally from the rows it holds, and the backend empties the cloud
+      // sheets on the next save. Old backends tolerate the absent tables:
+      // saveAll stages `body.customerTx || {}` / `body.seen || {}`, and a
+      // full chunked commit counts 0 against staging sheets saveBegin just
+      // reset, so no Code.gs redeploy is required to drop the tables.
       transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
     };
+    const allTx = payload.transactions;
 
     // This save's abort handle: Delete All aborts it to take the slot over.
     const cancelSignal = cloudSaveToken ? cloudSaveToken.controller.signal : undefined;
@@ -1711,25 +1802,60 @@ async function performSaveToCloud(busyRetry = 0) {
       body: JSON.stringify(obj)
     }, timeoutMs);
 
-    // Flatten the two nested tables exactly as the backend does, so the row
-    // counts promised to saveCommit match what it stages.
-    const ctxRows = [];
-    Object.keys(payload.customerTx).forEach(name => {
-      (payload.customerTx[name] || []).forEach(t => ctxRows.push({
-        customer: name,
-        date: t.date || '',
-        amount: t.amount || 0,
-        product: t.product || '',
-        till: t.till || '',
-        receipt: t.receipt || '',
-        importedAt: t.importedAt || ''
-      }));
-    });
-    const bigTables = {
-      transactions: payload.transactions,
-      customerTx: ctxRows
-    };
-    const totalBigRows = bigTables.transactions.length + ctxRows.length;
+    // Transactions is the only big table now: the per-customer history and
+    // the dedup map stopped being synced (both are rebuilt on load), which
+    // took the routine full save from ~35k rows to ~17k.
+    const bigTables = { transactions: allTx };
+    const totalBigRows = allTx.length;
+
+    // ── INCREMENTAL SAVE (backend v3.4) ──
+    // When this device knows what the cloud already holds and the database
+    // only grew, the save appends the NEW transactions (small tables always
+    // ride along in full — they are cheap and must stay exact). A null delta
+    // means "cannot append": no pushed state yet (first save after the
+    // upgrade / a fresh device) or a destructive change flagged a full
+    // replace (Delete All, a scoped Rebuild, a duplicate rollback, a rename).
+    let deltaRows = null;
+    if (!spaxTxFullReplaceRequired()) {
+      const pushed = spaxPushedSet();
+      if (pushed) deltaRows = allTx.filter(t => !spaxTxAlreadyPushed(pushed, t));
+    }
+    if (deltaRows !== null && (cloudDelta || !cloudDeltaProbed)) {
+      try {
+        const deltaOk = await saveDeltaToCloud(post, payload, deltaRows);
+        if (deltaOk) {
+          // Every local row is now accounted for in the cloud — either it
+          // was already live there or the append just added it (the server
+          // de-duplicates, so rows it skipped were already present).
+          spaxNotePushedTransactions(allTx);
+          try { spaxClearUploadSession(); } catch (_) {}
+          lastSyncTime = new Date();
+          showSyncStatus(cloudSaveDoneMessage());
+          lastCloudError = '';
+          cloudStoppedUpload = null;
+          return true;
+        }
+      } catch (err) {
+        if (err && err.spaxCancelled) throw err;
+        if (isUnknownActionError(err)) {
+          cloudDelta = false;
+          cloudDeltaProbed = true;
+          try { localStorage.setItem('spaxCloudDelta', '0'); } catch (_) {}
+          console.warn('Cloud backend has no incremental actions — falling back to a full save.');
+          // fall through to the full-save paths below
+        } else if (err && err.probeFailed) {
+          // Transient failure of the probe (network drop, timeout) — not
+          // proof the deployment lacks saveDelta; fall back just this once.
+          console.warn('Delta probe failed (' + (err && err.message) + ') — falling back to a full save.');
+          // fall through
+        } else {
+          // Chunks already started landing. Appends are idempotent, but do
+          // not replay the whole database as one request: fail and let the
+          // next save resume/retry cleanly.
+          throw err;
+        }
+      }
+    }
 
     // Large payloads try the chunked upload first — but only if the backend is
     // known (or not yet known) to support it. A saveAll-only backend answers
@@ -1738,8 +1864,12 @@ async function performSaveToCloud(busyRetry = 0) {
     // a single request, on every backend.
     if (totalBigRows > CHUNK_ROWS && (cloudChunks || !cloudChunkProbed)) {
       try {
-        const chunked = await saveToCloudChunked(post, payload, bigTables, totalBigRows);
-        if (chunked) return true;
+        const chunked = await saveToCloudChunked(post, payload, bigTables, totalBigRows, 'full');
+        if (chunked) {
+          // A full commit just replaced the cloud sheet with these rows.
+          spaxNotePushedTransactions(allTx);
+          return true;
+        }
       } catch (err) {
         // A cancel must be checked FIRST: saveToCloudChunked marks every
         // saveBegin failure as probeFailed, and falling through to a one-shot
@@ -1788,8 +1918,11 @@ async function performSaveToCloud(busyRetry = 0) {
     }
     if (result.success) {
       // saveAll swapped every live sheet for a freshly staged copy, so any
-      // half-finished chunked session's staging area is gone with it.
+      // half-finished chunked session's staging area is gone with it. A
+      // full save replaced the cloud sheet verbatim, so the pushed set is
+      // exactly the rows it carried.
       try { spaxClearUploadSession(); } catch (_) {}
+      spaxNotePushedTransactions(allTx);
       lastSyncTime = new Date();
       showSyncStatus(cloudSaveDoneMessage());
       lastCloudError = '';
@@ -1901,9 +2034,12 @@ function spaxClearUploadSession() {
 // fingerprint, same promised counts), is fresh enough that the server's
 // staging area plausibly still holds its slices, and its cursors point at
 // slices that still exist. Anything else falls back to a full saveBegin.
-function spaxSessionUsable(session, bigTables, expect, basis, tables) {
+function spaxSessionUsable(session, bigTables, expect, basis, tables, mode) {
   if (!session || !session.cursors || !session.expect || !session.basis) return false;
   if (session.uploadId === undefined || session.uploadId === null) return false;
+  // A delta session and a full session share storage but are not
+  // interchangeable: their staging semantics and promised counts differ.
+  if ((session.mode || 'full') !== (mode || 'full')) return false;
   if (Date.now() - (Number(session.ts) || 0) > CHUNK_SESSION_MAX_AGE_MS) return false;
   for (let i = 0; i < tables.length; i++) {
     const t = tables[i];
@@ -1924,7 +2060,7 @@ function spaxSessionUsable(session, bigTables, expect, basis, tables) {
 // of them are answered by restarting the save from saveBegin — never by
 // failing the user's data.
 function isDeadUploadSessionError(msg) {
-  return /no upload in progress|superseded by a newer save|chunk mismatch/i.test(String(msg || ''));
+  return /no upload in progress|superseded by a newer save|chunk mismatch|delta uploads append transactions only/i.test(String(msg || ''));
 }
 
 // Sends every slice still owed (from the session's cursors) and commits.
@@ -1942,7 +2078,9 @@ async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tabl
       const slice = rows.slice(i, i + CHUNK_ROWS);
       let res;
       try {
-        res = await post({ action: 'saveChunk', table, rows: slice, uploadId: session.uploadId, seq }, CLOUD_TIMEOUT_CHUNK);
+        const chunkBody = { action: 'saveChunk', table, rows: slice, uploadId: session.uploadId, seq };
+        if (session.mode === 'delta') chunkBody.mode = 'delta';
+        res = await post(chunkBody, CLOUD_TIMEOUT_CHUNK);
       } catch (err) {
         // cloudRequest throws on success:false, so app-level refusals (a
         // superseded uploadId, a reset staging area) arrive here — flag them
@@ -1968,11 +2106,14 @@ async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tabl
     }
   }
 
-  // The backend verifies the staged row counts before it swaps anything in,
-  // so a lost chunk aborts the commit and leaves the good data in place.
+  // The backend verifies the staged row counts before it swaps anything in
+  // (or, for a delta, before it appends to the live sheet), so a lost chunk
+  // aborts the commit and leaves the good data in place.
+  const commitBody = { action: 'saveCommit', expect: session.expect, uploadId: session.uploadId };
+  if (session.mode === 'delta') commitBody.mode = 'delta';
   let commit;
   try {
-    commit = await post({ action: 'saveCommit', expect: session.expect, uploadId: session.uploadId });
+    commit = await post(commitBody);
   } catch (err) {
     if (err && isDeadUploadSessionError(err.message)) err.spaxSessionDead = true;
     throw err;
@@ -1990,8 +2131,13 @@ async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tabl
   throw err;
 }
 
-async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
-  const tables = ['transactions', 'customerTx'];
+// mode 'full' stages every table and swaps the live sheets (the original
+// protocol). mode 'delta' stages only the NEW transactions and the backend
+// appends them to the live Transactions sheet (backend v3.4) — small tables
+// still stage-and-swap so contact edits and baseline changes always land.
+async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode) {
+  mode = mode === 'delta' ? 'delta' : 'full';
+  const tables = ['transactions'];
   const expect = {};
   const basis = {};
   tables.forEach(t => { expect[t] = bigTables[t].length; basis[t] = spaxTableBasis(bigTables[t]); });
@@ -1999,7 +2145,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
   // Resume an interrupted upload if — and only if — the database it describes
   // is byte-for-byte the one this save is about to send.
   const saved = spaxLoadUploadSession();
-  if (spaxSessionUsable(saved, bigTables, expect, basis, tables)) {
+  if (spaxSessionUsable(saved, bigTables, expect, basis, tables, mode)) {
     showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · resuming interrupted upload — keep the app open');
     try {
       return await spaxRunChunkedUpload(post, saved, bigTables, totalBigRows, tables);
@@ -2016,15 +2162,17 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
     }
   }
 
-  showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · large upload, sending in parts');
+  showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + (mode === 'delta'
+    ? ' · sending new rows in parts'
+    : ' · large upload, sending in parts'));
   let begin;
   try {
-    begin = await post({
+    begin = await post(Object.assign({
       action: 'saveBegin',
       customers: payload.customers,
       monthly: payload.monthly,
       settings: payload.settings
-    }, CLOUD_TIMEOUT_CHUNK);
+    }, mode === 'delta' ? { mode: 'delta' } : null), CLOUD_TIMEOUT_CHUNK);
   } catch (err) {
     // Distinguish the probe from the upload itself: a probe that fails for a
     // transient reason (network drop, timeout) may fall back to saveAll, but
@@ -2039,16 +2187,31 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
   cloudChunks = true;
   cloudChunkProbed = true;
   try { localStorage.setItem('spaxCloudChunked', '1'); } catch (_) {}
+  if (mode === 'delta') {
+    // A pre-v3.4 backend accepts the saveBegin but silently ignores the
+    // unknown `mode` field — its staging semantics are full-replace, which
+    // would refuse our partial commit. The echoed `delta:true` flag proves
+    // the backend is staging this session for an append.
+    if (!begin || begin.delta !== true) {
+      const err = new Error('unknown action: delta mode');
+      err.probeFailed = true;
+      throw err;
+    }
+    cloudDelta = true;
+    cloudDeltaProbed = true;
+    try { localStorage.setItem('spaxCloudDelta', '1'); } catch (_) {}
+  }
   // Backend v3.0 mints an uploadId per upload session so a second device's
   // save can't interleave slices with ours. Older backends return none —
   // echo '' and they ignore the field.
   const session = {
-    v: 1,
+    v: 2,
+    mode,
     uploadId: begin && begin.uploadId ? String(begin.uploadId) : '',
     ts: Date.now(),
     expect,
     basis,
-    cursors: { transactions: 0, customerTx: 0 },
+    cursors: { transactions: 0 },
     sent: 0
   };
   spaxSaveUploadSession(session);
@@ -2060,6 +2223,48 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows) {
     if (err && err.spaxSessionDead) spaxClearUploadSession();
     throw err;
   }
+}
+
+// Incremental save (backend v3.4): the small tables go up in full and only
+// the rows added since the last confirmed push travel as Transactions. A
+// small delta is a single saveDelta POST; a large first delta after the
+// upgrade is sliced (mode:"delta" chunked session) and still append-only.
+async function saveDeltaToCloud(post, payload, deltaRows) {
+  const rememberDelta = () => {
+    cloudDelta = true;
+    cloudDeltaProbed = true;
+    try { localStorage.setItem('spaxCloudDelta', '1'); } catch (_) {}
+  };
+  const oneShot = async (txAdd) => {
+    // A failed one-shot probe (transient network drop, a pre-v3.4 deployment
+    // answering "unknown action", any other rejection) is always safe to
+    // follow with a full save — no rows were staged or appended — so flag it
+    // as a probe failure for the caller; unknown-action is still recognised
+    // separately there and cached as "deployment lacks deltas".
+    try {
+      const res = await post({
+        action: 'saveDelta',
+        customers: payload.customers,
+        monthly: payload.monthly,
+        settings: payload.settings,
+        txAdd
+      }, CLOUD_TIMEOUT_CHUNK);
+      if (res && res.success === true) {
+        rememberDelta();
+        return true;
+      }
+      throw new Error((res && res.error) || 'Cloud rejected the delta save');
+    } catch (err) {
+      err.probeFailed = true;
+      throw err;
+    }
+  };
+  // Small deltas (and a nothing-new save carrying only the small tables) are
+  // a single POST. A first delta larger than CHUNK_ROWS is sliced as a
+  // mode:"delta" chunked session — still append-only.
+  if (!deltaRows || deltaRows.length <= CHUNK_ROWS) return await oneShot((deltaRows || []));
+  const deltaTables = { transactions: deltaRows };
+  return await saveToCloudChunked(post, payload, deltaTables, deltaRows.length, 'delta');
 }
 
 // A save may fail without touching any sheet when another device/tab owns
@@ -4042,6 +4247,10 @@ async function load(){
       // whose rows were previously lost can re-book them instead of skipping
       // them as "already imported".
       const healed = healOrphanedSeenKeys();
+      // customerTx is a derived table (not synced): project it from the final
+      // transactions before repairDates reconciles the per-customer tallies
+      // against it. Idempotent after the rebuild loadFromCloud already ran.
+      const histRebuilt = rebuildCustomerHistory();
       const fixed = repairDates();
       if (fixed > 0) console.log('Date repair: fixed', fixed, 'customers');
       // Persist locally only. A cloud push on every boot after repair raced
@@ -4050,20 +4259,22 @@ async function load(){
       // this startup heal. The next real edit / Force Push carries the data.
       // Exception: a previous session that died mid-save (minimized app killed
       // by the OS) left the resume flag set — that save goes up now, once.
-      if (healed > 0 || fixed > 0) persistDB();
+      if (healed > 0 || fixed > 0 || histRebuilt) persistDB();
       try { spaxResumeInterruptedSave(); } catch (_) {}
       return cloudLoaded;
     }).catch(() => {
       refreshAll();
       const healed = healOrphanedSeenKeys();
+      const histRebuilt = rebuildCustomerHistory();
       const fixed = repairDates();
       if (fixed > 0) console.log('Date repair: fixed', fixed, 'customers');
-      if (healed > 0 || fixed > 0) persistDB();
+      if (healed > 0 || fixed > 0 || histRebuilt) persistDB();
       try { spaxResumeInterruptedSave(); } catch (_) {}
     });
   }catch(e){
     DB=await seedDB();
     refreshAll();
+    rebuildCustomerHistory();
     const fixed = repairDates();
     if (fixed > 0) { console.log('Date repair: fixed', fixed, 'customers'); persistDB(); }
     return Promise.resolve();
@@ -6730,6 +6941,10 @@ function purgeMerchantData(quiet) {
 
     const removedTx = beforeTx - (DB.transactions || []).length;
     const removedCustomers = beforeCustomers - (DB.customers || []).length;
+    // Merchant rows are never uploaded, but a pre-filter build could already
+    // have left them on the cloud sheet — only a full replace scrubs them,
+    // so flag one when this purge actually shed transactions.
+    if (removedTx > 0) spaxMarkTxFullReplace();
     if ((removedTx || removedCustomers || removedRev) && !quiet) {
       save(); // persist — save() → refreshAll() re-enters, but the next pass
               // is a no-op (everything is already clean), so this converges.
@@ -7113,6 +7328,196 @@ function healOrphanedSeenKeys() {
     console.warn('Seen-map heal: cleared ' + cleared + ' orphaned dedup key(s) with no backing transaction');
   }
   return cleared;
+}
+
+// Union a cloud transactions array into DB.transactions with the same
+// identity rules loadFromCloud uses (receipt|date|time, the time-less
+// fallback and legacy truncated-receipt keys). Every cloud row is kept and
+// a local row is appended only when the cloud copy lacks it. Returns the
+// normalized cloud rows actually presented, so callers can mark them as
+// already pushed. Used by both loadFromCloud and Smart Merge — the
+// per-customer history is now a projection of exactly this union.
+function mergeCloudTransactionsIntoDB(dataTx) {
+  const txNorm = t => ({ ...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0 });
+  const cloudTx = Array.isArray(dataTx) ? dataTx.map(txNorm) : [];
+  const localTx = (Array.isArray(DB.transactions) ? DB.transactions : []).map(txNorm);
+  const cloudTxKeys = new Set();
+  const addKeys = (set, t) => {
+    set.add(transactionKey(t));
+    const k2 = txKeyNoTime(t);
+    if (k2) set.add(k2);
+    try { legacyReceiptKeys(t).forEach(k => set.add(k)); } catch (_) {}
+  };
+  cloudTx.forEach(t => addKeys(cloudTxKeys, t));
+  const kept = cloudTx.slice();
+  localTx.forEach(t => {
+    const k = transactionKey(t);
+    const k2 = txKeyNoTime(t);
+    let leg = [];
+    try { leg = legacyReceiptKeys(t); } catch (_) {}
+    if (cloudTxKeys.has(k) || (k2 && cloudTxKeys.has(k2)) || leg.some(x => cloudTxKeys.has(x))) return;
+    kept.push(t);
+    addKeys(cloudTxKeys, t);
+  });
+  DB.transactions = kept;
+  return cloudTx;
+}
+
+/* ══════════ PER-CUSTOMER HISTORY IS DERIVED ══════════
+   DB.customerTx is a PROJECTION of DB.transactions, exactly like DB.seen:
+   every imported transaction is attached to the customer the same matcher
+   used at import time (findCustomerMatch — phone first, then masked number,
+   then exact/fuzzy name; the FIRST record of a same-name pair owns the
+   history, mirroring historyOwnerMap), or filed under its statement name
+   when no record exists yet. The table is no longer synced to the cloud —
+   each device rebuilds it on load and the cloud sheet stays empty — which
+   removed a near 1:1 copy of the transactions sheet from every save (the
+   same trick that made the seen map local).
+
+   Pure derivation alone is not enough: a device without IndexedDB can be
+   forced by quota to shed the global copy of a backfillOnly transaction
+   while keeping its per-customer history row (persistToLocalStorage).
+   Those HISTORY-ONLY rows have no backing global transaction and must be
+   preserved; stale rows that DO have a backing transaction are always
+   re-derived (which also re-homes history after a rename, a contact
+   resolution or a customer merge). Duplicate handling matches
+   repairDates(): only receipt-bearing rows collapse (cleaned receipt ≥ 8
+   chars + date + amount); two receipt-less payments sharing a date and
+   amount stay distinct. The function returns whether the projection
+   changed, so the boot path knows to persist the heal. */
+function rebuildCustomerHistory() {
+  if (!DB) return false;
+  if (!DB.customers) DB.customers = [];
+  if (!Array.isArray(DB.transactions)) DB.transactions = [];
+  const prev = DB.customerTx || {};
+
+  const cleanRc = r => String(r == null ? '' : r).replace(/[^A-Z0-9]/gi, '').toUpperCase();
+  // One-payment identity for receipt rows (same scheme repairDates dedups).
+  const receiptKey = (date, amount, receipt) => {
+    const rc = cleanRc(receipt);
+    if (rc.length < 8) return '';
+    return rc + '|' + (stripTime(date) || '') + '|' + (Number(amount) || 0).toFixed(2);
+  };
+  // Multiset key for receipt-less rows (date + amount + cleaned receipt,
+  // which is empty for truly receipt-less payments; product/till/importedAt
+  // are deliberately ignored).
+  const bucketKey = t => (stripTime(t && t.date) || '') + '|' + (Number(t && t.amount) || 0).toFixed(2) + '|' + cleanRc(t && t.receipt).toLowerCase();
+  const histRowOf = t => ({
+    date: stripTime(t.date) || '',
+    amount: Number(t.amount) || 0,
+    product: t.product || '',
+    till: t.till || '',
+    receipt: t.receipt || '',
+    importedAt: t.importedAt || ''
+  });
+
+  // Fast owner indexes (the transactions list can be tens of thousands of
+  // rows; findCustomerMatch's linear scans would make every boot quadratic).
+  const phoneIndex = new Map();   // normalized full number → first record
+  const maskedIndex = new Map();  // masked number → first record
+  const nameIndex = new Map();    // normalized name → first record
+  DB.customers.forEach(c => {
+    if (!c) return;
+    const pc = normalizeContact(c.contact);
+    if (pc && isValidKenyanContact(pc)) { if (!phoneIndex.has(pc)) phoneIndex.set(pc, c); }
+    else if (pc && pc.indexOf('***') >= 0) { if (!maskedIndex.has(pc)) maskedIndex.set(pc, c); }
+    const nn = normalizeName(c.name);
+    if (nn && !nameIndex.has(nn)) nameIndex.set(nn, c);
+  });
+  const ownerForTx = tx => {
+    const pc = normalizeContact(tx.phone || tx.contact);
+    if (pc && isValidKenyanContact(pc) && phoneIndex.has(pc)) return phoneIndex.get(pc);
+    if (pc && pc.indexOf('***') >= 0 && maskedIndex.has(pc)) return maskedIndex.get(pc);
+    const nn = normalizeName(tx.name);
+    if (nn && nameIndex.has(nn)) return nameIndex.get(nn);
+    // Rare: fuzzy token match (a statement spelling variant with no
+    // phone/masked/exact-name hit) — fall back to the real matcher.
+    return findCustomerMatch(tx);
+  };
+
+  const next = {};
+  const receiptSeen = new Map();      // customer name → Set(receiptKey)
+  const compositeMade = new Map();    // customer name → Map(bucketKey → count derived)
+  const addRow = (name, src, derived) => {
+    if (!name) return;
+    if (!next[name]) next[name] = [];
+    const rk = receiptKey(src.date, src.amount, src.receipt);
+    if (rk) {
+      let set = receiptSeen.get(name);
+      if (!set) { set = new Set(); receiptSeen.set(name, set); }
+      if (set.has(rk)) return; // same payment imported twice
+      set.add(rk);
+    } else if (!derived) {
+      // A preserved, receipt-less history row survives only in excess of
+      // what derivation already produced for this customer/day/amount.
+      const bk = bucketKey(src);
+      const map = compositeMade.get(name);
+      const n = map ? (map.get(bk) || 0) : 0;
+      if (n > 0) { map.set(bk, n - 1); return; }
+    }
+    next[name].push(histRowOf(src));
+  };
+
+  // 1) Derive a history row for every non-merchant transaction. The main
+  // import always creates a customer record for an unknown name, so its rows
+  // attach here; a BACKFILL row that never matched a record historically got
+  // no history bucket either (it lives in DB.transactions only), so a row
+  // with no record is attached under its statement name ONLY when that bucket
+  // already existed (a cloud/history-only name) — the projection must not
+  // invent buckets the import paths would not have created.
+  DB.transactions.forEach(tx => {
+    if (!tx) return;
+    if (isMerchant(tx.name) || isMerchant(tx.details)) return;
+    const cust = ownerForTx(tx);
+    let name = cust ? cust.name : '';
+    if (!name) {
+      const statementName = tx.name || '';
+      if (statementName && Object.prototype.hasOwnProperty.call(prev, statementName)) name = statementName;
+    }
+    if (!name) return;
+    addRow(name, tx, true);
+    // Count derived rows by the SAME non-receipt identity the preserve path
+    // uses: a receipt shorter than the dedup threshold (repairDates only
+    // collapses receipts of ≥ 8 cleaned chars) is accounted for by the
+    // date/amount/receipt bucket, not as a global one-payment receipt.
+    if (!receiptKey(tx.date, tx.amount, tx.receipt)) {
+      const bk = bucketKey(tx);
+      let map = compositeMade.get(name);
+      if (!map) { map = new Map(); compositeMade.set(name, map); }
+      map.set(bk, (map.get(bk) || 0) + 1);
+    }
+  });
+
+  // Every receipt present in the (final, merged) transactions table is
+  // identity-covered by derivation — even if its derived row lands under a
+  // different owner (a rename/merge self-heals instead of duplicating).
+  const globalReceipts = new Set();
+  DB.transactions.forEach(tx => {
+    const rk = receiptKey(tx.date, tx.amount, tx.receipt);
+    if (rk) globalReceipts.add(rk);
+  });
+
+  // 2) Preserve history-only rows the derivation cannot reproduce.
+  Object.keys(prev).forEach(name => {
+    (prev[name] || []).forEach(row => {
+      const rk = receiptKey(row.date, row.amount, row.receipt);
+      if (rk && globalReceipts.has(rk)) return; // rebuilt above (maybe under a new owner)
+      addRow(name, row, false);
+    });
+  });
+
+  // Newest first, drop empty buckets, then compare the projection's identity
+  // signature with what was there so callers persist only on change.
+  Object.keys(next).forEach(name => {
+    if (!next[name].length) { delete next[name]; return; }
+    next[name].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  });
+  const sigOf = map => Object.keys(map).sort().map(n => n + ':' +
+    (map[n] || []).map(bucketKey).sort().join(',')).join(';');
+  const changed = sigOf(prev) !== sigOf(next);
+  DB.customerTx = next;
+  if (changed) console.log('History rebuild: re-derived per-customer history from transactions');
+  return changed;
 }
 
 /* ══════════ NEW-CUSTOMER FLAG (isNew) ══════════
@@ -7525,10 +7930,14 @@ function reconcileImportedRevenue(){
     rolledBack = _round2(rolledBack + drop);
   });
   DB.transactions = survivors;
+  // Rows were DELETED — an append-only delta cannot remove them from the
+  // cloud sheet, so the next save must fully replace Transactions.
+  spaxMarkTxFullReplace();
   // Rebuild the dedup seen-map from surviving transactions (same key scheme the
   // import guard uses, including the time-less receipt variant for older rows).
   DB.seen = {};
   DB.transactions.forEach(t => { markSeen(t); });
+  rebuildCustomerHistory();
   repairDates();
   save();
   refreshAll();
@@ -7612,13 +8021,9 @@ function dedupeCustomers(){
       Object.assign(primary, mergeBaselineFields(primary, o));
       if (o.lastVisit && (!primary.lastVisit || o.lastVisit > primary.lastVisit)) primary.lastVisit = o.lastVisit;
       if (o.firstVisit && (!primary.firstVisit || o.firstVisit < primary.firstVisit)) primary.firstVisit = o.firstVisit;
-      // Consolidate transaction history onto the survivor (only when the two
-      // records live under different history keys — same-name dups share one key).
-      if (DB.customerTx[o.name] && normalizeName(o.name) !== normalizeName(primary.name)){
-        const arr = DB.customerTx[primary.name] || (DB.customerTx[primary.name] = []);
-        Array.prototype.push.apply(arr, DB.customerTx[o.name]);
-        delete DB.customerTx[o.name];
-      }
+      // Transaction history consolidation happens below via
+      // rebuildCustomerHistory(): after the repoint it re-projects every row
+      // onto the survivor by phone/masked/name match (the table is derived).
       merged++;
     });
     // Re-point every imported transaction that referenced a removed name
@@ -7641,6 +8046,12 @@ function dedupeCustomers(){
     if (!inGroup || survivorIdx.has(i)) next.push(c);
   });
   DB.customers = next;
+  // Re-project history onto the merged customer set, then reconcile tallies.
+  rebuildCustomerHistory();
+  // Repointing rows onto a survivor RENAMES existing cloud rows (their
+  // composite identity moves too) — an append cannot change them, so the
+  // next save must fully replace the Transactions sheet.
+  if (groups.length) spaxMarkTxFullReplace();
   repairDates();
   save();
   refreshAll();
@@ -8281,7 +8692,16 @@ $('resetBtn').onclick = async () => {
   const msg = hasCustom
     ? 'Reset to your saved baseline (the last “Save Current as Local Baseline”)? Imports after that save will be dropped.'
     : 'Reset ALL data to the original report seed (imports, dedup history, resolved contacts)?';
-  if (confirm(msg)) { DB = await seedDB(); save(); toast(hasCustom ? '↺ Restored your saved baseline' : '↺ Reset complete'); }
+  if (confirm(msg)) {
+    DB = await seedDB();
+    // Wholesale local replacement (seed or saved baseline): the next cloud
+    // save must fully replace Transactions, not append — rows this snapshot
+    // lacks could still be on the sheet.
+    spaxMarkTxFullReplace();
+    rebuildCustomerHistory();
+    save();
+    toast(hasCustom ? '↺ Restored your saved baseline' : '↺ Reset complete');
+  }
 };
 
 /* ══════════ SAVE CURRENT AS LOCAL BASELINE / EXPORT JS SEED CODE ══════════ */
@@ -8318,6 +8738,11 @@ async function restoreLocalBaseline(){
     if(!DB.seen) DB.seen = {};
     if(!DB.transactions) DB.transactions = [];
     if(!DB.customerTx) DB.customerTx = {};
+    // A wholesale local replacement cannot be expressed as appends: rows the
+    // restored snapshot lacks may still be on the sheet, so flag a full
+    // replace for the next push and re-project the derived history.
+    rebuildCustomerHistory();
+    spaxMarkTxFullReplace();
     save();
     toast('♻️ Local baseline restored');
     return { ok: true, customers: n };
@@ -8662,13 +9087,10 @@ function saveContactEdit(){
   const oldName = c.name;
   let changes = [];
 
-  // Update name (also update transaction history key and transaction references)
+  // Update name (transaction references move with it; the derived history is
+  // re-projected below by rebuildCustomerHistory instead of being moved by
+  // hand).
   if(newName !== oldName){
-    // Move transaction history to the new name
-    if(DB.customerTx && DB.customerTx[oldName]){
-      DB.customerTx[newName] = DB.customerTx[oldName];
-      delete DB.customerTx[oldName];
-    }
     // Update transaction references
     (DB.transactions || []).forEach(t => {
       if(t.name === oldName) t.name = newName;
@@ -8698,6 +9120,10 @@ function saveContactEdit(){
     return;
   }
 
+  // A rename rewrites existing cloud rows (and the composite identity of
+  // receipt-less rows) — the next save must fully replace Transactions.
+  if(changes.some(x => x.indexOf('name → ') === 0)) spaxMarkTxFullReplace();
+  rebuildCustomerHistory();
   repairDates();
   save();
   refreshAll();
@@ -9220,6 +9646,10 @@ function urlBase64ToUint8Array(base64String){
 async function forcePushToCloud(){
   if(!confirm('🚀 FORCE PUSH\n\nThis will OVERWRITE the Google Sheet with your LOCAL data (' + DB.customers.length + ' customers).\n\nAre you sure?')) return;
 
+  // Force Push is an explicit OVERWRITE, not an append: rows this device
+  // deleted or renamed must actually leave the sheet, so take the full
+  // replace path even when an incremental delta would otherwise suffice.
+  spaxMarkTxFullReplace();
   showSyncStatus('🚀 Force pushing local data...');
   try{
     const saved = await saveToCloud(true, CLOUD_SAVE_NAMES.forcePush);
@@ -9263,9 +9693,10 @@ async function forcePullFromCloud(){
     if(data.transactions){
       DB.transactions = data.transactions.map(t => ({...t, amount: Number(t.amount) || 0}));
     }
-    if(data.customerTx){
-      DB.customerTx = data.customerTx;
-    }
+    // Per-customer history is a projection of the transactions table (no
+    // longer synced): any cloud customerTx copy is stale-by-definition, so
+    // rebuild locally from the pulled rows rather than overwriting.
+    rebuildCustomerHistory();
     // Restore the dedup map by REBUILDING it from the pulled transactions —
     // the guard is derivable from the rows it protects and is no longer
     // synced (see performSaveToCloud). Ignoring any stale cloud copy also
@@ -9277,6 +9708,11 @@ async function forcePullFromCloud(){
     repairDates(); // re-derive spent/visits from the pulled baseline + history
     save();
     purgeMerchantData();
+    // A pull made the local sheet an exact copy of the cloud one: the pushed
+    // set is exactly whatever survived the merchant purge, and there can be
+    // no pending full-replace flag inherited from the previous local state.
+    spaxReplacePushedFromCloud(DB.transactions || []);
+    spaxClearTxFullReplace();
     refreshAll();
     $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pulled ' + DB.customers.length + ' customers from cloud. Local data overwritten.</span>';
     showSyncStatus('✅ Force pull complete');
@@ -9337,20 +9773,12 @@ async function smartMergeCloud(){
     DB.customers = merged;
     if(data.monthly) DB.monthly = data.monthly;
 
-    // Merge customerTx: keep both local and cloud transactions
-    const cloudTx = data.customerTx || {};
-    Object.keys(cloudTx).forEach(name => {
-      if(!DB.customerTx[name]) DB.customerTx[name] = [];
-      const existing = new Set(DB.customerTx[name].map(t => t.date + '|' + t.amount + '|' + t.receipt));
-      cloudTx[name].forEach(t => {
-        const key = t.date + '|' + t.amount + '|' + t.receipt;
-        if(!existing.has(key)){
-          DB.customerTx[name].push(t);
-          existing.add(key);
-        }
-      });
-      DB.customerTx[name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
-    });
+    // Transactions: keep both local and cloud rows (identity union, same
+    // rules as loadFromCloud). The per-customer history is no longer synced
+    // — it is a projection of this union and is rebuilt below.
+    const cloudTx = mergeCloudTransactionsIntoDB(data.transactions);
+    spaxNoteCloudTransactions(cloudTx);
+    rebuildCustomerHistory();
 
     // A cleared baseline is viral across merges too (see loadFromCloud).
     if ((data.settings && Number(data.settings.baselineCleared) === 1) || baselineCleared()) {
@@ -9732,6 +10160,9 @@ function clearHistoryInPeriod(period){
     });
     if(keep.length !== rows.length) DB.customerTx[name] = keep;
   });
+  // Rows were DELETED inside the window — an append cannot remove them from
+  // the cloud sheet, so the rebuild's save must fully replace Transactions.
+  if (removed > 0) spaxMarkTxFullReplace();
   return removed;
 }
 function rebuildSeenMap(){
@@ -9826,6 +10257,9 @@ function deleteAllKeepResolved(){
   DB.importBatch = 0;
   DB.resolved = plan.savedCount;
   DB.baselineCleared = true;
+  // Every cloud row is about to be deleted — an append-only delta cannot do
+  // that. The wipe's save must fully replace the Transactions sheet.
+  spaxMarkTxFullReplace();
   return plan;
 }
 

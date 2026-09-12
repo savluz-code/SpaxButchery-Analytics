@@ -624,7 +624,291 @@ test('code.html reads the backend version from the file, not from hard-coded mar
   assert.strictEqual(current.ver, header[1]);
   assert.strictEqual(current.date, header[2]);
 
-  // …and the version it reports is the one that carries the till column
-  // (v3.3 supersedes the v3.2 chunk-mismatch fix).
-  assert.strictEqual(current.ver, 'v3.3', 'code.html must be offering the fixed backend');
+  // …and the version it reports is the incremental-save backend.
+  // (v3.4 supersedes the v3.3 till-column release.)
+  assert.strictEqual(current.ver, 'v3.4', 'code.html must be offering the fixed backend');
+});
+
+/* ── incremental saves (backend v3.4) ───────────────────────────────────────
+ * Routine saves append ONLY the transactions added since the last push — the
+ * live Transactions sheet is never replaced by a delta (an append cannot
+ * truncate), de-duplication is identity-based so a retried/replayed/two-device
+ * append cannot double-count, and the small tables still stage-and-swap so
+ * contact edits and baseline-cleared state always land exactly. Deletions and
+ * renames are not append-shaped: the client takes the full path for those.
+ * Old saveAll clients keep working unchanged (the table set is untouched). */
+
+function deltaRow(receipt, extra) {
+  return Object.assign({
+    date: '2026-09-10', time: '12:00:00', amount: 200, name: 'New Person',
+    phone: '254710000000', product: 'Beef', till: '5803756',
+    source: 'test', importedAt: '2026-09-10'
+  }, extra || {}, receipt ? { receipt } : {});
+}
+
+test('saveDelta appends new transactions to the LIVE sheet and empties the derivable caches', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  assert.deepStrictEqual(await env.post({ action: 'saveAll', ...db }), { success: true });
+  assert.strictEqual((await env.load()).transactions.length, 5);
+
+  const addRows = [deltaRow('NEW0001'), deltaRow('NEW0002')];
+  const res = await env.post({
+    action: 'saveDelta',
+    customers: db.customers,
+    monthly: db.monthly,
+    settings: db.settings,
+    txAdd: addRows
+  });
+  assert.strictEqual(res.success, true);
+  assert.strictEqual(res.added, 2, 'both new rows appended');
+  assert.strictEqual(res.skippedDuplicates, 0);
+  assert.strictEqual(res.transactions, 7, 'total live rows reported');
+
+  // The append never replaced the sheet: the original five rows keep their
+  // place and the two new rows follow them.
+  const loaded = await env.load();
+  assert.strictEqual(loaded.transactions.length, 7);
+  assert.strictEqual(loaded.transactions[0].receipt, 'RCPT0');
+  assert.strictEqual(loaded.transactions[5].receipt, 'NEW0001');
+  assert.strictEqual(loaded.transactions[6].receipt, 'NEW0002');
+  assert.strictEqual(loaded.transactions[6].till, '5803756', 'the appended row keeps its till');
+
+  // The derivable caches are no longer synced — a delta empties them exactly
+  // like a full save does.
+  assert.strictEqual(Object.keys(loaded.customerTx).length, 0, 'CustomerTx must be header-only after a delta');
+  assert.strictEqual(Object.keys(loaded.seen).length, 0, 'Seen must be header-only after a delta');
+});
+
+test('saveDelta is idempotent — replaying the same append adds nothing', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  const payload = {
+    action: 'saveDelta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings,
+    txAdd: [deltaRow('NEW0003'), deltaRow('NEW0004')]
+  };
+  const first = await env.post(payload);
+  assert.strictEqual(first.added, 2);
+
+  // The response got lost; the client retries the identical POST (what a
+  // mobile timeout then retry actually does). Nothing may be double-booked.
+  const retry = await env.post(payload);
+  assert.strictEqual(retry.success, true);
+  assert.strictEqual(retry.added, 0, 'the replay appends nothing');
+  assert.strictEqual(retry.skippedDuplicates, 2);
+  assert.strictEqual(retry.transactions, 7);
+  assert.strictEqual((await env.load()).transactions.length, 7);
+});
+
+test('saveDelta de-duplicates a row repeated inside one batch', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  const row = deltaRow('NEW0005');
+  const res = await env.post({
+    action: 'saveDelta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings,
+    txAdd: [row, { ...row }]
+  });
+  assert.strictEqual(res.added, 1);
+  assert.strictEqual(res.skippedDuplicates, 1);
+  assert.strictEqual((await env.load()).transactions.length, 6);
+});
+
+test('saveDelta recognises duplicates by the time-less receipt identity after a cloud round-trip', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+  // First append carries a time (as an import does).
+  await env.post({
+    action: 'saveDelta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings,
+    txAdd: [deltaRow('NEW0006', { time: '08:15:00' })]
+  });
+  // Another device only knows the time-less cloud row; its replay must skip.
+  const again = await env.post({
+    action: 'saveDelta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings,
+    txAdd: [deltaRow('NEW0006', { time: '' })]
+  });
+  assert.strictEqual(again.added, 0, 'receipt + date alone must identify the payment');
+  assert.strictEqual((await env.load()).transactions.length, 6);
+});
+
+test('saveDelta keeps receipt-less payments apart with the strict composite identity', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  // Same day and amount, different customers — both must append.
+  const a = deltaRow('', { name: 'Cash Buyer A', phone: '254711111111' });
+  const b = deltaRow('', { name: 'Cash Buyer B', phone: '254722222222' });
+  const res = await env.post({
+    action: 'saveDelta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings,
+    txAdd: [a, b]
+  });
+  assert.strictEqual(res.added, 2, 'two genuinely different same-day payments must not collapse');
+
+  // An exact composite repeat (same date/time/amount/name/contact) skips.
+  const replay = await env.post({
+    action: 'saveDelta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings,
+    txAdd: [{ ...a }]
+  });
+  assert.strictEqual(replay.added, 0);
+  assert.strictEqual((await env.load()).transactions.length, 7);
+});
+
+test('saveDelta with no new rows still swaps the small tables', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  // A contact resolution/baseline edit is the only thing this save carries.
+  const customers = [{ ...db.customers[0], spent: 999 }];
+  const res = await env.post({
+    action: 'saveDelta', customers, monthly: db.monthly, settings: db.settings, txAdd: []
+  });
+  assert.strictEqual(res.success, true);
+  assert.strictEqual(res.added, 0);
+  const loaded = await env.load();
+  assert.strictEqual(loaded.transactions.length, 5, 'an empty delta never touches transactions');
+  assert.strictEqual(loaded.customers[0].spent, 999, 'the small-table edit still lands');
+});
+
+test('saveDelta without the lock answers busy and appends nothing', async () => {
+  const env = makeEnv({ lockBusy: true });
+  const res = await env.post({ action: 'saveDelta', customers: [], monthly: { labels: [], revenue: [] }, settings: {}, txAdd: [deltaRow('X')] });
+  assert.strictEqual(res.success, false);
+  assert.match(res.error, /backend busy/);
+  assert.strictEqual(env.sheet('Transactions'), null, 'a busy refusal must not touch any sheet');
+});
+
+test('a delta chunked session is advertised, appends transactions, and refuses other tables', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  const begin = await env.post({
+    action: 'saveBegin', mode: 'delta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings
+  });
+  assert.strictEqual(begin.success, true);
+  assert.strictEqual(begin.delta, true, 'the backend must echo delta:true so the client can tell it apart from a pre-v3.4 deploy');
+
+  const addRows = [deltaRow('CHUNK001'), deltaRow('CHUNK002'), deltaRow('CHUNK003')];
+  const chunk = await env.post({
+    action: 'saveChunk', table: 'transactions', rows: addRows,
+    uploadId: begin.uploadId, seq: 0
+  });
+  assert.strictEqual(chunk.success, true);
+  assert.strictEqual(chunk.written, 3);
+  // Nothing has been appended yet — a delta only appends at commit.
+  assert.strictEqual((await env.load()).transactions.length, 5, 'the live sheet is untouched until the commit');
+
+  // The derivable caches never ride a delta session.
+  const refused = await env.post({
+    action: 'saveChunk', table: 'customerTx',
+    rows: [{ customer: 'Alice', date: '2026-09-10', amount: 1 }],
+    uploadId: begin.uploadId, seq: 0
+  });
+  assert.strictEqual(refused.success, false);
+  assert.match(refused.error, /delta uploads append transactions only/);
+
+  const commit = await env.post({
+    action: 'saveCommit', mode: 'delta',
+    expect: { transactions: 3 }, uploadId: begin.uploadId
+  });
+  assert.strictEqual(commit.success, true);
+  assert.strictEqual(commit.added, 3);
+  const loaded = await env.load();
+  assert.strictEqual(loaded.transactions.length, 8, 'commit appends to the live sheet, never replaces it');
+  assert.strictEqual(loaded.transactions[5].receipt, 'CHUNK001');
+  assert.strictEqual(Object.keys(loaded.customerTx).length, 0);
+});
+
+test('a full (non-delta) saveBegin does not echo delta and still swaps every table', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  const begin = await env.post({
+    action: 'saveBegin',
+    customers: db.customers, monthly: db.monthly, settings: db.settings
+  });
+  assert.strictEqual(begin.success, true);
+  assert.strictEqual(begin.delta, undefined, 'a pre-delta session must not be flagged delta');
+  await env.post({ action: 'saveChunk', table: 'transactions', rows: db.transactions, uploadId: begin.uploadId, seq: 0 });
+  // Old clients still stage the derivable tables on a full session.
+  await env.post({
+    action: 'saveChunk', table: 'customerTx',
+    rows: [{ customer: 'Alice', date: '2026-08-31', amount: 500, product: 'Beef', till: '', receipt: 'RCPT0', importedAt: '2026-08-31' }],
+    uploadId: begin.uploadId, seq: 0
+  });
+  const commit = await env.post({
+    action: 'saveCommit', expect: { transactions: 5, customerTx: 1, seen: 0 }, uploadId: begin.uploadId
+  });
+  assert.deepStrictEqual(commit, { success: true });
+  const loaded = await env.load();
+  assert.strictEqual(loaded.transactions.length, 5);
+  assert.strictEqual(loaded.customerTx.Alice.length, 1, 'old-client full saves keep working byte-for-byte');
+});
+
+test('a delta commit with a missing slice refuses and leaves the live sheet untouched', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  const begin = await env.post({
+    action: 'saveBegin', mode: 'delta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings
+  });
+  await env.post({
+    action: 'saveChunk', table: 'transactions', rows: [deltaRow('PARTIAL1')],
+    uploadId: begin.uploadId, seq: 0
+  });
+  // Promise four rows, only one staged.
+  const commit = await env.post({
+    action: 'saveCommit', mode: 'delta',
+    expect: { transactions: 4 }, uploadId: begin.uploadId
+  });
+  assert.strictEqual(commit.success, false);
+  assert.match(commit.error, /chunk mismatch on transactions: staged 1 rows, expected 4/);
+  const loaded = await env.load();
+  assert.strictEqual(loaded.transactions.length, 5, 'a refused delta commit appends nothing');
+});
+
+test('delta routing honors the client mode even if the session record were lost (source pin)', () => {
+  // A delta commit misrouted to the full path would swap the live sheet for
+  // staging that holds only the appended rows. The session record is
+  // authoritative, but body.mode must decide too — belt and braces.
+  assert.match(GAS, /if \(body\.mode === 'delta' \|\| sessionIsDelta_\(body\.uploadId\)\) return commitDelta_\(body\)/);
+  assert.match(GAS, /var chunkIsDelta = body\.mode === 'delta' \|\| sessionIsDelta_\(body\.uploadId\)/);
+});
+
+test('a replayed delta slice is skipped and the delta still commits', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  const begin = await env.post({
+    action: 'saveBegin', mode: 'delta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings
+  });
+  const addRows = [deltaRow('REPLAY1'), deltaRow('REPLAY2')];
+  await env.post({ action: 'saveChunk', table: 'transactions', rows: addRows, uploadId: begin.uploadId, seq: 0 });
+  const dup = await env.post({ action: 'saveChunk', table: 'transactions', rows: addRows, uploadId: begin.uploadId, seq: 0 });
+  assert.strictEqual(dup.duplicate, true);
+  assert.strictEqual(dup.written, 0);
+
+  const commit = await env.post({
+    action: 'saveCommit', mode: 'delta',
+    expect: { transactions: 2 }, uploadId: begin.uploadId
+  });
+  assert.strictEqual(commit.success, true);
+  assert.strictEqual(commit.added, 2, 'the replayed slice is appended once');
+  assert.strictEqual((await env.load()).transactions.length, 7);
 });

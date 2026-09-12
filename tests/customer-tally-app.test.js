@@ -804,6 +804,83 @@ test('the 41 same-name pairs (and the one triple) survive repeated cloud syncs',
   assert.equal(ctx.DB.customers.filter(c => c.name === 'Peris Wacera Waite').length, 3);
 });
 
+test('a v3.4 sheet (empty CustomerTx/Seen caches) still syncs losslessly — history is derived, never uploaded', async () => {
+  // v3.4 clients stop syncing the per-customer history and the dedup map:
+  // the sheet's CustomerTx/Seen tabs stay header-only and every device
+  // rebuilds both from Transactions. A cloud in that exact shape must load
+  // with the same tallies (and the same derived history) as a sheet that
+  // still carried the caches.
+  const local = await bootLoaded();
+  // A typical day: payments to existing customers, one brand-new cash buyer,
+  // and a receipt-less pair that must stay two distinct visits.
+  local.importTransactions([
+    row('George Owiti', '0710428075', '2026-09-03', 300, 'V34NEW0001'),
+    row('Florah Atieno', '0711000022', '2026-09-03', 250, 'V34NEW0002'),
+    row('Cash Walk-in', '0722333444', '2026-09-04', 120, 'V34NEW0003'),
+    { name: 'George Owiti', phone: '0710428075', contact: '0710428075', date: '2026-09-04', time: '12:00:00', amount: 70, receipt: '', source: 'test', visits: 1 },
+    { name: 'George Owiti', phone: '0710428075', contact: '0710428075', date: '2026-09-04', time: '18:00:00', amount: 70, receipt: '', source: 'test', visits: 1 }
+  ]);
+  await new Promise(r => setTimeout(r, 10));
+
+  const histRowsOf = c => Object.values(c.DB.customerTx).reduce((s, a) => s + a.length, 0);
+  const expected = {
+    customers: local.DB.customers.length,
+    transactions: local.DB.transactions.length,
+    spent: sumSpent(local),
+    visits: sumVisits(local),
+    historyRows: histRowsOf(local),
+    george: local.DB.customerTx['George Owiti'].length
+  };
+  assert.ok(expected.transactions >= 5, 'fixture must actually carry transactions');
+  assert.ok(expected.historyRows >= 5, 'fixture must actually carry derived history');
+
+  const emptyCacheSheet = cloudSheetOf(local);
+  emptyCacheSheet.customerTx = {};
+  emptyCacheSheet.seen = {};
+  // Control: a sheet in the OLD shape, carrying the caches as before.
+  const fullCacheSheet = cloudSheetOf(local);
+
+  const deriveDevice = async (sheet) => {
+    const c = await bootLoaded({ cloud: sheet });
+    assert.equal(await c.loadFromCloud(), true);
+    return c;
+  };
+  const fromEmpty = await deriveDevice(emptyCacheSheet);
+  const fromFull = await deriveDevice(fullCacheSheet);
+  for (const c of [fromEmpty, fromFull]) {
+    assert.equal(c.DB.customers.length, expected.customers);
+    assert.equal(c.DB.transactions.length, expected.transactions);
+    assert.equal(histRowsOf(c), expected.historyRows, 'the history re-projects to exactly the same rows');
+    assert.equal(c.DB.customerTx['George Owiti'].length, expected.george, 'both receipt-less visits survive');
+    assert.equal(sumSpent(c), expected.spent);
+    assert.equal(sumVisits(c), expected.visits);
+  }
+  // Repeated loads converge and never re-grow or shrink the projection.
+  assert.equal(await fromEmpty.loadFromCloud(), true);
+  assert.equal(histRowsOf(fromEmpty), expected.historyRows);
+
+  // A save must never re-introduce the derived tables to the wire.
+  await fromEmpty.saveToCloud(true);
+  assert.ok(fromEmpty.savedPayloads.length > 0, 'a save payload was sent');
+  fromEmpty.savedPayloads.forEach((p, i) => {
+    assert.equal(p.customerTx, undefined, `payload ${i} must not upload customerTx`);
+    assert.equal(p.seen, undefined, `payload ${i} must not upload seen`);
+    if (p.action === 'saveAll') assert.ok(Array.isArray(p.transactions), 'saveAll still carries Transactions');
+  });
+
+  // History-only rows (global copy shed by the localStorage quota compaction)
+  // survive a rebuild even with no sheet history to pull from.
+  const compacted = await deriveDevice(emptyCacheSheet);
+  const keep = compacted.DB.customerTx['George Owiti'].slice();
+  keep.push({ date: '2026-08-31', amount: 75, product: 'meat', till: '', receipt: '', importedAt: '2026-09-01' });
+  compacted.DB.customerTx['George Owiti'] = keep;
+  compacted.rebuildCustomerHistory();
+  assert.ok(
+    compacted.DB.customerTx['George Owiti'].some(r => r.date === '2026-08-31' && r.amount === 75),
+    'the history-only compaction survivor must be preserved'
+  );
+});
+
 test('Smart Merge is lossless for same-name records too', async () => {
   const local = await bootLoaded();
   const ctx = await bootLoaded({ cloud: cloudSheetOf(local) });

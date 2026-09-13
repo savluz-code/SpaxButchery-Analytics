@@ -169,6 +169,7 @@ function makeEnv({ lockBusy = false } = {}) {
     ctx,
     sheets,
     cache,
+    props,   // Script Properties, so a test can age or drop a cached value
     // Drive the web-app entrypoints exactly as Apps Script would.
     async post(body) {
       const out = await vm.runInContext(
@@ -624,9 +625,11 @@ test('code.html reads the backend version from the file, not from hard-coded mar
   assert.strictEqual(current.ver, header[1]);
   assert.strictEqual(current.date, header[2]);
 
-  // …and the version it reports is the incremental-save backend.
-  // (v3.4 supersedes the v3.3 till-column release.)
-  assert.strictEqual(current.ver, 'v3.4', 'code.html must be offering the fixed backend');
+  // …and the version it reports is the backend this repo ships. Bump this pin
+  // with the header above: a version nobody updated the pin for is exactly the
+  // drift this test exists to catch.
+  // (v3.5 supersedes the v3.4 incremental-save release.)
+  assert.strictEqual(current.ver, 'v3.5', 'code.html must be offering the fixed backend');
 });
 
 /* ── incremental saves (backend v3.4) ───────────────────────────────────────
@@ -911,4 +914,195 @@ test('a replayed delta slice is skipped and the delta still commits', async () =
   assert.strictEqual(commit.success, true);
   assert.strictEqual(commit.added, 2, 'the replayed slice is appended once');
   assert.strictEqual((await env.load()).transactions.length, 7);
+});
+
+/* ── fast saves (backend v3.5) ───────────────────────────────────────────────
+ * A queue of saves runs one save at a time behind the script lock, so what a
+ * batch costs is (time per save) × (number of saves). v3.5 attacks the time
+ * per save where it was actually spent:
+ *   1. the duplicate guard read the WHOLE Transactions sheet on every delta —
+ *      it now reads a one-column index of identity keys (TxKeys) that is kept
+ *      in step with the sheet, and rebuilds it only when it cannot be trusted;
+ *   2. a small table the client re-sends unchanged (Customers is the biggest
+ *      write in a routine save) is neither re-written nor re-swapped;
+ *   3. a swap no longer clears the sheet it just displaced.
+ * Every one of those is invisible in the data — the round-trip, the
+ * de-duplication and the atomicity all have to come out exactly the same, and
+ * that is what these tests pin. */
+
+// Counts whole-sheet reads: the call that used to pull the entire database
+// back out of Sheets on every single save.
+function countFullReads(sheet) {
+  const counter = { reads: 0 };
+  const original = sheet.getDataRange;
+  sheet.getDataRange = function () {
+    counter.reads++;
+    return original.apply(sheet, arguments);
+  };
+  return counter;
+}
+
+// Counts writes to a sheet (staging writes are the other half of the cost).
+function countWrites(sheet) {
+  const counter = { writes: 0, cells: 0 };
+  const original = sheet.getRange;
+  sheet.getRange = function (row, col, numRows, numCols) {
+    const range = original.apply(sheet, arguments);
+    const setValues = range.setValues;
+    range.setValues = function () {
+      counter.writes++;
+      counter.cells += numRows * numCols;
+      return setValues.apply(range, arguments);
+    };
+    return range;
+  };
+  return counter;
+}
+
+const deltaBase = (db) => ({ customers: db.customers, monthly: db.monthly, settings: db.settings });
+
+test('a routine delta reads the key index, not the whole Transactions sheet', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  // The first delta after a full save has to build the index — the live sheet
+  // was replaced wholesale, so nothing is known about its rows.
+  const live = env.sheet('Transactions');
+  let reads = countFullReads(live);
+  const first = await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('IDX1')] });
+  assert.strictEqual(first.success, true);
+  assert.strictEqual(first.added, 1);
+  assert.strictEqual(reads.reads, 1, 'the first delta builds the index from the sheet');
+
+  // Every delta after that reads the index instead. This is the saving: the
+  // same 20k-row read was repeated by every save in the queue.
+  reads = countFullReads(live);
+  const second = await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('IDX2')] });
+  assert.strictEqual(second.added, 1);
+  assert.strictEqual(reads.reads, 0, 'a warm index must not re-read the sheet');
+
+  const third = await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('IDX3')] });
+  assert.strictEqual(third.added, 1);
+  assert.strictEqual(reads.reads, 0);
+  assert.strictEqual((await env.load()).transactions.length, 8);
+});
+
+test('the key index keeps de-duplicating as rows accumulate', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  // Several routine saves in a row, the way an import day actually goes.
+  for (let i = 0; i < 5; i++) {
+    const res = await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('ACC' + i)] });
+    assert.strictEqual(res.added, 1, 'row ' + i + ' is new');
+  }
+
+  // Replay the whole batch (a client that lost every response): the index has
+  // to know about the rows appended by earlier saves, not just the originals.
+  const replay = await env.post({
+    ...deltaBase(db), action: 'saveDelta',
+    txAdd: ['ACC0', 'ACC1', 'ACC2', 'ACC3', 'ACC4'].map((r) => deltaRow(r))
+  });
+  assert.strictEqual(replay.added, 0, 'no row may be booked twice');
+  assert.strictEqual(replay.skippedDuplicates, 5);
+  assert.strictEqual((await env.load()).transactions.length, 10);
+});
+
+test('a row added straight to the sheet is indexed and still de-duplicated', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+  await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('WARM1')] });
+
+  // Someone edits the sheet by hand in Google Sheets — one more row, which no
+  // index update can have seen.
+  const live = env.sheet('Transactions');
+  // Same receipt and date as the row the client is about to send (the
+  // identity a receipt row is deduplicated by), different everything else.
+  live.getRange(live.getLastRow() + 1, 1, 1, 11).setValues([[
+    '2026-09-10', '08:00:00', 900, 'Hand Added', '254799999999', 'Beef',
+    '5803756', 'HAND1', 'test', '2026-09-11', 'false'
+  ]]);
+
+  // The index no longer describes the sheet (the row count moved), so it is
+  // rebuilt — and the row it finds there makes the upload a duplicate.
+  const res = await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('HAND1')] });
+  assert.strictEqual(res.added, 0, 'the hand-added row is the same payment, not new revenue');
+  assert.strictEqual(res.skippedDuplicates, 1);
+  const loaded = await env.load();
+  assert.strictEqual(loaded.transactions.length, 7);
+  assert.strictEqual(loaded.transactions[6].name, 'Hand Added');
+});
+
+test('an index past its lifetime is rebuilt, so a hand edit cannot hide in it', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+  await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('STALE1')] });
+
+  // Wind the index's clock back past TX_KEY_MAX_AGE_MS: an edit made directly
+  // in the sheet does not change the row count, so age is the only signal.
+  env.props.spaxTxKeyStamp = String(new Date().getTime() - 7 * 60 * 60 * 1000);
+  const reads = countFullReads(env.sheet('Transactions'));
+  const res = await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('STALE2')] });
+  assert.strictEqual(res.added, 1);
+  assert.strictEqual(reads.reads, 1, 'a stale index is rebuilt from the sheet');
+
+  // …and the rebuild leaves a usable index behind, so the next save is fast.
+  const again = countFullReads(env.sheet('Transactions'));
+  await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('STALE3')] });
+  assert.strictEqual(again.reads, 0);
+});
+
+test('a save that changes no customer neither re-writes nor re-swaps Customers', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+
+  const staging = env.sheet('Customers_Staging');
+  const liveBefore = env.sheet('Customers');
+  let writes = countWrites(staging);
+  await env.post({ ...deltaBase(db), action: 'saveDelta', txAdd: [deltaRow('SKIP1')] });
+  assert.strictEqual(writes.writes, 0, 'an unchanged Customers table must not be staged again');
+  assert.strictEqual(env.sheet('Customers'), liveBefore, 'an unchanged table is not swapped either');
+
+  // A real edit must never be swallowed by that shortcut.
+  const edited = { customers: [{ ...db.customers[0], contact: '254700000999' }], monthly: db.monthly, settings: db.settings };
+  writes = countWrites(env.sheet('Customers_Staging'));
+  const res = await env.post({ ...edited, action: 'saveDelta', txAdd: [deltaRow('SKIP2')] });
+  assert.strictEqual(res.success, true);
+  assert.ok(writes.writes > 0, 'a changed Customers table must be staged');
+  assert.notStrictEqual(env.sheet('Customers'), liveBefore, 'the changed table is swapped in');
+  assert.strictEqual((await env.load()).customers[0].contact, '254700000999');
+});
+
+test('a swap leaves the displaced sheet intact and a later upload cannot inherit its rows', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  await env.post({ action: 'saveAll', ...db });
+  const bigger = dbFixture();
+  bigger.transactions = db.transactions.concat([deltaRow('SECOND1')]);
+  await env.post({ action: 'saveAll', ...bigger });
+
+  // The sheet a swap displaced keeps its rows — clearing tens of thousands of
+  // them was one of the slowest calls in every save — so it is left alone
+  // until something actually stages into it.
+  const displaced = env.sheet('Transactions_Staging');
+  assert.strictEqual(displaced.getLastRow(), 6, 'the displaced sheet still holds the rows it used to serve');
+
+  // A chunked upload begins by resetting exactly that area, so those rows can
+  // never be counted as this upload's slices.
+  const begin = await env.post({ action: 'saveBegin', customers: db.customers, monthly: db.monthly, settings: db.settings });
+  assert.strictEqual(env.sheet('Transactions_Staging').getLastRow(), 1, 'saveBegin resets the staging area');
+  const rows = db.transactions.concat([deltaRow('LEAK1'), deltaRow('LEAK2')]);
+  await env.post({ action: 'saveChunk', table: 'transactions', rows, uploadId: begin.uploadId, seq: 0 });
+  const commit = await env.post({
+    action: 'saveCommit', expect: { transactions: 7, customerTx: 0, seen: 0 }, uploadId: begin.uploadId
+  });
+  assert.strictEqual(commit.success, true);
+  const loaded = await env.load();
+  assert.strictEqual(loaded.transactions.length, 7);
+  assert.deepStrictEqual(loaded.transactions.map((t) => t.receipt).slice(5), ['LEAK1', 'LEAK2']);
 });

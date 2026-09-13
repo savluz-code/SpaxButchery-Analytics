@@ -966,6 +966,21 @@ let lastCloudError = '';
 // take the full replace path. A pre-v3.4 deployment answers "unknown action"
 // and the save falls back to a full upload exactly as the chunked fallback
 // does — redeploying Code.gs is never a hard requirement.
+//
+// SAVE QUEUES (2026-09-13): saves cannot overlap — the backend funnels writers
+// through one script lock — so a batch of queued saves costs (time per save) ×
+// (number of saves). Two client-side changes bring the number down:
+//   • a BACKGROUND save whose data is already in the cloud (no new
+//     transaction, no changed small table) does not spend a round-trip
+//     proving it — a forced save always does, because the user asked for the
+//     cloud to take this device's data and another device may have pushed
+//     since;
+//   • the same forced save queued twice shares one slot.
+// Backend v3.5 cuts the time per save (a routine delta reads a one-column
+// index instead of the whole Transactions sheet, and no longer re-writes a
+// Customers table that did not change). It is a pure speed-up behind the same
+// actions, so an unredeployed v3.4 script keeps working exactly as before —
+// it just stays slow.
 const CHUNK_ROWS = 2000; // rows per chunked upload request
 let cloudChunks = false;      // true once the backend proves it speaks the chunked actions
 let cloudChunkProbed = false; // one probe per session is enough
@@ -1109,11 +1124,15 @@ function spaxLoadPushedTx() {
   try {
     const raw = localStorage.getItem(SPAX_PUSHED_TX_KEY);
     const s = raw ? JSON.parse(raw) : null;
+    // v2 keeps the keys in one newline-joined string. JSON.parse of a
+    // ~20k-element array (one per transaction) was a measurable pause at the
+    // start of every save, and the set is read purely to decide what to send.
+    if (s && typeof s.keys === 'string') return s.keys ? s.keys.split('\n') : [];
     return s && Array.isArray(s.keys) ? s.keys : null;
   } catch (_) { return null; }
 }
 function spaxSavePushedTx(keys) {
-  try { localStorage.setItem(SPAX_PUSHED_TX_KEY, JSON.stringify({ v: 1, keys: keys })); return true; }
+  try { localStorage.setItem(SPAX_PUSHED_TX_KEY, JSON.stringify({ v: 2, keys: keys.join('\n') })); return true; }
   catch (_) { return false; }
 }
 function spaxPushedSet() {
@@ -1146,6 +1165,57 @@ function spaxNoteCloudTransactions(rows) {
 function spaxReplacePushedFromCloud(rows) {
   spaxSavePushedTx((rows || []).map(spaxTxIdentity).filter(Boolean));
   spaxClearTxFullReplace();
+}
+
+// ── NOTHING-NEW SAVES ──
+// A queued batch of saves re-snapshots the database as each job runs, so
+// every job after the first usually finds that the one before it already
+// pushed everything this device holds. Those jobs still cost a full cloud
+// round-trip each — the small tables get re-staged, re-written and re-swapped
+// on the server even when only transactions changed, and that is most of the
+// work in a save. Remembering what the last successful save actually put in
+// the cloud lets a save that has nothing to say finish at once, so a queue of
+// five saves costs one save's worth of waiting instead of five.
+const SPAX_SAVED_BASIS_KEY = 'spaxSavedBasis_v1';
+// How long "nothing new" is trusted before the save runs anyway. A delta only
+// ever sends what is new HERE, so it can never restore rows the cloud lost
+// (deleted there, a re-deployed script pointing at a fresh sheet, another
+// device's push) — but re-sending the small tables at least every few hours
+// keeps the cloud within one routine save of this device, and costs one extra
+// routine save per period instead of one per action.
+const SPAX_SAVE_BASIS_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+// Fingerprint of the small tables a save carries (Customers / Monthly /
+// Settings). Transactions are covered separately, by the pushed set above.
+function spaxSmallBasis(payload) {
+  const s = JSON.stringify([payload.customers || [], payload.monthly || null, payload.settings || null]);
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return (h >>> 0) + ':' + s.length;
+}
+
+function spaxLoadSavedBasis() {
+  try { return localStorage.getItem(SPAX_SAVED_BASIS_KEY); } catch (_) { return null; }
+}
+
+// The cloud now holds this save's small tables as well as its transactions.
+function spaxNoteSavedBasis(payload) {
+  try { localStorage.setItem(SPAX_SAVED_BASIS_KEY, spaxSmallBasis(payload) + '|' + Date.now()); } catch (_) {}
+}
+
+// True when the cloud already has everything this save would send: no
+// transaction is new, the small tables are the ones the last successful save
+// wrote, and that confirmation is recent enough to trust.
+// `deltaRows === null` means "cannot append" (no confirmed push yet, or a
+// destructive change has to go up as a full replace) — never a skip.
+function spaxCloudAlreadyCurrent(payload, deltaRows) {
+  if (!deltaRows || deltaRows.length) return false;
+  const saved = spaxLoadSavedBasis();
+  if (!saved) return false;
+  const cut = saved.lastIndexOf('|');
+  if (cut < 0 || saved.slice(0, cut) !== spaxSmallBasis(payload)) return false;
+  const at = Number(saved.slice(cut + 1));
+  return isFinite(at) && (Date.now() - at) < SPAX_SAVE_BASIS_MAX_AGE_MS;
 }
 
 // Identity of a customer RECORD for merge purposes: name + contact.
@@ -1587,7 +1657,17 @@ function saveToCloud(force = false, name) {
   // Every job is named. A caller that forgets still gets a real name rather
   // than the old anonymous slot that surfaced as "another save".
   const label = name || (force ? CLOUD_SAVE_NAMES.save : CLOUD_SAVE_NAMES.auto);
-  const job = { force: !!force, auto: !force, name: label, cancelled: false, resolve: resolveJob };
+  const job = { force: !!force, auto: !force, name: label, cancelled: false, resolve: resolveJob, promise };
+  // The SAME forced save twice (Force Push tapped twice, a Rebuild queued
+  // behind a Rebuild) would upload the whole database twice — minutes apart
+  // and one behind the other, since saves cannot overlap the backend's lock.
+  // The one already waiting snapshots the live DB when it runs and will carry
+  // this change too, so ride it instead of adding a second identical upload
+  // to the queue.
+  if (force) {
+    const twin = cloudSaveQueue.find(j => !j.cancelled && j.force && j.name === label);
+    if (twin) return twin.promise;
+  }
   if (!force) cloudSaveAutoPromise = promise;
   cloudSaveQueue.push(job);
   // From here the save must survive minimizing/covering: hold the wake lock,
@@ -1820,6 +1900,19 @@ async function performSaveToCloud(busyRetry = 0) {
       const pushed = spaxPushedSet();
       if (pushed) deltaRows = allTx.filter(t => !spaxTxAlreadyPushed(pushed, t));
     }
+    // ── NOTHING NEW TO SEND ──
+    // Only a BACKGROUND save may stop here. A forced save (Force Push, Delete
+    // All, Manual) is the user asking the cloud to take THIS device's data,
+    // so it always reaches the cloud even when it would be a no-op — the
+    // cloud may hold something a different device pushed since.
+    if (!(cloudSaveRunningJob && cloudSaveRunningJob.force) && spaxCloudAlreadyCurrent(payload, deltaRows)) {
+      showSyncStatus('✅ Already up to date — ' + cloudSaveRunningName() +
+        ' had nothing new to send' + (cloudSaveLiveTotal() > 1 ? ' (' + cloudSavePos + '/' + cloudSaveLiveTotal() + ')' : ''));
+      lastSyncTime = new Date();
+      lastCloudError = '';
+      return true;
+    }
+
     if (deltaRows !== null && (cloudDelta || !cloudDeltaProbed)) {
       try {
         const deltaOk = await saveDeltaToCloud(post, payload, deltaRows);
@@ -1828,6 +1921,7 @@ async function performSaveToCloud(busyRetry = 0) {
           // was already live there or the append just added it (the server
           // de-duplicates, so rows it skipped were already present).
           spaxNotePushedTransactions(allTx);
+          spaxNoteSavedBasis(payload);
           try { spaxClearUploadSession(); } catch (_) {}
           lastSyncTime = new Date();
           showSyncStatus(cloudSaveDoneMessage());
@@ -1868,6 +1962,7 @@ async function performSaveToCloud(busyRetry = 0) {
         if (chunked) {
           // A full commit just replaced the cloud sheet with these rows.
           spaxNotePushedTransactions(allTx);
+          spaxNoteSavedBasis(payload);
           return true;
         }
       } catch (err) {
@@ -1923,6 +2018,7 @@ async function performSaveToCloud(busyRetry = 0) {
       // exactly the rows it carried.
       try { spaxClearUploadSession(); } catch (_) {}
       spaxNotePushedTransactions(allTx);
+      spaxNoteSavedBasis(payload);
       lastSyncTime = new Date();
       showSyncStatus(cloudSaveDoneMessage());
       lastCloudError = '';

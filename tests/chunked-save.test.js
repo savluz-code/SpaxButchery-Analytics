@@ -774,8 +774,13 @@ test('background saves coalesce into ONE queued slot while forced saves queue in
   assert.deepStrictEqual(results, [true, true, true, true]);
   assert.strictEqual(maxInFlight, 1, 'the queue must keep saves strictly serialized');
   const mutating = (c) => c.action === 'saveAll' || c.action === 'saveDelta' || c.action === 'saveCommit';
-  assert.strictEqual(cloud.calls.filter(mutating).length, 3,
-    '3 uploads: forced #1, ONE coalesced background save, forced #2');
+  // 2 uploads, not 3: the background save queued between them had nothing new
+  // to send — the forced push before it already put every row and the same
+  // small tables in the cloud — so it reported up-to-date instead of paying
+  // for a second round-trip (see "NOTHING-NEW SAVES"). The two forced saves
+  // each upload in full: the user asked for those by name.
+  assert.strictEqual(cloud.calls.filter(mutating).length, 2,
+    '2 uploads: forced #1, forced #2 — the coalesced background save had nothing new');
   assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 0);
   assert.strictEqual(vm.runInContext('cloudSaveRunning', ctx), false);
 
@@ -784,7 +789,10 @@ test('background saves coalesce into ONE queued slot while forced saves queue in
   assert.ok(status.some((m) => /Saving to cloud — 🚀 Force Push \(1\/3\)/.test(m)), 'the pill must name the running save and its queue position');
   assert.ok(status.some((m) => /next: 💾 Auto-save, 📥 Backfill/.test(m)), 'the pill must name the saves waiting behind it');
   assert.ok(status.some((m) => /✅ Saved to cloud — 🚀 Force Push \(1\/3\)/.test(m)), 'first completion must name itself and its position');
-  assert.ok(status.some((m) => /✅ Saved to cloud — 💾 Auto-save \(2\/3\)/.test(m)), 'second completion must name itself');
+  // The skipped background save still names itself and its place in the
+  // batch — a save that ends instantly must not look like one that never ran.
+  assert.ok(status.some((m) => /✅ Already up to date — 💾 Auto-save had nothing new to send \(2\/3\)/.test(m)),
+    'a nothing-new save must still name itself and its queue position');
   assert.ok(status.some((m) => /✅ Saved to cloud — 📥 Backfill \(3\/3\)/.test(m)), 'last completion must not claim queued tasks');
   assert.ok(!status.some((m) => /another save/i.test(m)), 'no message may fall back to a generic "another save"');
 });
@@ -1347,4 +1355,118 @@ test('every forced save is named at its call site', () => {
     assert.ok(HTML.includes(call), key + ' must save under its own name: ' + call);
   });
   assert.ok(!/await saveToCloud\(true\)/.test(HTML), 'no forced save may stay anonymous');
+});
+
+/* ── nothing-new saves (v3.5) ────────────────────────────────────────────────
+ * A queue of saves runs one save at a time behind the backend's script lock,
+ * so what a batch costs is (time per save) × (number of saves). Two things
+ * bring the number down without ever losing an edit:
+ *   • a BACKGROUND save whose data is already in the cloud does not spend a
+ *     round-trip proving it (a forced save always does — the user asked for
+ *     the cloud to take this device's data);
+ *   • the SAME forced save queued twice uploads once.
+ */
+
+const MUTATING = (c) => c.action === 'saveAll' || c.action === 'saveDelta' || c.action === 'saveCommit';
+
+test('a background save with nothing new skips the round-trip; a forced save never does', async () => {
+  const cloud = makeCloud({ chunked: true, delta: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 5); // small save → one-shot each
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+  vm.runInContext(syncLayerSource(), ctx);
+
+  // First save: nothing is in the cloud yet, so everything goes.
+  assert.strictEqual(await ctx.saveToCloud(false, '💾 Auto-save'), true);
+  const afterFirst = cloud.calls.length;
+  assert.ok(afterFirst > 0, 'the first save must reach the cloud');
+
+  // Nothing has changed since. The same auto-save again has nothing to say.
+  assert.strictEqual(await ctx.saveToCloud(false, '💾 Auto-save'), true);
+  assert.strictEqual(cloud.calls.length, afterFirst, 'a nothing-new background save must not hit the cloud');
+  assert.ok(status.some((m) => /Already up to date/.test(m)), 'and it says so rather than failing silently');
+
+  // A changed customer is sent, even though no transaction is new — the
+  // shortcut must never swallow a real edit.
+  db.customers[0].contact = '254799999999';
+  assert.strictEqual(await ctx.saveToCloud(false, '💾 Auto-save'), true);
+  assert.strictEqual(cloud.calls.length, afterFirst + 1, 'a changed small table must still be pushed');
+
+  // A FORCED save is never skipped: another device may have pushed since, and
+  // the point of Force Push is that the cloud ends up holding THIS device's
+  // data.
+  const beforeForced = cloud.calls.length;
+  assert.strictEqual(await ctx.saveToCloud(true, '🚀 Force Push'), true);
+  assert.strictEqual(cloud.calls.length, beforeForced + 1, 'a forced save always reaches the cloud');
+});
+
+test('the same forced save queued twice uploads once, while different saves keep their own slot', async () => {
+  const cloud = makeCloud({ chunked: true, delta: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 5);
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+  vm.runInContext(syncLayerSource(), ctx);
+
+  const running = ctx.saveToCloud(true, '🚀 Force Push');  // takes the slot at once
+  const twinA = ctx.saveToCloud(true, '🚀 Force Push');    // identical → queued
+  const twinB = ctx.saveToCloud(true, '🚀 Force Push');    // identical again → rides twinA
+  const other = ctx.saveToCloud(true, '📥 Backfill');      // a different save → its own slot
+  assert.strictEqual(twinA, twinB, 'a second identical forced save must share the queued slot');
+  assert.notStrictEqual(running, other);
+  assert.strictEqual(vm.runInContext('cloudSaveQueue.length', ctx), 2,
+    'one coalesced Force Push slot + one Backfill slot behind the running save');
+  assert.deepStrictEqual(await Promise.all([running, twinA, twinB, other]), [true, true, true, true]);
+  // Three uploads, not four: the save already running keeps its slot (it is
+  // mid-upload of the database the user asked for), and the two taps behind it
+  // share one.
+  assert.strictEqual(cloud.calls.filter(MUTATING).length, 3,
+    'three uploads: the running Force Push, one coalesced Force Push, Backfill');
+});
+
+test('the pushed-transaction set is stored compactly and pre-v2 state still loads', async () => {
+  const cloud = makeCloud({ chunked: true, delta: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 5);
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+  vm.runInContext(syncLayerSource(), ctx);
+  await ctx.saveToCloud(false, '💾 Auto-save');
+
+  // v2 stores one newline-joined string instead of a ~20k-element JSON array
+  // (the set is read at the start of every save to decide what to send).
+  const raw = JSON.parse(cloud.store.spaxPushedTx_v1);
+  assert.strictEqual(typeof raw.keys, 'string', 'the pushed set must be stored as one string');
+  assert.ok(raw.keys.split('\n').length >= 5);
+
+  // A device upgraded mid-life still holds the v1 array — it must keep working.
+  cloud.store.spaxPushedTx_v1 = JSON.stringify({ v: 1, keys: ['receipt|R1|2026-08-31|10:00:00'] });
+  assert.deepStrictEqual(
+    Array.from(vm.runInContext('spaxLoadPushedTx()', ctx)),
+    ['receipt|R1|2026-08-31|10:00:00'],
+    'old pushed-set state must still load'
+  );
+});
+
+test('a nothing-new save still runs when its last confirmation has aged out', async () => {
+  const cloud = makeCloud({ chunked: true, delta: true });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 5);
+  const status = [];
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+  vm.runInContext(syncLayerSource(), ctx);
+
+  assert.strictEqual(await ctx.saveToCloud(false, '💾 Auto-save'), true);
+  const afterFirst = cloud.calls.length;
+  assert.strictEqual(await ctx.saveToCloud(false, '💾 Auto-save'), true);
+  assert.strictEqual(cloud.calls.length, afterFirst, 'a fresh confirmation is trusted');
+
+  // Wind the confirmation back past SPAX_SAVE_BASIS_MAX_AGE_MS: a delta only
+  // ever sends what is new here, so it can never repair a cloud that drifted
+  // — but re-sending the small tables keeps it within one save of this device.
+  const cut = cloud.store.spaxSavedBasis_v1.lastIndexOf('|');
+  cloud.store.spaxSavedBasis_v1 = cloud.store.spaxSavedBasis_v1.slice(0, cut + 1) + (Date.now() - 7 * 60 * 60 * 1000);
+  assert.strictEqual(await ctx.saveToCloud(false, '💾 Auto-save'), true);
+  assert.strictEqual(cloud.calls.length, afterFirst + 1, 'an aged-out confirmation must not suppress the save');
 });

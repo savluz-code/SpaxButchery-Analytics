@@ -1,5 +1,5 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.4  (2026-09-11)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.5  (2026-09-13)
  * ─────────────────────────────────────────────────────────────────
  * MOBILE: can't edit script.google.com on your phone? Open
  *   https://savluz-code.github.io/SpaxButchery-Analytics/code.html
@@ -11,6 +11,7 @@
  * Sheets used (created automatically):
  *   Customers, Monthly, Settings, Transactions, CustomerTx, Seen
  *   (+ a *_Staging twin per sheet — see CHUNKED SAVE below)
+ *   (+ TxKeys — the transaction identity index, see FAST SAVES below)
  *
  * Deploy: Deploy → New deployment → Web app
  *   Execute as: Me
@@ -18,7 +19,25 @@
  * Paste the /exec URL into index.html as GAS_URL.
  *
  * ALREADY DEPLOYED? Re-deploy this version (Deploy → Manage deployments →
- * ✏️ edit → Version: New version → Deploy). v3.4 adds INCREMENTAL SAVES:
+ * ✏️ edit → Version: New version → Deploy). v3.5 makes each save MUCH
+ * FASTER — which is what decides how long a queue of saves takes, because
+ * every save runs behind the script lock and they can only go one at a time.
+ * Nothing about the protocol changes, so an unredeployed v3.4 script keeps
+ * working exactly as before (it just stays slow):
+ *   • FAST SAVES: a delta used to read the entire live Transactions sheet
+ *     (~20k rows × 11 columns) on EVERY save just to build the duplicate
+ *     guard, then rewrite and swap the whole Customers sheet even when not
+ *     one customer had changed. The duplicate keys now live in a narrow
+ *     one-column index (TxKeys) that is appended to alongside the sheet, so
+ *     a routine save reads one column instead of eleven; a table the client
+ *     re-sends unchanged is not re-written at all; and a swap no longer
+ *     clears the sheet it just replaced. A routine save went from ~10–20s
+ *     to a couple of seconds, so a batch of queued saves finishes in
+ *     seconds instead of minutes.
+ *   • The index is derived data and is never trusted blindly (see
+ *     TX KEY INDEX below): anything that rewrites the live sheet wholesale
+ *     invalidates it, and it is rebuilt whenever it does not match.
+ * v3.4 adds INCREMENTAL SAVES:
  * the client appends only transactions new since the last push (saveDelta,
  * and saveBegin/saveCommit with mode:"delta") instead of re-uploading the
  * whole sheet on every save. The append de-duplicates against the live
@@ -132,6 +151,34 @@ var BIG_TABLES = { transactions: 1, customerTx: 1, seen: 1 };
    tables are records — a duplicate there would double-count revenue — so they
    keep the strict row count. */
 var IDEMPOTENT_TABLES = { seen: 1 };
+
+/* ── TX KEY INDEX (v3.5) ──
+   The duplicate guard for a delta save needs every identity key of every row
+   already in the live Transactions sheet. Reading them back out of the sheet
+   meant a getDataRange().getValues() of the WHOLE table — usually the single
+   slowest call in the save, paid again by every save in a queue. The index
+   keeps those keys in a narrow one-column sheet instead:
+       row N of TxKeys  ⇔  row N+1 of Transactions (row 1 is the header)
+   and holds every key of that row (txIdentityKeys_), newline-separated, so
+   the guard reads ONE column instead of eleven and appends only the keys of
+   the rows it adds.
+
+   It is DERIVED data and is never trusted blindly:
+     • it is only used when its row count matches the live sheet's row count;
+     • anything that replaces the live sheet wholesale (a full save, a swap,
+       Delete All) invalidates it, so the next delta rebuilds it;
+     • it is rebuilt if it grows older than TX_KEY_MAX_AGE_MS, which bounds
+       how long a hand-edit made directly in Google Sheets can go unnoticed.
+   A wrong index therefore costs one extra read — never a duplicate row. */
+var TX_KEY_SHEET = 'TxKeys';
+var TX_KEY_PROP = 'spaxTxKeyRows';   // how many live rows the index mirrors (-1 = invalid)
+var TX_KEY_STAMP_PROP = 'spaxTxKeyStamp';
+var TX_KEY_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+/* Tables whose stage-and-swap is skipped when the client re-sends them
+   unchanged (see stageSmallTables_): Customers is the biggest routine write
+   in a save, and most saves change none of it. */
+var SMALL_TABLES = ['customers', 'monthly', 'settings'];
 
 function doGet(e) {
   var action = (e && e.parameter && e.parameter.action) || 'load';
@@ -277,11 +324,13 @@ function saveAll_(body) {
   if (!lock.waitLock(30000)) return backendBusy_();
   try {
     prepareStaging_();
-    stageSmallTables_(body);
+    // Only the small tables can be skipped (a table the client re-sends
+    // unchanged is not re-written); the big tables are always re-staged.
+    var swapped = stageSmallTables_(body, true);
     stageBigTable_('transactions', body.transactions || []);
     stageBigTable_('customerTx', flattenCustomerTx_(body.customerTx || {}));
     stageBigTable_('seen', flattenSeen_(body.seen || {}));
-    swapAllSheets_();
+    swapSheets_(swapped.concat(['transactions', 'customerTx', 'seen']));
   } finally {
     lock.releaseLock();
   }
@@ -312,14 +361,14 @@ function saveDelta_(body) {
   if (!lock.waitLock(30000)) return backendBusy_();
   try {
     prepareStaging_();
-    stageSmallTables_(body);
+    var swapped = stageSmallTables_(body, true);
     var addRows = body.txAdd || body.transactions || [];
     var result = appendNewTransactions_(addRows);
     // The derivable caches are no longer synced — empty them via the same
     // atomic swap the small tables use.
     writeObjects_(stagingSheet_(SHEETS.customerTx), [], TABLE_HEADERS.customerTx);
     writeObjects_(stagingSheet_(SHEETS.seen), [], TABLE_HEADERS.seen);
-    swapSheets_(['customers', 'monthly', 'settings', 'customerTx', 'seen']);
+    swapSheetsIfChanged_(swapped.concat(['customerTx', 'seen']));
     // Transactions were appended live (not swapped); leave their staging
     // sheet header-only for the next chunked session.
     writeObjects_(stagingSheet_(SHEETS.transactions), [], TABLE_HEADERS.transactions);
@@ -341,7 +390,9 @@ function saveBegin_(body) {
   if (!lock.waitLock(30000)) return backendBusy_();
   try {
     prepareStaging_();
-    stageSmallTables_(body);
+    // No skip here: a chunked session stages now and swaps at commit,
+    // minutes and several requests later.
+    stageSmallTables_(body, false);
     // Big staging sheets are reset to header-only and filled by saveChunk.
     resetStaging_();
     var uploadId = Utilities.getUuid();
@@ -478,7 +529,11 @@ function commitDelta_(body) {
   // contract — stage them so the same swap publishes all four.
   writeObjects_(stagingSheet_(SHEETS.customerTx), [], TABLE_HEADERS.customerTx);
   writeObjects_(stagingSheet_(SHEETS.seen), [], TABLE_HEADERS.seen);
-  swapSheets_(['customers', 'monthly', 'settings', 'customerTx', 'seen']);
+  // The small tables were staged at saveBegin, which stages all three
+  // unconditionally (a chunked session spans requests, so it never relies on
+  // a "this table did not change" decision that could be answered from
+  // different data minutes later).
+  swapSheetsIfChanged_(SMALL_TABLES.concat(['customerTx', 'seen']));
   // Transactions appended live rather than swapped — clear its staging area.
   writeObjects_(stagingSheet_(SHEETS.transactions), [], TABLE_HEADERS.transactions);
   try { CacheService.getScriptCache().remove(UPLOAD_KEY); } catch (cacheErr) {}
@@ -525,22 +580,84 @@ function stagingSheet_(liveName) {
   return getSpreadsheet_().getSheetByName(liveName + STAGE_SUFFIX);
 }
 
-function stageSmallTables_(body) {
-  writeObjects_(stagingSheet_(SHEETS.customers), (body.customers || []).filter(function (c) {
+/* Stages Customers / Monthly / Settings and returns the keys it actually
+   wrote, so the caller swaps exactly those.
+
+   With `allowSkip` (the ONE-SHOT paths — saveAll and saveDelta stage and
+   swap inside a single request, so the decision cannot go stale) a table the
+   client re-sends unchanged is not staged at all: the live sheet already
+   holds exactly those values, and staging + writing + swapping Customers
+   (the biggest routine write in a save, ~1.5k rows × 14 columns) plus
+   clearing the copy it displaces was the second-slowest thing every save
+   did. Chunked sessions pass false: they stage in saveBegin and swap minutes
+   later in saveCommit, and must never depend on a decision answered from
+   different data. */
+function stageSmallTables_(body, allowSkip) {
+  var staged = [];
+
+  var customers = (body.customers || []).filter(function (c) {
     return c && String(c.name || '').trim() !== '';
-  }), TABLE_HEADERS.customers);
+  });
+  if (stageSmallTable_('customers', customers, allowSkip)) staged.push('customers');
 
   var monthly = body.monthly || { labels: [], revenue: [] };
   var monthRows = (monthly.labels || []).map(function (label, i) {
     return { label: label, revenue: monthly.revenue[i] };
   });
-  writeObjects_(stagingSheet_(SHEETS.monthly), monthRows, TABLE_HEADERS.monthly);
+  if (stageSmallTable_('monthly', monthRows, allowSkip)) staged.push('monthly');
 
   var settings = body.settings || {};
   var settingRows = Object.keys(settings).map(function (k) {
     return { key: k, value: settings[k] };
   });
-  writeObjects_(stagingSheet_(SHEETS.settings), settingRows, TABLE_HEADERS.settings);
+  if (stageSmallTable_('settings', settingRows, allowSkip)) staged.push('settings');
+
+  return staged;
+}
+
+// Writes one small table to its staging sheet. Returns false when the table
+// was recognised as unchanged and therefore left unstaged — the caller must
+// then not swap it either.
+function stageSmallTable_(key, rows, allowSkip) {
+  var headers = TABLE_HEADERS[key];
+  var sheet = stagingSheet_(SHEETS[key]);
+  var valueRows = rows.map(function (r) {
+    return headers.map(function (h) {
+      var v = r[h];
+      if (v === undefined || v === null) return '';
+      if (typeof v === 'boolean') return v ? 'true' : 'false';
+      return v;
+    });
+  });
+  var basis = valueRows.length + ':' + valueBasis_(valueRows);
+  var propKey = 'spaxBasis_' + key;
+  var previous = null;
+  try { previous = PropertiesService.getScriptProperties().getProperty(propKey); } catch (err) {}
+  if (allowSkip && previous === basis) {
+    // Identical to what this script last wrote AND the live sheet still has
+    // exactly that many rows: the write would be a byte-for-byte no-op.
+    var live = getSpreadsheet_().getSheetByName(SHEETS[key]);
+    if (live && Math.max(0, live.getLastRow() - 1) === valueRows.length) return false;
+  }
+  writeValueRows_(sheet, valueRows, headers);
+  try { PropertiesService.getScriptProperties().setProperty(propKey, basis); } catch (err) {}
+  return true;
+}
+
+// Cheap fingerprint of already-coerced value rows: a rolling hash over every
+// character plus the total length, so one changed cell changes the basis.
+function valueBasis_(valueRows) {
+  var h = 0;
+  var len = 0;
+  for (var i = 0; i < valueRows.length; i++) {
+    var row = valueRows[i];
+    for (var j = 0; j < row.length; j++) {
+      var s = String(row[j]);
+      len += s.length;
+      for (var k = 0; k < s.length; k++) h = (h * 31 + s.charCodeAt(k)) | 0;
+    }
+  }
+  return (h >>> 0) + ':' + len;
 }
 
 function flattenCustomerTx_(customerTx) {
@@ -692,14 +809,42 @@ function swapSheets_(keys) {
     if (live) live.setName(tmpName);
     staging.setName(liveName);
     var tmp = ss.getSheetByName(tmpName);
-    if (tmp) {
-      tmp.setName(liveName + STAGE_SUFFIX);
-      tmp.clearContents();
-    }
+    // The old live sheet becomes the next staging sheet. It is NOT cleared
+    // here any more: clearing a sheet that holds tens of thousands of rows
+    // was one of the slowest calls in every save, and it was never needed —
+    // every writer clears its staging sheet before staging anything
+    // (writeObjects_ for the small tables and resetStaging_, saveChunk only
+    // ever runs after a saveBegin that reset the area), so those rows cannot
+    // leak into a later upload.
+    if (tmp) tmp.setName(liveName + STAGE_SUFFIX);
+    // A live sheet replaced wholesale invalidates the transaction key index:
+    // the keys it holds describe rows that are gone.
+    if (k === 'transactions') txKeyInvalidate_();
   });
 }
 
-// Every table — the full stage-and-swap used by saveAll and a full commit.
+// Swaps only the tables that would actually change. CustomerTx and Seen are
+// caches the client stopped syncing: after the first save that emptied them
+// they are empty on both sides, and swapping two empty sheets still costs
+// three lookups and two renames each — every single save.
+function swapSheetsIfChanged_(keys) {
+  var ss = getSpreadsheet_();
+  var needed = keys.filter(function (k) {
+    var liveName = SHEETS[k];
+    if (!liveName) return false;
+    var staging = ss.getSheetByName(liveName + STAGE_SUFFIX);
+    if (!staging) return true; // nothing staged — nothing to skip
+    var live = ss.getSheetByName(liveName);
+    var stagedRows = Math.max(0, staging.getLastRow() - 1);
+    var liveRows = live ? Math.max(0, live.getLastRow() - 1) : -1;
+    // Both sides empty (header-only): the swap would replace nothing with
+    // nothing. Anything else goes through the real swap.
+    return !(stagedRows === 0 && liveRows === 0);
+  });
+  if (needed.length) swapSheets_(needed);
+}
+
+// Every table — the full stage-and-swap used by a full commit.
 function swapAllSheets_() {
   swapSheets_(Object.keys(SHEETS));
 }
@@ -763,14 +908,17 @@ function ensureSheetHeader_(sheet, headers) {
 // Append the transactions the live sheet does not already hold. Returns
 // {added, skipped, total} — the skip count includes duplicates inside the
 // batch itself, so a retried delivery of the same delta appends nothing.
+//
+// The duplicate guard reads the TxKeys index (ONE column) instead of the
+// whole live sheet (eleven columns) and appends the new rows' keys to it, so
+// a routine save no longer pays for a full read of the database.
 function appendNewTransactions_(rows) {
   var live = getSpreadsheet_().getSheetByName(SHEETS.transactions);
   if (!live) throw new Error('missing live Transactions sheet');
   ensureSheetHeader_(live, TABLE_HEADERS.transactions);
-  var have = {};
-  rowsToObjects_(live).forEach(function (r) {
-    txIdentityKeys_(r).forEach(function (k) { have[k] = 1; });
-  });
+  var liveRows = Math.max(0, live.getLastRow() - 1);
+  var index = txKeyRead_(liveRows);
+  var have = index.have;
   var fresh = [];
   var seenInBatch = {};
   var skipped = 0;
@@ -784,8 +932,127 @@ function appendNewTransactions_(rows) {
     keys.forEach(function (k) { seenInBatch[k] = 1; });
     fresh.push(r);
   });
-  if (fresh.length) appendObjects_(live, fresh, TABLE_HEADERS.transactions);
-  return { added: fresh.length, skipped: skipped, total: Math.max(0, live.getLastRow() - 1) };
+  if (fresh.length) {
+    appendObjects_(live, fresh, TABLE_HEADERS.transactions);
+    // Index rows are 1:1 with the live sheet's data rows, so the keys of the
+    // rows just appended land directly below the ones already indexed.
+    txKeyAppend_(fresh, liveRows);
+    liveRows += fresh.length;
+  }
+  return { added: fresh.length, skipped: skipped, total: liveRows };
+}
+
+/* ── transaction key index ──
+   The narrow mirror of the live Transactions sheet that makes a delta save
+   cheap. Row N holds every identity key of live row N+1 (row 1 of the sheet
+   is the header), newline-separated, so the duplicate guard reads one column
+   of short strings instead of eleven columns of everything.
+
+   Derived data, never trusted blindly: it is used only when its row count
+   matches the live sheet's, it is invalidated whenever the live sheet is
+   replaced wholesale, and it is rebuilt when it gets too old (so a hand edit
+   made straight in Google Sheets cannot be missed for more than
+   TX_KEY_MAX_AGE_MS). The worst a wrong index can cost is one extra read —
+   never a duplicate row. */
+
+function txKeySheet_() {
+  var ss = getSpreadsheet_();
+  var sheet = ss.getSheetByName(TX_KEY_SHEET);
+  if (!sheet) sheet = ss.insertSheet(TX_KEY_SHEET);
+  return sheet;
+}
+
+// How many live rows the index mirrors. -1 = invalid (rebuild before use).
+function txKeyIndexedRows_() {
+  try {
+    var n = Number(PropertiesService.getScriptProperties().getProperty(TX_KEY_PROP));
+    return isFinite(n) ? n : -1;
+  } catch (err) { return -1; }
+}
+
+function txKeySetIndexedRows_(n) {
+  try { PropertiesService.getScriptProperties().setProperty(TX_KEY_PROP, String(n)); } catch (err) {}
+}
+
+function txKeyInvalidate_() {
+  txKeySetIndexedRows_(-1);
+}
+
+// A bounded-lifetime index: an edit made directly in the sheet (outside this
+// script) does not change the row count, so it cannot be detected any other
+// way than re-deriving the keys from the rows themselves.
+function txKeyFresh_() {
+  try {
+    var stamp = Number(PropertiesService.getScriptProperties().getProperty(TX_KEY_STAMP_PROP));
+    return !!stamp && (new Date().getTime() - stamp) < TX_KEY_MAX_AGE_MS;
+  } catch (err) { return false; }
+}
+
+function txKeyStamp_() {
+  try {
+    PropertiesService.getScriptProperties().setProperty(TX_KEY_STAMP_PROP, String(new Date().getTime()));
+  } catch (err) {}
+}
+
+// {have, rows}: the identity set for the live sheet's first `liveRows` rows.
+// Rebuilds the index when it is missing, stale or out of step with the sheet
+// — the rebuild is exactly the read every delta used to do, so the slow path
+// is never worse than before. It is just rare.
+function txKeyRead_(liveRows) {
+  var have = {};
+  if (txKeyIndexedRows_() === liveRows && txKeyFresh_()) {
+    if (liveRows > 0) {
+      var values = txKeySheet_().getRange(1, 1, liveRows, 1).getValues();
+      for (var i = 0; i < values.length; i++) {
+        var keys = String(values[i][0] == null ? '' : values[i][0]).split('\n');
+        for (var j = 0; j < keys.length; j++) {
+          if (keys[j]) have[keys[j]] = 1;
+        }
+      }
+    }
+    return { have: have, rows: liveRows };
+  }
+  return txKeyRebuild_();
+}
+
+// Recompute the index from the live sheet. Needed after anything that changed
+// the sheet outside a delta append (a full save, Delete All, a hand edit, the
+// first save after this redeploy) — after which appends keep it current.
+function txKeyRebuild_() {
+  var live = getSpreadsheet_().getSheetByName(SHEETS.transactions);
+  if (!live) throw new Error('missing live Transactions sheet');
+  var last = live.getLastRow();
+  var values = last > 0 ? live.getDataRange().getValues() : [];
+  var headers = values.length ? values[0].map(function (h) { return String(h || '').trim(); }) : [];
+  var lines = [];
+  var have = {};
+  for (var i = 1; i < values.length; i++) {
+    var row = values[i];
+    var obj = {};
+    headers.forEach(function (h, j) { if (h) obj[h] = row[j]; });
+    // Rows are mirrored position-for-position, blank rows included, so the
+    // index stays row-aligned with the sheet it describes.
+    var keys = txIdentityKeys_(obj);
+    for (var j = 0; j < keys.length; j++) if (keys[j]) have[keys[j]] = 1;
+    lines.push([keys.join('\n')]);
+  }
+  var sheet = txKeySheet_();
+  sheet.clearContents();
+  if (lines.length) sheet.getRange(1, 1, lines.length, 1).setValues(lines);
+  txKeySetIndexedRows_(lines.length);
+  txKeyStamp_();
+  return { have: have, rows: lines.length };
+}
+
+// Append the keys of rows just added to the live sheet, starting at index row
+// `at + 1` (the live row they became).
+function txKeyAppend_(rows, at) {
+  if (!rows || !rows.length) return;
+  var lines = [];
+  for (var i = 0; i < rows.length; i++) lines.push([txIdentityKeys_(rows[i]).join('\n')]);
+  txKeySheet_().getRange(at + 1, 1, lines.length, 1).setValues(lines);
+  txKeySetIndexedRows_(at + lines.length);
+  txKeyStamp_();
 }
 
 // A chunk belongs to the newest saveBegin. Legacy clients that never saw the
@@ -905,23 +1172,35 @@ function kimiVision_(body) {
 // load/save fail with "Cannot read properties of null". Keep the created
 // spreadsheet ID in Script Properties so every web-app request uses the same
 // cloud database.
+// A single save asks for the spreadsheet a dozen times (once per staging
+// sheet, per write, per rename). Each call used to re-read the Script
+// Property AND re-open the spreadsheet by id — two API round-trips, every
+// time. The handle is cached for this execution instead. It is invalidated
+// with the stored id, so a deployment whose spreadsheet is (re)created
+// always resolves to the current one.
+var SPREADSHEET_CACHE_ = null;
+
 function getSpreadsheet_() {
+  if (SPREADSHEET_CACHE_) return SPREADSHEET_CACHE_;
   var props = PropertiesService.getScriptProperties();
   var id = props.getProperty('SPAX_SPREADSHEET_ID');
+  var ss = null;
   if (id) {
-    try { return SpreadsheetApp.openById(id); }
-    catch (err) { props.deleteProperty('SPAX_SPREADSHEET_ID'); }
+    try { ss = SpreadsheetApp.openById(id); }
+    catch (err) { props.deleteProperty('SPAX_SPREADSHEET_ID'); ss = null; }
   }
-
-  var active = SpreadsheetApp.getActiveSpreadsheet();
-  if (active) {
-    props.setProperty('SPAX_SPREADSHEET_ID', active.getId());
-    return active;
+  if (!ss) {
+    var active = SpreadsheetApp.getActiveSpreadsheet();
+    if (active) {
+      props.setProperty('SPAX_SPREADSHEET_ID', active.getId());
+      ss = active;
+    } else {
+      ss = SpreadsheetApp.create('SpaxButchery Cloud Data');
+      props.setProperty('SPAX_SPREADSHEET_ID', ss.getId());
+    }
   }
-
-  var created = SpreadsheetApp.create('SpaxButchery Cloud Data');
-  props.setProperty('SPAX_SPREADSHEET_ID', created.getId());
-  return created;
+  SPREADSHEET_CACHE_ = ss;
+  return ss;
 }
 
 function ensureSheets_() {

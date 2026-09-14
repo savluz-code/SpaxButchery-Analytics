@@ -1,6 +1,26 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.5  (2026-09-13)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.6  (2026-09-14)
  * ─────────────────────────────────────────────────────────────────
+ * v3.6 makes saves VERIFIED and commits IDEMPOTENT:
+ *   • Every successful save records a RECEIPT (the client's save tag plus
+ *     the fingerprints of the data it carried). A client whose upload timed
+ *     out asks `action=status` whether its data landed instead of blindly
+ *     re-uploading the whole database — the loop that made big saves look
+ *     like they "fail all the time" on slow servers (each retry re-sent
+ *     everything and timed out again, without ever noticing the first
+ *     attempt had already landed).
+ *   • A repeated full commit no longer swaps the live sheets a second time:
+ *     the committed uploadId is remembered and a replay answers success
+ *     without touching anything. (Replaying a swap would silently revert
+ *     the live sheets to their pre-save state.)
+ *   • Session supersession no longer depends only on the (evictable) script
+ *     cache: saveBegin records the newest uploadId in Script Properties, so
+ *     a stale chunk/commit from an older session is refused even after the
+ *     cache entry expired.
+ *   • load and status responses carry the backend `version`, so the app can
+ *     tell a deployment that predates these guarantees apart from a live one.
+ * Older clients keep working unchanged: they simply never send a save tag
+ * and never call status.
  * MOBILE: can't edit script.google.com on your phone? Open
  *   https://savluz-code.github.io/SpaxButchery-Analytics/code.html
  * on your phone → tap "Copy Entire Code.gs" → paste over Code.gs
@@ -139,10 +159,19 @@ var TABLE_HEADERS = {
      • waitLock's answer is honoured: a save that cannot get the script lock is
        refused instead of running alongside the writer that holds it. */
 
+var BACKEND_VERSION = '3.6';
+
 var STAGE_SUFFIX = '_Staging';
 var SWAP_TMP_SUFFIX = '_SwapTmp';
 var UPLOAD_KEY = 'spaxUploadSession';
 var CHUNK_SEQ_KEY = 'spaxChunkSeqs';
+// The newest uploadId any saveBegin minted (authoritative supersession guard
+// — the script cache above it may be evicted at any time).
+var LAST_BEGIN_KEY = 'spaxLastBeginUpload';
+// The uploadId of the last COMMITTED chunked save (duplicate-commit guard).
+var COMMITTED_KEY = 'spaxCommittedUpload';
+// Receipt of the last successful save (see recordSaveReceipt_).
+var LAST_SAVE_KEY = 'spaxLastSave';
 var BIG_TABLES = { transactions: 1, customerTx: 1, seen: 1 };
 /* `seen` is a SET of dedup keys, not a list of records: the same key staged
    twice is still one key (loadAll_ collapses it with seen[key] = 1). It is
@@ -225,6 +254,16 @@ function doPost(e) {
       return json_(saveCommit_(body));
     }
 
+    // Cheap, lock-free status probe (v3.6): lets a client whose save timed
+    // out ask whether its data landed (see recordSaveReceipt_) instead of
+    // re-uploading the whole database, and reports the backend version so
+    // the app can tell an old deployment from a live one. A deployment that
+    // predates this action answers "unknown action", which the client treats
+    // as "verify unavailable — retry the save as before".
+    if (action === 'status') {
+      return json_(status_());
+    }
+
     if (action === 'kimiVision') {
       return json_(kimiVision_(body));
     }
@@ -305,6 +344,7 @@ function loadAll_() {
 
   return {
     success: true,
+    version: BACKEND_VERSION,
     customers: customers,
     monthly: monthly,
     settings: settings,
@@ -312,6 +352,66 @@ function loadAll_() {
     customerTx: customerTx,
     seen: seen
   };
+}
+
+/* ══════════ STATUS + SAVE RECEIPTS (v3.6) ══════════
+   A client whose upload timed out cannot tell "the server never got it"
+   from "the server finished after I gave up" — and re-uploading a 20k-row
+   database that already landed just times out again. So every successful
+   save records a RECEIPT first: the client's save tag plus the fingerprints
+   of the data it carried (opaque strings the server stores verbatim — it
+   never needs to compute them itself, so no cross-system hash agreement can
+   drift). status_() hands that receipt back without taking the script lock
+   (a dirty read is harmless: at worst the receipt is one save behind and
+   the client retries as it always did). A receipt match is exact — the tag
+   is unique per attempt and the fingerprints cover the content — so a false
+   "your save landed" is not possible short of a hash collision. */
+
+function status_() {
+  var txRows = -1;
+  var customersRows = -1;
+  try {
+    ensureSheets_();
+    var ss = getSpreadsheet_();
+    var tx = ss.getSheetByName(SHEETS.transactions);
+    var cu = ss.getSheetByName(SHEETS.customers);
+    if (tx) txRows = Math.max(0, tx.getLastRow() - 1);
+    if (cu) customersRows = Math.max(0, cu.getLastRow() - 1);
+  } catch (err) { /* counts are informational — never fail the probe */ }
+  return {
+    success: true,
+    version: BACKEND_VERSION,
+    txRows: txRows,
+    customersRows: customersRows,
+    lastSave: lastSaveReceipt_()
+  };
+}
+
+// The receipt of the last successful save, or null when no v3.6 save has
+// landed yet (or the property is unreadable).
+function lastSaveReceipt_() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(LAST_SAVE_KEY);
+    if (!raw) return null;
+    var rec = JSON.parse(raw);
+    return rec && typeof rec === 'object' ? rec : null;
+  } catch (err) { return null; }
+}
+
+// Called at the END of every successful save, after every sheet is written
+// (and, for chunked saves, after the commit). Best-effort by design: if the
+// property write fails the save itself still succeeded — verification just
+// stays unavailable for this one attempt and the client retries as before.
+function recordSaveReceipt_(body, txCount) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(LAST_SAVE_KEY, JSON.stringify({
+      tag: String((body && body.saveTag) || ''),
+      txBasis: String((body && body.txBasis) || ''),
+      smallBasis: String((body && body.smallBasis) || ''),
+      txCount: Number(txCount) || 0,
+      at: new Date().getTime()
+    }));
+  } catch (err) { /* best-effort only — see above */ }
 }
 
 /* ══════════ SAVE ══════════ */
@@ -331,6 +431,9 @@ function saveAll_(body) {
     stageBigTable_('customerTx', flattenCustomerTx_(body.customerTx || {}));
     stageBigTable_('seen', flattenSeen_(body.seen || {}));
     swapSheets_(swapped.concat(['transactions', 'customerTx', 'seen']));
+    // Every sheet is swapped: a client whose response never arrived can now
+    // be told its save landed (see status_).
+    recordSaveReceipt_(body, (body.transactions || []).length);
   } finally {
     lock.releaseLock();
   }
@@ -372,6 +475,7 @@ function saveDelta_(body) {
     // Transactions were appended live (not swapped); leave their staging
     // sheet header-only for the next chunked session.
     writeObjects_(stagingSheet_(SHEETS.transactions), [], TABLE_HEADERS.transactions);
+    recordSaveReceipt_(body, result.total);
     return {
       success: true,
       added: result.added,
@@ -399,6 +503,12 @@ function saveBegin_(body) {
     try {
       CacheService.getScriptCache().put(UPLOAD_KEY, uploadId, 3600);
     } catch (cacheErr) { /* best-effort session guard only */ }
+    // Authoritative record of the newest session: the cache above may be
+    // evicted at any time, but a stale chunk/commit must stay refused even
+    // then (see uploadSessionCurrent_).
+    try {
+      PropertiesService.getScriptProperties().setProperty(LAST_BEGIN_KEY, uploadId);
+    } catch (propErr) { /* best-effort — the cache check remains */ }
     // A delta session chunks ONLY new transactions and appends them at
     // commit; a full (default) session stages every big table and swaps the
     // live sheets. The mode rides the same per-upload Script Properties
@@ -420,7 +530,7 @@ function saveChunk_(body) {
   if (!BIG_TABLES[table]) {
     return { success: false, error: 'unknown table: ' + table };
   }
-  if (!uploadSessionValid_(body.uploadId)) {
+  if (!uploadSessionCurrent_(body.uploadId)) {
     return { success: false, error: 'upload superseded by a newer save — please retry the whole save' };
   }
   var lock = LockService.getScriptLock();
@@ -463,8 +573,17 @@ function saveChunk_(body) {
 function saveCommit_(body) {
   // A commit from a superseded session must not swap in another device's
   // staged rows — it promised counts for slices that are no longer there.
-  if (!uploadSessionValid_(body.uploadId)) {
+  if (!uploadSessionCurrent_(body.uploadId)) {
     return { success: false, error: 'upload superseded by a newer save — please retry the whole save' };
+  }
+  // A commit that already succeeded answers success WITHOUT swapping again:
+  // the swap already renamed the staging sheets over the live ones, so a
+  // second swap would silently revert the live sheets to their pre-save
+  // state. This is what a client retrying a commit whose response never
+  // arrived must get (its session cursors say "everything sent", so it
+  // re-commits rather than re-uploading).
+  if (body.uploadId && committedUploadId_() === String(body.uploadId)) {
+    return { success: true, duplicate: true };
   }
   var lock = LockService.getScriptLock();
   if (!lock.waitLock(30000)) return backendBusy_();
@@ -499,6 +618,8 @@ function saveCommit_(body) {
     swapAllSheets_();
     try { CacheService.getScriptCache().remove(UPLOAD_KEY); } catch (cacheErr) {}
     try { PropertiesService.getScriptProperties().deleteProperty(CHUNK_SEQ_KEY); } catch (propsErr) {}
+    rememberCommittedUpload_(body.uploadId);
+    recordSaveReceipt_(body, Number((body.expect || {}).transactions || 0));
     return { success: true };
   } finally {
     lock.releaseLock();
@@ -538,6 +659,8 @@ function commitDelta_(body) {
   writeObjects_(stagingSheet_(SHEETS.transactions), [], TABLE_HEADERS.transactions);
   try { CacheService.getScriptCache().remove(UPLOAD_KEY); } catch (cacheErr) {}
   try { PropertiesService.getScriptProperties().deleteProperty(CHUNK_SEQ_KEY); } catch (propsErr) {}
+  rememberCommittedUpload_(body.uploadId);
+  recordSaveReceipt_(body, result.total);
   return {
     success: true,
     added: result.added,
@@ -1065,6 +1188,38 @@ function uploadSessionValid_(uploadId) {
   try { current = CacheService.getScriptCache().get(UPLOAD_KEY); } catch (cacheErr) { return true; }
   if (!current) return true; // evicted/expired cache — cannot prove supersession
   return String(current) === String(uploadId);
+}
+
+// Same question, answered authoritatively: saveBegin records the newest
+// uploadId in Script Properties (which persist, unlike the cache above), so
+// a stale chunk/commit is refused even after the cache entry expired —
+// including a replay from a tab whose commit already landed and was
+// superseded by another save since. Anything the property cannot decide
+// (no property yet, legacy client without an id) falls back to the cache
+// check, so pre-v3.6 behaviour is unchanged there.
+function uploadSessionCurrent_(uploadId) {
+  if (uploadId) {
+    try {
+      var newest = PropertiesService.getScriptProperties().getProperty(LAST_BEGIN_KEY);
+      if (newest && String(newest) !== String(uploadId)) return false;
+    } catch (err) { /* fall through to the cache check */ }
+  }
+  return uploadSessionValid_(uploadId);
+}
+
+// The uploadId of the last committed chunked save ('' when none). A commit
+// carrying it is a replay of an already-successful commit.
+function committedUploadId_() {
+  try {
+    return String(PropertiesService.getScriptProperties().getProperty(COMMITTED_KEY) || '');
+  } catch (err) { return ''; }
+}
+
+function rememberCommittedUpload_(uploadId) {
+  if (!uploadId) return;
+  try {
+    PropertiesService.getScriptProperties().setProperty(COMMITTED_KEY, String(uploadId));
+  } catch (err) { /* best-effort — the count check remains the safety net */ }
 }
 
 // Appends rows below whatever is already staged (same value coercion as

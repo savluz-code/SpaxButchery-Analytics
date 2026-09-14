@@ -628,8 +628,8 @@ test('code.html reads the backend version from the file, not from hard-coded mar
   // …and the version it reports is the backend this repo ships. Bump this pin
   // with the header above: a version nobody updated the pin for is exactly the
   // drift this test exists to catch.
-  // (v3.5 supersedes the v3.4 incremental-save release.)
-  assert.strictEqual(current.ver, 'v3.5', 'code.html must be offering the fixed backend');
+  // (v3.6 supersedes the v3.5 fast-save release: verified saves + idempotent commits.)
+  assert.strictEqual(current.ver, 'v3.6', 'code.html must be offering the fixed backend');
 });
 
 /* ── incremental saves (backend v3.4) ───────────────────────────────────────

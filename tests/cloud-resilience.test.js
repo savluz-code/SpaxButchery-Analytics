@@ -272,7 +272,10 @@ test('saveCommit and the small one-shot saveAll ride their own deadlines', () =>
   assert.match(HTML, /isTransientCloudStatus/);
   assert.match(HTML, /cloudSaveRetrySleep/);
   assert.match(HTML, /mode === 'delta' \? \{ mode: 'delta' \} : null\), CLOUD_TIMEOUT_CHUNK, 0\)/, 'saveBegin probe opts out of retries');
-  assert.match(HTML, /txAdd\n(\s+)?\}, CLOUD_TIMEOUT_CHUNK, 0\)/, 'saveDelta probe opts out of retries');
+  // The one-shot saveDelta still appends+swaps server-side like any big save,
+  // so it rides the big-save deadline now — but keeps capability-probe
+  // semantics (0 retries: a blip falls back, a timeout backs off and retries).
+  assert.match(HTML, /action: 'saveDelta'[\s\S]{0,600}\}, CLOUD_TIMEOUT_BIG_SAVE, 0\)/, 'saveDelta probe opts out of retries');
 });
 
 /* ── per-device URL override ────────────────────────────────────────────── */

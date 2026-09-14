@@ -1099,7 +1099,11 @@ test('backend v3.2 can tell a repeated slice from a lost one', () => {
   assert.match(GAS, /IDEMPOTENT_TABLES/);
   assert.match(GAS, /dedupeStaged_/);
   // The commit checks the session id too, and a refusal leaves staging empty.
-  assert.match(GAS, /function saveCommit_\(body\) \{\n[\s\S]{0,240}uploadSessionValid_/);
+  // (v3.6 renamed the check to uploadSessionCurrent_ — it now consults the
+  // persistent newest-uploadId, not just the evictable script cache — and a
+  // repeated commit answers success without swapping a second time.)
+  assert.match(GAS, /function saveCommit_\(body\) \{\n[\s\S]{0,240}uploadSessionCurrent_/);
+  assert.match(GAS, /duplicate: true/);
   assert.match(GAS, /function resetStaging_/);
   // waitLock's answer is honoured rather than ignored.
   assert.ok(!/^\s*lock\.waitLock\(30000\);\s*$/m.test(GAS), 'waitLock result must not be discarded');
@@ -1137,7 +1141,7 @@ test('client keeps payload-aware timeouts and wires the chunked actions + fallba
   assert.match(HTML, /CLOUD_BUSY_RETRIES/, 'busy retries must be bounded');
   // Busy retries must await the recursive call and only clear isSyncing on the
   // outermost attempt — otherwise a concurrent save starts mid-retry.
-  assert.match(HTML, /return await performSaveToCloud\(nextRetry\)/);
+  assert.match(HTML, /return await performSaveToCloud\(nextRetry, \(err && err\.spaxVerifyFirst\) \|\| null\)/);
   assert.match(HTML, /if \(busyRetry === 0\) isSyncing = false/);
   // The save queue: background saves coalesce into one slot (never silently
   // dropped), forced saves each get a slot, and the queue announces itself.

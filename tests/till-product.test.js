@@ -333,7 +333,9 @@ test('the derived per-customer history keeps the till column', () => {
   const rebuild = slice('function rebuildCustomerHistory()', '/* ══════════ NEW-CUSTOMER FLAG');
   assert.match(rebuild, /till: t\.till \|\| ''/);
   // The synced payload still carries transactions (with their tills).
-  const payload = slice('const payload = {', 'const allTx = payload.transactions;');
+  // (The builder now lives in spaxBuildSavePayload, extracted from
+  // performSaveToCloud so the resume pre-check can reuse it.)
+  const payload = slice('function spaxBuildSavePayload()', 'function spaxComputeDeltaRows(');
   assert.match(payload, /transactions: \(DB\.transactions/);
   assert.doesNotMatch(payload, /customerTx:/, 'the per-customer history must not be uploaded');
 });

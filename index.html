@@ -1394,6 +1394,9 @@ async function loadFromCloud() {
   try {
     showSyncStatus('⏳ Loading from cloud...');
     const data = await cloudLoad();
+    // Remember the deployment's version for the Sync-tab diagnostics (and the
+    // old-backend hint on failed big saves). Pre-v3.6 backends send none.
+    try { spaxNoteBackendVersion(data); } catch (_) {}
 
     // Ignore formatting/blank rows returned by a Sheet. They are not cloud data.
     const cloudCustomers = validCloudCustomers(data.customers);
@@ -1580,6 +1583,10 @@ let cloudSaveToken = null;       // { cancelled, controller } of the running job
 // Names of the jobs that completed in the current batch, for the completion
 // toast ("💾 Save queue complete — 📥 Backfill, 💾 Auto-save saved").
 let cloudSaveBatch = [];
+// Jobs that failed with data possibly unpushed ({name, error}), drained below:
+// a batch that failed for a RETRY-WORTHY reason re-plants the resume flag so
+// the next boot pushes instead of waiting for the user to notice.
+let cloudSaveBatchFailed = [];
 // Name of a save this device aborted mid-upload. Apps Script may still be
 // writing it server-side, which is exactly why the next save can come back
 // "backend busy" — so the retry message can name the culprit instead of
@@ -1808,15 +1815,38 @@ function spaxTitleProgress(msg) {
     }
   } catch (_) {}
 }
-// A save that never drained (page killed while minimized) resumes with one
-// forced push on the next boot. The flag is consumed FIRST so a failed resume
-// can't loop on every load; the new save re-marks it and clears it on drain.
+// A save that never drained (page killed while minimized, a failure that left
+// data unpushed) resumes with one forced push on the next boot. The flag is
+// consumed FIRST so a failed resume can't loop on every load; the new save
+// re-marks it and clears it on drain.
+// The resume stands down — instead of queueing a mystery job — in two cases:
+//   1. A save is already queued or running. The live job snapshots the live
+//      DB when it runs, so it already carries whatever the interrupted save
+//      was pushing; queueing a second job here is exactly the phantom
+//      "resumed" task that used to appear from nowhere (a Background Sync
+//      wake landing mid-save, a second tab's boot while the first tab saves)
+//      and push the user's own change to second place.
+//   2. Nothing is unpushed. The classic interrupted save actually LANDED —
+//      the client timed out waiting for the ack — and the boot load just
+//      merged those rows back. Uploading the whole database to prove it
+//      would only re-enter the failure the user is trying to get past.
 function spaxResumeInterruptedSave() {
   let pending = null;
   try { pending = localStorage.getItem(SPAX_PENDING_KEY); } catch (_) { pending = null; }
   if (!pending) return false;
   try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
   if (typeof SYNC_MODE !== 'undefined' && SYNC_MODE === 'local') return false;
+  if (cloudSaveRunning || cloudSaveQueue.length) return false;
+  try {
+    if (typeof DB !== 'undefined' && DB && typeof spaxComputeDeltaRows === 'function' &&
+        typeof spaxCloudAlreadyCurrent === 'function' && typeof spaxBuildSavePayload === 'function') {
+      const allTx = DB.transactions || [];
+      if (spaxCloudAlreadyCurrent(spaxBuildSavePayload(), spaxComputeDeltaRows(allTx))) {
+        try { showSyncStatus('✅ Interrupted save already landed — nothing to resume'); } catch (_) {}
+        return false;
+      }
+    }
+  } catch (_) {}
   // No popup toast on resume — the sync pill already announces and tracks the
   // resumed upload, and a boot-time toast made every restart feel like an error.
   // Name it and say WHEN it was interrupted — a resumed save is a real,
@@ -2007,6 +2037,19 @@ function cloudSavePump() {
     // Nothing left to protect: release the wake lock, clear the resume flag
     // and restore the tab title (announcing first if we finished hidden).
     try { spaxClearPending(); } catch (_) {}
+    // ...unless a job failed with data possibly still unpushed: re-plant the
+    // resume flag (the flag ONLY — no wake lock for a dead queue) so the
+    // next boot pushes automatically instead of leaving the failure for the
+    // user to notice and Force Push by hand. Bounded to one attempt per boot
+    // (the resume consumes the flag first), and never for dead deployments
+    // (no retry can succeed until a human redeploys) or cancelled jobs
+    // (the user stopped those on purpose — failedWith stays unset for them).
+    const retryable = cloudSaveBatchFailed.filter(f => f && f.error && !isDeadDeploymentError(f.error));
+    cloudSaveBatchFailed = [];
+    if (retryable.length) {
+      try { localStorage.setItem(SPAX_PENDING_KEY, String(Date.now())); } catch (_) {}
+      try { console.log('Cloud save: ' + retryable.map(f => f.name).join(', ') + ' failed — will resume automatically on the next launch.'); } catch (_) {}
+    }
     return;
   }
   const job = cloudSaveQueue.shift();
@@ -2027,11 +2070,13 @@ function cloudSavePump() {
     .then(ok => {
       job.resolve(!!ok);
       if (ok) cloudSaveBatch.push(job.name);
+      else if (!job.cancelled && job.failedWith) cloudSaveBatchFailed.push({ name: job.name, error: job.failedWith });
       if (job.cancelled) spaxFinishTask(job.task, 'cancelled', 'stopped by you');
       else spaxFinishTask(job.task, ok ? 'done' : 'failed', ok ? 'saved to the cloud' : (lastCloudError || 'save failed'));
     })
     .catch((err) => {
       job.resolve(false);
+      if (!job.cancelled) cloudSaveBatchFailed.push({ name: job.name, error: (err && err.message) || 'save failed' });
       spaxFinishTask(job.task, job.cancelled ? 'cancelled' : 'failed',
         job.cancelled ? 'stopped by you' : ((err && err.message) || 'save failed'));
     })
@@ -2163,7 +2208,56 @@ function cloudSaveFailedMessage(msg) {
     (total > 1 ? ' (' + cloudSavePos + '/' + total + ')' : '') + ': ' + msg;
 }
 
-async function performSaveToCloud(busyRetry = 0) {
+// The cloud save payload, built in exactly one place so the save path and
+// the resume pre-check (spaxResumeInterruptedSave) can never describe two
+// different databases. Merchant exclusion applies to the cloud too: never
+// push Simon Musyoka (the Merchant) to the Google Sheet — his rows,
+// customer record, or history would come back on the next pull and pollute
+// revenue again.
+function spaxBuildSavePayload() {
+  return {
+    customers: (DB.customers || []).filter(c => !isMerchant(c.name)),
+    monthly: DB.monthly,
+    settings: {
+      importedRev: DB.importedRev,
+      importedTx: DB.importedTx,
+      resolved: DB.resolved,
+      importBatch: Number(DB.importBatch) || 0,
+      // Delete-All state rides the generic key/value settings sheet, so a
+      // wiped-then-pushed database stays wiped on every device that pulls.
+      baselineCleared: DB.baselineCleared ? 1 : 0
+    },
+    // The `customerTx` history table and the `seen` dedup map are NOT
+    // uploaded. Both are fully derivable from the transactions table
+    // (rebuildCustomerHistory re-projects the history on every load;
+    // markSeenInto/healOrphanedSeenKeys rebuild and heal the guard), so
+    // syncing them re-sent ~two extra copies of the database on every
+    // save — tens of thousands of rows that carried nothing the
+    // transactions sheet didn't already hold. Every device rebuilds both
+    // locally from the rows it holds, and the backend empties the cloud
+    // sheets on the next save. Old backends tolerate the absent tables:
+    // saveAll stages `body.customerTx || {}` / `body.seen || {}`, and a
+    // full chunked commit counts 0 against staging sheets saveBegin just
+    // reset, so no Code.gs redeploy is required to drop the tables.
+    transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
+  };
+}
+
+// ── INCREMENTAL SAVE (backend v3.4) ──
+// When this device knows what the cloud already holds and the database
+// only grew, the save appends the NEW transactions (small tables always
+// ride along in full — they are cheap and must stay exact). A null delta
+// means "cannot append": no pushed state yet (first save after the
+// upgrade / a fresh device) or a destructive change flagged a full
+// replace (Delete All, a scoped Rebuild, a duplicate rollback, a rename).
+function spaxComputeDeltaRows(allTx) {
+  if (spaxTxFullReplaceRequired()) return null;
+  const pushed = spaxPushedSet();
+  if (!pushed) return null;
+  return allTx.filter(t => !spaxTxAlreadyPushed(pushed, t));
+}
+
+async function performSaveToCloud(busyRetry = 0, verifyFirst) {
   // isSyncing must stay true across busy retries. A bare
   // `return performSaveToCloud(next)` runs `finally { isSyncing = false }`
   // as soon as the inner call is *started* — not when it finishes — which
@@ -2173,37 +2267,12 @@ async function performSaveToCloud(busyRetry = 0) {
   // tab fighting itself. Only the outermost attempt owns the flag. The
   // queue has already announced this job ("⏳ Saving to cloud… 1/3").
   if (busyRetry === 0) isSyncing = true;
+  // Which job this attempt belongs to (the drain books failures per job —
+  // the global may point at a replacement by unwind time; see the catch).
+  const myJob = (typeof cloudSaveRunningJob !== 'undefined') ? cloudSaveRunningJob : null;
 
   try {
-    // Merchant exclusion applies to the cloud too: never push Simon Musyoka
-    // (the Merchant) to the Google Sheet — his rows, customer record, or
-    // history would come back on the next pull and pollute revenue again.
-    const payload = {
-      customers: (DB.customers || []).filter(c => !isMerchant(c.name)),
-      monthly: DB.monthly,
-      settings: {
-        importedRev: DB.importedRev,
-        importedTx: DB.importedTx,
-        resolved: DB.resolved,
-        importBatch: Number(DB.importBatch) || 0,
-        // Delete-All state rides the generic key/value settings sheet, so a
-        // wiped-then-pushed database stays wiped on every device that pulls.
-        baselineCleared: DB.baselineCleared ? 1 : 0
-      },
-      // The `customerTx` history table and the `seen` dedup map are NOT
-      // uploaded. Both are fully derivable from the transactions table
-      // (rebuildCustomerHistory re-projects the history on every load;
-      // markSeenInto/healOrphanedSeenKeys rebuild and heal the guard), so
-      // syncing them re-sent ~two extra copies of the database on every
-      // save — tens of thousands of rows that carried nothing the
-      // transactions sheet didn't already hold. Every device rebuilds both
-      // locally from the rows it holds, and the backend empties the cloud
-      // sheets on the next save. Old backends tolerate the absent tables:
-      // saveAll stages `body.customerTx || {}` / `body.seen || {}`, and a
-      // full chunked commit counts 0 against staging sheets saveBegin just
-      // reset, so no Code.gs redeploy is required to drop the tables.
-      transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
-    };
+    const payload = spaxBuildSavePayload();
     const allTx = payload.transactions;
 
     // This save's abort handle: Delete All aborts it to take the slot over.
@@ -2222,17 +2291,42 @@ async function performSaveToCloud(busyRetry = 0) {
     const bigTables = { transactions: allTx };
     const totalBigRows = allTx.length;
 
-    // ── INCREMENTAL SAVE (backend v3.4) ──
-    // When this device knows what the cloud already holds and the database
-    // only grew, the save appends the NEW transactions (small tables always
-    // ride along in full — they are cheap and must stay exact). A null delta
-    // means "cannot append": no pushed state yet (first save after the
-    // upgrade / a fresh device) or a destructive change flagged a full
-    // replace (Delete All, a scoped Rebuild, a duplicate rollback, a rename).
-    let deltaRows = null;
-    if (!spaxTxFullReplaceRequired()) {
-      const pushed = spaxPushedSet();
-      if (pushed) deltaRows = allTx.filter(t => !spaxTxAlreadyPushed(pushed, t));
+    const deltaRows = spaxComputeDeltaRows(allTx);
+    // Identity of THIS attempt (backend v3.6): a unique tag plus the
+    // fingerprints of the data it carries. Every one-shot save body and
+    // every commit echoes them, and the server stores them as the save's
+    // receipt on success — so an attempt whose response never arrived can be
+    // verified (did it land?) instead of re-uploaded blindly.
+    const saveTag = 't' + Date.now().toString(36) + Math.floor(Math.random() * 0x1000000).toString(36);
+    const txBasis = spaxTableBasis(allTx);
+    const smallBasis = spaxSmallBasis(payload);
+    // ── VERIFY BEFORE RE-UPLOADING ──
+    // This attempt only exists because the previous one ended ambiguously
+    // (its connection timed out — the server may have finished writing
+    // anyway). If the database hasn't changed since, ask the cloud for its
+    // last receipt first: a match means the previous attempt LANDED, and
+    // re-uploading it would just time out again. Verification needs a v3.6
+    // backend; anything older (or unreachable) simply doesn't match and the
+    // save proceeds exactly as before.
+    if (verifyFirst && verifyFirst.txBasis === txBasis && verifyFirst.smallBasis === smallBasis) {
+      showSyncStatus('⏳ ' + cloudSaveRunningName() + ' — checking whether the last attempt landed…');
+      let landed = false;
+      try {
+        landed = await spaxVerifySaveLanded(post, verifyFirst);
+      } catch (e) {
+        if (e && e.spaxCancelled) throw e;
+        landed = false;
+      }
+      if (landed) {
+        spaxNotePushedTransactions(allTx);
+        spaxNoteSavedBasis(payload);
+        try { spaxClearUploadSession(); } catch (_) {}
+        lastSyncTime = new Date();
+        showSyncStatus(cloudSaveDoneMessage());
+        lastCloudError = '';
+        cloudStoppedUpload = null;
+        return true;
+      }
     }
     // ── NOTHING NEW TO SEND ──
     // Only a BACKGROUND save may stop here. A forced save (Force Push, Delete
@@ -2272,15 +2366,25 @@ async function performSaveToCloud(busyRetry = 0) {
           console.warn('Cloud backend has no incremental actions — falling back to a full save.');
           // fall through to the full-save paths below
         } else if (err && err.probeFailed) {
-          // Transient failure of the probe (network drop, timeout) — not
-          // proof the deployment lacks saveDelta; fall back just this once.
+          // A TIMEOUT here means the server is still appending (slow, not
+          // incapable) — falling back to a full upload would restage
+          // everything slower and time out again. Back off and retry the
+          // delta instead: the retry verifies first and the server dedupes
+          // whatever already landed. Any other probe failure (an answered
+          // HTTP/app error, a network drop the server never saw) is not
+          // proof the deployment lacks saveDelta either — fall back just
+          // this once, exactly as before.
+          const rerouted = cloudSaveRerouteTimeout(err, { txBasis, smallBasis });
+          if (rerouted !== err) throw rerouted;
           console.warn('Delta probe failed (' + (err && err.message) + ') — falling back to a full save.');
           // fall through
         } else {
           // Chunks already started landing. Appends are idempotent, but do
           // not replay the whole database as one request: fail and let the
-          // next save resume/retry cleanly.
-          throw err;
+          // next save resume/retry cleanly — unless this was a timeout, in
+          // which case backing off and resuming the same session continues
+          // the upload instead of failing it.
+          throw cloudSaveRerouteTimeout(err, err && err.spaxVerifyFirst);
         }
       }
     }
@@ -2292,7 +2396,7 @@ async function performSaveToCloud(busyRetry = 0) {
     // a single request, on every backend.
     if (totalBigRows > CHUNK_ROWS && (cloudChunks || !cloudChunkProbed)) {
       try {
-        const chunked = await saveToCloudChunked(post, payload, bigTables, totalBigRows, 'full');
+        const chunked = await saveToCloudChunked(post, payload, bigTables, totalBigRows, 'full', { tag: saveTag, txBasis, smallBasis });
         if (chunked) {
           // A full commit just replaced the cloud sheet with these rows.
           spaxNotePushedTransactions(allTx);
@@ -2311,15 +2415,25 @@ async function performSaveToCloud(busyRetry = 0) {
           console.warn('Cloud backend has no chunked actions — saving in one request.');
           // fall through to the one-shot saveAll below
         } else if (err && err.probeFailed) {
-          // The probe failed for a transient reason (network drop, timeout)
-          // — NOT proof that the backend lacks the actions. Don't poison the
-          // capability cache; try the saveAll this once.
+          // A saveBegin TIMEOUT means the server is still staging (slow, not
+          // incapable): falling back to saveAll here would convert a
+          // resumable upload into a non-resumable one that times out again.
+          // Back off and retry the chunked upload instead. Any other probe
+          // failure (an answered HTTP/app error, a drop the server never
+          // saw) is NOT proof the backend lacks the actions either — don't
+          // poison the capability cache; try the saveAll this once.
+          const rerouted = cloudSaveRerouteTimeout(err, null);
+          if (rerouted !== err) throw rerouted;
           console.warn('Chunked probe failed (' + (err && err.message) + ') — falling back to a single saveAll.');
           // fall through to the one-shot saveAll below
         } else {
           // Slices already started landing — never replay the whole database
-          // as one request. Fail the save; the next save() retries cleanly.
-          throw err;
+          // as one request. Fail the save; the next save retries cleanly —
+          // unless this was a timeout, in which case backing off and
+          // re-entering the SAME session continues the upload (landed slices
+          // are de-duplicated by seq, a landed commit answers success)
+          // instead of failing it.
+          throw cloudSaveRerouteTimeout(err, err && err.spaxVerifyFirst);
         }
       }
     }
@@ -2327,7 +2441,9 @@ async function performSaveToCloud(busyRetry = 0) {
     // One-shot fallback. A payload this size needs minutes on a weak link —
     // give it CLOUD_TIMEOUT_BIG_SAVE, not the default 30s that aborted
     // (and kept aborting, server-side write still running) every big day.
-    const saveAllBody = { action: 'saveAll', ...payload };
+    // The attempt identity rides along so a v3.6 backend records a receipt
+    // (see spaxVerifySaveLanded); older backends ignore the extra fields.
+    const saveAllBody = { action: 'saveAll', ...payload, saveTag, txBasis, smallBasis };
     const saveAllTimeout = totalBigRows > CHUNK_ROWS ? CLOUD_TIMEOUT_BIG_SAVE : CLOUD_TIMEOUT_SMALL;
     let result;
     try {
@@ -2336,13 +2452,15 @@ async function performSaveToCloud(busyRetry = 0) {
       // A transient mobile drop surfaces as "Failed to fetch". saveAll is
       // atomic on the backend (stage → swap), so one retry of the WHOLE request
       // can never land on a truncated sheet — it just re-sends the same body.
-      // Never retry timeouts (they already burned their full budget) or a
+      // A TIMEOUT is different: the server is presumably still swapping, so
+      // re-sending immediately would just queue behind it — back off and
+      // retry (verifying first), like the busy path. Never retry a
       // body/HTTP rejection (retrying wastes another round-trip).
       if (isTransientNetworkError(err) && !err._spaxRetried) {
         try { err._spaxRetried = true; result = await post(saveAllBody, saveAllTimeout); }
-        catch (err2) { err2._spaxRetried = true; throw err2; }
+        catch (err2) { err2._spaxRetried = true; throw cloudSaveRerouteTimeout(err2, { txBasis, smallBasis }); }
       } else {
-        throw err;
+        throw cloudSaveRerouteTimeout(err, { txBasis, smallBasis });
       }
     }
     if (result.success) {
@@ -2378,25 +2496,35 @@ async function performSaveToCloud(busyRetry = 0) {
       const nextRetry = busyRetry + 1;
       const delayMs = CLOUD_BUSY_RETRY_DELAYS[nextRetry - 1] || CLOUD_BUSY_RETRY_DELAYS[CLOUD_BUSY_RETRY_DELAYS.length - 1];
       const busyTotal = cloudSaveLiveTotal();
+      // A rerouted timeout names its own cause (the previous attempt still
+      // being written); a genuine lock refusal names the lock holder.
+      const busyWhy = (err && err.spaxBusyWhy) || cloudSaveBusyReason();
       showSyncStatus('⏳ ' + cloudSaveRunningName() + ' waiting on the cloud' +
         (busyTotal > 1 ? ' (' + cloudSavePos + '/' + busyTotal + ')' : '') +
-        ' — ' + cloudSaveBusyReason() +
+        ' — ' + busyWhy +
         ', retrying in ' + Math.ceil(delayMs / 1000) + 's (' + nextRetry + '/' + CLOUD_BUSY_RETRIES + ')');
       // The wait must be interruptible: sitting out a 30s backoff while a
       // Delete All is trying to take over would defeat the pre-emption.
       await cloudSaveDelay(delayMs);
       if (cloudSaveIsCancelled()) return false;
-      return await performSaveToCloud(nextRetry);
+      // A rerouted timeout carries the fingerprints of the attempt that may
+      // have landed — the retry verifies before re-uploading (see above).
+      return await performSaveToCloud(nextRetry, (err && err.spaxVerifyFirst) || null);
     }
     lastCloudError = err && err.message ? err.message : String(err);
     console.error('Cloud save failed:', err);
+    // The batch drain uses this to decide whether the failure is worth an
+    // automatic retry on the next launch (see cloudSavePump). Captured at
+    // entry: by the time a pre-empted job unwinds, the global already points
+    // at its replacement, and the failure must not be booked onto that job.
+    if (myJob) myJob.failedWith = lastCloudError;
     // Spell out the common case so "what's saving in the background?" has an
     // answer: name the upload this device stopped if there was one, otherwise
     // say precisely what the two possible writers are — never "another save".
     if (isBackendBusyError(err)) {
-      showSyncStatus(cloudSaveFailedMessage('the cloud is still busy after retries — ' + cloudSaveBusyReason() + '. Wait ~1 min then Force Push.'));
+      showSyncStatus(cloudSaveFailedMessage('the cloud is still busy after retries — ' + ((err && err.spaxBusyWhy) || cloudSaveBusyReason()) + '. Wait ~1 min then Force Push.' + spaxOldBackendHint()));
     } else {
-      showSyncStatus(cloudSaveFailedMessage(lastCloudError));
+      showSyncStatus(cloudSaveFailedMessage(lastCloudError + spaxOldBackendHint()));
     }
     return false;
   } finally {
@@ -2496,7 +2624,10 @@ function isDeadUploadSessionError(msg) {
 // Sends every slice still owed (from the session's cursors) and commits.
 // Each acknowledged slice advances and re-persists the session, so a page
 // death at ANY point leaves a valid resume point behind.
-async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tables) {
+// `attempt` (optional) carries the saveTag/smallBasis the commit step needs
+// for the v3.6 save receipt; sessions resumed across saves omit it because
+// the original attempt is long gone.
+async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tables, attempt) {
   for (const table of tables) {
     const rows = bigTables[table];
     let seq = Number(session.cursors[table]) || 0;
@@ -2541,6 +2672,14 @@ async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tabl
   // aborts the commit and leaves the good data in place.
   const commitBody = { action: 'saveCommit', expect: session.expect, uploadId: session.uploadId };
   if (session.mode === 'delta') commitBody.mode = 'delta';
+  // Attempt identity for the v3.6 receipt (see performSaveToCloud); older
+  // backends ignore the extra fields. The basis covers the STAGED set,
+  // which for a full commit is the whole table.
+  if (attempt && attempt.tag) {
+    commitBody.saveTag = attempt.tag;
+    commitBody.txBasis = spaxTableBasis(bigTables.transactions || []);
+    commitBody.smallBasis = attempt.smallBasis || '';
+  }
   let commit;
   try {
     // Heaviest one-shot step: the backend counts every staged row and then
@@ -2548,6 +2687,10 @@ async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tabl
     commit = await post(commitBody, CLOUD_TIMEOUT_COMMIT);
   } catch (err) {
     if (err && isDeadUploadSessionError(err.message)) err.spaxSessionDead = true;
+    // A commit may have succeeded server-side even when its response never
+    // arrived (a v3.6 backend answers the replay with success instead of
+    // swapping twice) — flag the step so the caller can verify first.
+    if (err) err.spaxCommitStep = true;
     throw err;
   }
   if (commit.success) {
@@ -2567,12 +2710,29 @@ async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tabl
 // protocol). mode 'delta' stages only the NEW transactions and the backend
 // appends them to the live Transactions sheet (backend v3.4) — small tables
 // still stage-and-swap so contact edits and baseline changes always land.
-async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode) {
+// `attempt` carries this save's identity ({tag, txBasis, smallBasis}) for the
+// v3.6 save receipt; omitted when the resuming save has no live attempt.
+async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode, attempt) {
   mode = mode === 'delta' ? 'delta' : 'full';
   const tables = ['transactions'];
   const expect = {};
   const basis = {};
   tables.forEach(t => { expect[t] = bigTables[t].length; basis[t] = spaxTableBasis(bigTables[t]); });
+  if (!attempt || !attempt.tag) attempt = null;
+  const markCommitStep = (err) => {
+    // A commit that may have landed server-side (its ack never arrived):
+    // carry the fingerprints the busy-retry verifies before re-uploading.
+    // The receipt covers the LIVE sheet, so a delta append verifies against
+    // the full-set hash, while a full replace verifies the staged set (the
+    // live sheet it just swapped in).
+    if (err && err.spaxCommitStep && !err.spaxVerifyFirst) {
+      err.spaxVerifyFirst = {
+        txBasis: mode === 'delta' && attempt ? attempt.txBasis : spaxTableBasis(bigTables.transactions || []),
+        smallBasis: attempt ? attempt.smallBasis : ''
+      };
+    }
+    return err;
+  };
 
   // Resume an interrupted upload if — and only if — the database it describes
   // is byte-for-byte the one this save is about to send.
@@ -2580,7 +2740,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode) 
   if (spaxSessionUsable(saved, bigTables, expect, basis, tables, mode)) {
     showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · resuming interrupted upload — keep the app open');
     try {
-      return await spaxRunChunkedUpload(post, saved, bigTables, totalBigRows, tables);
+      return await spaxRunChunkedUpload(post, saved, bigTables, totalBigRows, tables, attempt);
     } catch (err) {
       if (err && err.spaxSessionDead) {
         // The server no longer holds that staging area. Start over — this is
@@ -2589,7 +2749,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode) 
       } else {
         // Network/timeout: the cursors were persisted after every ack, so the
         // next save picks up from the last acknowledged slice.
-        throw err;
+        throw markCommitStep(err);
       }
     }
   }
@@ -2650,12 +2810,12 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode) 
   };
   spaxSaveUploadSession(session);
   try {
-    return await spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tables);
+    return await spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tables, attempt);
   } catch (err) {
     // A session the server refuses is useless — clear it so the next save
     // starts clean instead of resuming into the same refusal.
     if (err && err.spaxSessionDead) spaxClearUploadSession();
-    throw err;
+    throw markCommitStep(err);
   }
 }
 
@@ -2663,7 +2823,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode) 
 // the rows added since the last confirmed push travel as Transactions. A
 // small delta is a single saveDelta POST; a large first delta after the
 // upgrade is sliced (mode:"delta" chunked session) and still append-only.
-async function saveDeltaToCloud(post, payload, deltaRows) {
+async function saveDeltaToCloud(post, payload, deltaRows, saveTag) {
   const rememberDelta = () => {
     cloudDelta = true;
     cloudDeltaProbed = true;
@@ -2674,15 +2834,24 @@ async function saveDeltaToCloud(post, payload, deltaRows) {
     // answering "unknown action", any other rejection) is always safe to
     // follow with a full save — no rows were staged or appended — so flag it
     // as a probe failure for the caller; unknown-action is still recognised
-    // separately there and cached as "deployment lacks deltas".
+    // separately there and cached as "deployment lacks deltas". An
+    // UNANSWERED one (a client timeout) is the exception: the server may be
+    // mid-append, so the fingerprint of the in-flight attempt rides along
+    // for the busy-retry's verify-before-re-uploading step.
+    const verifyFirst = saveTag ? { txBasis: saveTag.txBasis, smallBasis: saveTag.smallBasis } : null;
     try {
       const res = await post({
         action: 'saveDelta',
         customers: payload.customers,
         monthly: payload.monthly,
         settings: payload.settings,
-        txAdd
-      }, CLOUD_TIMEOUT_CHUNK, 0); // capability probe: blips fall back, not retry
+        txAdd,
+        saveTag: saveTag && saveTag.tag,
+        txBasis: verifyFirst && verifyFirst.txBasis,
+        smallBasis: verifyFirst && verifyFirst.smallBasis
+      }, CLOUD_TIMEOUT_BIG_SAVE, 0); // full-body post: tiny deltas answer fast, but the server
+      // still appends+swaps like any big save — a 60s slice deadline would
+      // abort it on a slow host. Capability-probe semantics stay (0 retries).
       if (res && res.success === true) {
         rememberDelta();
         return true;
@@ -2690,6 +2859,7 @@ async function saveDeltaToCloud(post, payload, deltaRows) {
       throw new Error((res && res.error) || 'Cloud rejected the delta save');
     } catch (err) {
       err.probeFailed = true;
+      if (verifyFirst) err.spaxVerifyFirst = verifyFirst;
       throw err;
     }
   };
@@ -2698,7 +2868,7 @@ async function saveDeltaToCloud(post, payload, deltaRows) {
   // mode:"delta" chunked session — still append-only.
   if (!deltaRows || deltaRows.length <= CHUNK_ROWS) return await oneShot((deltaRows || []));
   const deltaTables = { transactions: deltaRows };
-  return await saveToCloudChunked(post, payload, deltaTables, deltaRows.length, 'delta');
+  return await saveToCloudChunked(post, payload, deltaTables, deltaRows.length, 'delta', saveTag);
 }
 
 // A save may fail without touching any sheet when another device/tab owns
@@ -2723,6 +2893,76 @@ function isTransientNetworkError(err) {
   const msg = String((err && err.message) || err);
   if (/timed out|timeout/i.test(msg)) return false;
   return /failed to fetch|network error|load failed|typeerror|connection|net::/i.test(msg);
+}
+
+// A client-side timeout: the request outlived its deadline, so the server
+// may STILL BE WRITING (slow, not incapable). Unlike an answered failure,
+// a timeout must never fall back to a SLOWER path (saveAll) — it backs off
+// and retries the same resumable path instead (see
+// cloudSaveRerouteTimeout). Matched narrowly against cloudRequest's own
+// timeout message so unrelated "timeout" words never qualify.
+function isTimeoutError(err) {
+  return /timed out after \d+s/i.test(String((err && err.message) || err));
+}
+
+// Failures that prove the deployment itself is gone or misconfigured: no
+// retry — now or on the next boot — can succeed until a human redeploys
+// Code.gs and pastes the new URL. Every other failure is worth one
+// automatic retry on the next launch (see cloudSavePump's drain).
+function isDeadDeploymentError(msg) {
+  return /HTTP 404|deployment appears deleted|non-JSON response/i.test(String(msg || ''));
+}
+
+// Wraps a timeout as a busy-retry round: the server is presumably still
+// working, so this attempt backs off and re-enters (verifying first when
+// the timed-out attempt may have completed — see performSaveToCloud).
+// Matches isBackendBusyError so the existing retry machinery runs it.
+function cloudSaveSlowServerError(verifyFirst) {
+  const err = new Error('backend busy — the previous upload attempt is still being written on the server after the connection timed out');
+  err.spaxBusyWhy = 'the previous upload attempt is still being written on the server after the connection timed out';
+  err.spaxVerifyFirst = verifyFirst || null;
+  return err;
+}
+
+// Timeout (and only timeout — never a cancel, a lock refusal or an
+// answered failure) becomes a busy-retry round; anything else passes
+// through untouched for its existing handling.
+function cloudSaveRerouteTimeout(err, verifyFirst) {
+  if (err && !err.spaxCancelled && !isBackendBusyError(err) && isTimeoutError(err)) {
+    return cloudSaveSlowServerError(verifyFirst);
+  }
+  return err;
+}
+
+// Asks a v3.6 backend for its last save receipt and compares fingerprints.
+// True = the timed-out attempt verifiably landed; anything else (an older
+// backend answering "unknown action", an unreachable cloud, a receipt for
+// different data) throws or returns false, and the save proceeds to upload.
+async function spaxVerifySaveLanded(post, verifyFirst) {
+  const st = await post({ action: 'status' }, CLOUD_TIMEOUT_DEFAULT, 0);
+  try { spaxNoteBackendVersion(st); } catch (_) {}
+  const rec = st && st.lastSave;
+  return !!(rec && verifyFirst && verifyFirst.txBasis && verifyFirst.smallBasis &&
+    rec.txBasis === verifyFirst.txBasis && rec.smallBasis === verifyFirst.smallBasis);
+}
+
+// Last backend version seen on a load/status answer (null = unknown —
+// either never asked or a deployment that predates version reporting).
+let cloudBackendVersion = null;
+function spaxNoteBackendVersion(data) {
+  if (data && data.version) cloudBackendVersion = String(data.version);
+}
+
+// Shown on a failed big save when the backend has PROVEN it has no chunked
+// uploads: a one-shot save can never resume, so on a slow server it can
+// never converge either — redeploying is the fix, not retrying.
+function spaxOldBackendHint() {
+  try {
+    if ((DB.transactions || []).length > CHUNK_ROWS && cloudChunkProbed && !cloudChunks) {
+      return ' The backend answers without chunked uploads — redeploy Code.gs (v3.6): chunked saves resume instead of restarting.';
+    }
+  } catch (_) {}
+  return '';
 }
 
 function showSyncStatus(msg) {
@@ -10405,6 +10645,8 @@ function updateSyncDetails(){
     <b>Sync Mode:</b> ${mode}<br>
     <b>Saving Now:</b> ${savingLine}<br>
     <b>Background guard:</b> ${guardLine}<br>
+    <b>Cloud Backend:</b> ${spaxBackendDiagHtml()}<br>
+    ${spaxPendingRetryHtml()}
     <b>Last Sync:</b> ${lastSync}<br>
     <b>Local Customers:</b> ${DB.customers.length.toLocaleString()}<br>
     <b>Local Transactions:</b> ${(DB.transactions || []).length.toLocaleString()}<br>
@@ -10414,6 +10656,41 @@ function updateSyncDetails(){
     <b>Local Store:</b> ${typeof _idb !== 'undefined' && _idb ? 'IndexedDB' : 'localStorage (fallback)'} — ${typeof DB_persistFailed !== 'undefined' && DB_persistFailed ? '<span style="color:var(--amber)">⚠️ Full — data is in memory &amp; cloud only</span>' : '<span style="color:var(--green)">OK</span>'}<br>
     ${spaxCloudUrlLineHtml()}
   `;
+}
+
+// What the deployment last proved it can do: its reported version plus the
+// upload capabilities probed this session. A backend stuck on one-shot saves
+// is the thing to fix when big saves keep failing — no retry strategy can
+// make a non-resumable upload converge on a slow server.
+function spaxBackendDiagHtml() {
+  const v = (typeof cloudBackendVersion !== 'undefined' && cloudBackendVersion) ? String(cloudBackendVersion) : null;
+  if (!v) return '<span style="color:var(--muted)">Unknown yet — shown after the next load or save answers</span>';
+  const probed = (typeof cloudDeltaProbed !== 'undefined' && cloudDeltaProbed) ||
+                 (typeof cloudChunkProbed !== 'undefined' && cloudChunkProbed);
+  const caps = !probed ? 'upload capabilities not probed yet this session'
+    : (typeof cloudDelta !== 'undefined' && cloudDelta) ? 'delta uploads'
+    : (typeof cloudChunks !== 'undefined' && cloudChunks) ? 'chunked uploads' : 'one-shot saves only';
+  let html = 'v' + escHtml(v) + ' · ' + escHtml(caps);
+  try {
+    if (!cloudDelta && !cloudChunks && cloudChunkProbed && (DB.transactions || []).length > CHUNK_ROWS) {
+      html += ' — <span style="color:var(--amber)">big saves cannot resume on this backend; redeploy Code.gs (v3.6)</span>';
+    }
+  } catch (_) {}
+  return html;
+}
+
+// A failed batch re-plants the resume flag (see cloudSavePump's drain) —
+// while idle, a set flag means exactly that: the data is still unpushed and
+// the next launch pushes it. Surfaced here so the pending retry is visible
+// instead of a surprise "resumed" task later.
+function spaxPendingRetryHtml() {
+  try {
+    if (cloudSaveRunning || cloudSaveQueue.length) return '';
+    if (typeof localStorage !== 'undefined' && localStorage.getItem(SPAX_PENDING_KEY)) {
+      return '<b>Pending Retry:</b> <span style="color:var(--amber)">a failed save will resume automatically on the next launch</span><br>';
+    }
+  } catch (_) {}
+  return '';
 }
 
 /* ── CLOUD ENDPOINT (Test connection / URL override) ─────────────────────── */
@@ -10442,6 +10719,7 @@ async function testCloudConnection(){
   if(el) el.innerHTML = '<span style="color:var(--muted)">⏳ Testing the cloud endpoint…</span>';
   try{
     const data = await cloudLoad();
+    try { spaxNoteBackendVersion(data); } catch (_) {}
     const nCust = (data.customers || []).length;
     const nTx = (data.transactions || []).length;
     cloudTestResult = { ok: true, detail: 'HTTP 200 — ' + nCust + ' customers, ' + nTx + ' transactions', at: Date.now() };

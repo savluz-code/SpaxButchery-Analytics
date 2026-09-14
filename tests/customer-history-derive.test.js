@@ -300,9 +300,11 @@ test('the boot path rebuilds history before reconciling tallies', () => {
 });
 
 test('the save payload no longer carries customerTx', () => {
+  // The payload builder was extracted from performSaveToCloud so the resume
+  // pre-check can ask "is anything unpushed?" without starting a save.
   const payload = htmlSource.slice(
-    htmlSource.indexOf('const payload = {', htmlSource.indexOf('async function performSaveToCloud')),
-    htmlSource.indexOf('const allTx = payload.transactions;')
+    htmlSource.indexOf('function spaxBuildSavePayload()'),
+    htmlSource.indexOf('function spaxComputeDeltaRows(')
   );
   assert.match(payload, /transactions: \(DB\.transactions/);
   assert.doesNotMatch(payload, /customerTx:/, 'the derived history must never be uploaded');

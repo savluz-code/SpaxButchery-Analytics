@@ -627,6 +627,12 @@ function doPost(e) {
   </div>
 
   <div class="card" style="margin-top:16px;">
+    <h3>🛠️ Live Activity — what's running right now</h3>
+    <div class="hint">Every save and every import shows here by name, with its own ✖ to cancel just that one.</div>
+    <div id="taskPanel" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
     <h3>📊 Sync Status</h3>
     <div id="syncDetails" style="font-size:.85rem;color:var(--muted);line-height:1.6;">
       Loading...
@@ -1465,6 +1471,93 @@ let spaxSaveWanted = false;   // a cloud save is queued or running
 let spaxModalWanted = false;  // an import/parse task (modal or file handler) is running
 let spaxHiddenDuringSave = false;
 
+// ── LIVE TASK REGISTRY ──
+// Every unit of work the app runs in the background — each cloud save job and
+// each local import/parse/OCR task — is registered here the moment it is
+// created, so the UI can answer "what exactly is happening right now?" with
+// names, states and per-task progress instead of one vague pill. Each entry
+// also carries its own `cancel` handle, so a single task can be stopped
+// without touching the others.
+//   { id, kind:'save'|'task', name, state, detail, started, ended, cancel }
+// state: 'queued' | 'running' | 'done' | 'cancelled' | 'failed'
+let spaxTasks = [];
+let spaxTaskSeq = 0;
+const SPAX_TASK_HISTORY = 6; // finished tasks kept for the "recent" list
+
+function spaxNow() { return Date.now(); }
+
+function spaxTasksChanged() {
+  // The renderer lives with the rest of the UI; the sync layer must keep
+  // working (tests, headless) when it isn't there.
+  try { if (typeof spaxRenderTasks === 'function') spaxRenderTasks(); } catch (_) {}
+  try { if (typeof spaxTaskTick === 'function' && spaxActiveTasks().length) spaxTaskTick(); } catch (_) {}
+}
+
+function spaxRegisterTask(info) {
+  const task = {
+    id: 'T' + (++spaxTaskSeq),
+    kind: (info && info.kind) || 'task',
+    name: (info && info.name) || 'Task',
+    state: (info && info.state) || 'running',
+    detail: (info && info.detail) || '',
+    started: spaxNow(),
+    ended: null,
+    cancel: (info && info.cancel) || null
+  };
+  spaxTasks.push(task);
+  spaxTasksChanged();
+  return task;
+}
+
+function spaxUpdateTask(task, patch) {
+  if (!task) return;
+  Object.keys(patch || {}).forEach(k => { task[k] = patch[k]; });
+  spaxTasksChanged();
+}
+
+function spaxFinishTask(task, state, detail) {
+  if (!task || task.ended) return;
+  task.state = state || 'done';
+  if (detail !== undefined) task.detail = detail;
+  task.ended = spaxNow();
+  task.cancel = null;
+  // Keep a short tail of finished tasks so a completion stays readable for a
+  // moment instead of vanishing the instant it lands.
+  const finished = spaxTasks.filter(t => t.ended);
+  if (finished.length > SPAX_TASK_HISTORY) {
+    const drop = finished.slice(0, finished.length - SPAX_TASK_HISTORY);
+    spaxTasks = spaxTasks.filter(t => drop.indexOf(t) === -1);
+  }
+  spaxTasksChanged();
+}
+
+// Everything still queued or running — the honest answer to "what is the app
+// busy with?".
+function spaxActiveTasks() {
+  return spaxTasks.filter(t => !t.ended);
+}
+function spaxRecentTasks() {
+  return spaxTasks.filter(t => t.ended);
+}
+// Cancel ONE task by its id. Returns true when something was actually stopped.
+function spaxCancelTask(id) {
+  const task = spaxTasks.filter(t => t.id === id)[0];
+  if (!task || task.ended || typeof task.cancel !== 'function') return false;
+  try { task.cancel(); } catch (_) { return false; }
+  return true;
+}
+// Progress text from the sync pill is mirrored onto the RUNNING save task, so
+// the task list shows "42% · chunk 5/12" per job rather than a shared blob.
+function spaxTaskProgress(msg) {
+  const text = String(msg || '');
+  const running = spaxTasks.filter(t => t.kind === 'save' && t.state === 'running')[0];
+  if (!running) return;
+  // Strip the pill's own prefix/name so the task row isn't a duplicate of it.
+  let detail = text.replace(/^[^—]*—\s*/, '').replace(running.name, '').trim();
+  detail = detail.replace(/^[·\-—\s]+/, '');
+  spaxUpdateTask(running, { detail: detail.slice(0, 120) });
+}
+
 function spaxUpdateWakeLock() {
   if (typeof navigator === 'undefined' || !navigator.wakeLock || !navigator.wakeLock.request) return;
   if ((spaxSaveWanted || spaxModalWanted) && !spaxWakeLock) {
@@ -1509,6 +1602,41 @@ function spaxClearPending() {
 function spaxModalTask(running) {
   spaxModalWanted = !!running;
   spaxUpdateWakeLock();
+}
+
+// A NAMED local task (file parse, backfill, rebuild, OCR). It holds the wake
+// lock like spaxModalTask does, appears by name in the live task list, and
+// carries a cancel flag the worker loop can poll — so one import can be
+// stopped without killing the others or the saves.
+//   const t = spaxBeginLocalTask('📄 Parsing statement.pdf');
+//   if (t.cancelled) …bail out…
+//   t.progress('file 2 of 5'); t.end('done');
+let spaxLocalTaskCount = 0;
+function spaxBeginLocalTask(name, detail) {
+  spaxLocalTaskCount += 1;
+  spaxModalWanted = true;
+  spaxUpdateWakeLock();
+  const handle = { cancelled: false, name: name || 'Task' };
+  handle.task = spaxRegisterTask({
+    kind: 'task',
+    name: handle.name,
+    state: 'running',
+    detail: detail || '',
+    cancel: () => {
+      handle.cancelled = true;
+      spaxUpdateTask(handle.task, { detail: 'cancelling…' });
+      if (typeof toast === 'function') toast('⏹️ Cancelling ' + handle.name + '…');
+    }
+  });
+  handle.progress = (text) => spaxUpdateTask(handle.task, { detail: String(text || '').slice(0, 120) });
+  handle.end = (state, text) => {
+    if (handle.ended) return;
+    handle.ended = true;
+    spaxLocalTaskCount = Math.max(0, spaxLocalTaskCount - 1);
+    if (!spaxLocalTaskCount) { spaxModalWanted = false; spaxUpdateWakeLock(); }
+    spaxFinishTask(handle.task, state || (handle.cancelled ? 'cancelled' : 'done'), text);
+  };
+  return handle;
 }
 function spaxRegisterBackgroundSync() {
   try {
@@ -1555,8 +1683,16 @@ function spaxResumeInterruptedSave() {
   if (typeof SYNC_MODE !== 'undefined' && SYNC_MODE === 'local') return false;
   // No popup toast on resume — the sync pill already announces and tracks the
   // resumed upload, and a boot-time toast made every restart feel like an error.
-  try { showSyncStatus('🔄 Resuming interrupted save…'); } catch (_) {}
-  try { saveToCloud(true, (typeof CLOUD_SAVE_NAMES !== 'undefined' ? CLOUD_SAVE_NAMES.save : '💾 Save')); } catch (_) {}
+  // Name it and say WHEN it was interrupted — a resumed save is a real,
+  // listed, cancellable task like any other, not an anonymous "something".
+  let when = '';
+  try {
+    const ts = Number(pending);
+    if (ts) when = ' (started ' + new Date(ts).toLocaleTimeString() + ')';
+  } catch (_) {}
+  const resumeName = (typeof CLOUD_SAVE_NAMES !== 'undefined' ? CLOUD_SAVE_NAMES.resume : '🔄 Resumed save');
+  try { showSyncStatus('🔄 Resuming interrupted save — ' + resumeName + when); } catch (_) {}
+  try { saveToCloud(true, resumeName); } catch (_) {}
   return true;
 }
 // Warn before the tab is closed mid-save; track hidden saves so the finish is
@@ -1602,7 +1738,8 @@ const CLOUD_SAVE_NAMES = {
   smartMerge: '🔀 Smart Merge',
   backfill:   '📥 Backfill',
   rebuild:    '🔧 Rebuild',
-  dupFix:     '🧹 First-visit fix'
+  dupFix:     '🧹 First-visit fix',
+  resume:     '🔄 Resumed save'
 };
 
 // A cancelled save is not a failed one: the user asked for the thing that
@@ -1657,7 +1794,7 @@ function saveToCloud(force = false, name) {
   // Every job is named. A caller that forgets still gets a real name rather
   // than the old anonymous slot that surfaced as "another save".
   const label = name || (force ? CLOUD_SAVE_NAMES.save : CLOUD_SAVE_NAMES.auto);
-  const job = { force: !!force, auto: !force, name: label, cancelled: false, resolve: resolveJob, promise };
+  const job = { force: !!force, auto: !force, name: label, cancelled: false, resolve: resolveJob, promise, task: null };
   // The SAME forced save twice (Force Push tapped twice, a Rebuild queued
   // behind a Rebuild) would upload the whole database twice — minutes apart
   // and one behind the other, since saves cannot overlap the backend's lock.
@@ -1670,6 +1807,14 @@ function saveToCloud(force = false, name) {
   }
   if (!force) cloudSaveAutoPromise = promise;
   cloudSaveQueue.push(job);
+  // Visible from this instant: named, queued, and individually cancellable.
+  job.task = spaxRegisterTask({
+    kind: 'save',
+    name: label,
+    state: 'queued',
+    detail: 'waiting for the cloud slot',
+    cancel: () => cloudSaveCancelJob(job)
+  });
   // From here the save must survive minimizing/covering: hold the wake lock,
   // plant the resume flag and register for Background Sync.
   try { spaxMarkPending(); } catch (_) {}
@@ -1731,7 +1876,7 @@ function cloudSavePump() {
   const job = cloudSaveQueue.shift();
   // A pre-emption resolves queued jobs as it drops them; skip any that were
   // cancelled between being dropped and being reached.
-  if (job.cancelled) { job.resolve(false); return cloudSavePump(); }
+  if (job.cancelled) { job.resolve(false); spaxFinishTask(job.task, 'cancelled', 'cancelled before it started'); return cloudSavePump(); }
   if (job.auto) cloudSaveAutoPromise = null; // slot running — new background saves queue for the next round
   cloudSaveRunning = true;
   cloudSaveRunningJob = job;
@@ -1739,11 +1884,21 @@ function cloudSavePump() {
   // One abort handle per job: Delete All uses it to stop THIS upload without
   // touching whatever replaces it.
   cloudSaveToken = { cancelled: false, controller: new AbortController() };
+  spaxUpdateTask(job.task, { state: 'running', detail: 'uploading' });
   cloudSaveAnnounceRunning();
   Promise.resolve()
     .then(() => SYNC_MODE === 'local' ? false : performSaveToCloud())
-    .then(ok => { job.resolve(!!ok); if (ok) cloudSaveBatch.push(job.name); })
-    .catch(() => { job.resolve(false); })
+    .then(ok => {
+      job.resolve(!!ok);
+      if (ok) cloudSaveBatch.push(job.name);
+      if (job.cancelled) spaxFinishTask(job.task, 'cancelled', 'stopped by you');
+      else spaxFinishTask(job.task, ok ? 'done' : 'failed', ok ? 'saved to the cloud' : (lastCloudError || 'save failed'));
+    })
+    .catch((err) => {
+      job.resolve(false);
+      spaxFinishTask(job.task, job.cancelled ? 'cancelled' : 'failed',
+        job.cancelled ? 'stopped by you' : ((err && err.message) || 'save failed'));
+    })
     .then(() => {
       // Only the job that still owns the slot may release it. A job cancelled
       // by a pre-emption unwinds AFTER its replacement has already started,
@@ -1755,6 +1910,48 @@ function cloudSavePump() {
       }
       cloudSavePump();
     });
+}
+
+// ── PER-JOB CANCEL ──
+// Stops ONE save — the running upload or any single queued job — and leaves
+// everything else in the queue exactly where it is. This is what the task list
+// calls when the user taps ✖ on a row.
+function cloudSaveCancelJob(job) {
+  if (!job || job.cancelled) return false;
+  job.cancelled = true;
+  if (cloudSaveRunningJob === job) {
+    // Abort the request in flight and cut short any busy-retry backoff. The
+    // slot is released by the job's own unwind in cloudSavePump.
+    cloudStoppedUpload = job.name;
+    try { spaxClearUploadSession(); } catch (_) {}
+    if (cloudSaveToken) {
+      cloudSaveToken.cancelled = true;
+      try { cloudSaveToken.controller.abort(); } catch (_) {}
+      if (typeof cloudSaveToken.wake === 'function') cloudSaveToken.wake();
+    }
+  } else {
+    const i = cloudSaveQueue.indexOf(job);
+    if (i >= 0) cloudSaveQueue.splice(i, 1);
+    if (job.auto && cloudSaveAutoPromise === job.promise) cloudSaveAutoPromise = null;
+    job.resolve(false);
+    spaxFinishTask(job.task, 'cancelled', 'cancelled before it started');
+  }
+  if (typeof toast === 'function') toast('⏹️ Cancelled ' + job.name);
+  try {
+    showSyncStatus('⏹️ ' + job.name + ' cancelled' +
+      (cloudSaveRunning || cloudSaveQueue.length ? ' — other saves continue' : ''));
+  } catch (_) {}
+  // Nothing left to protect once the last job goes.
+  if (!cloudSaveRunning && !cloudSaveQueue.length) { try { spaxClearPending(); } catch (_) {} }
+  return true;
+}
+
+// Cancels every save queued or running, in one go.
+function cloudSaveCancelAll() {
+  const jobs = [cloudSaveRunningJob].concat(cloudSaveQueue.slice()).filter(Boolean);
+  let n = 0;
+  jobs.forEach(j => { if (cloudSaveCancelJob(j)) n += 1; });
+  return n;
 }
 
 // ── PRE-EMPTION ──
@@ -1787,6 +1984,7 @@ function cloudSavePreempt(reasonName) {
     stopped.push(j.name);
     j.cancelled = true;
     j.resolve(false);
+    spaxFinishTask(j.task, 'cancelled', 'superseded by ' + reasonName);
   });
   cloudSaveQueue.length = 0;
   // The coalesced background slot lived in that queue — it is gone with it,
@@ -2400,11 +2598,128 @@ function showSyncStatus(msg) {
   }
   el.textContent = msg;
   el.style.opacity = '1';
-  // Mirror in-progress saves into the tab title (task-switcher visibility).
+  // Mirror in-progress saves into the tab title (task-switcher visibility)
+  // and onto the running save's row in the live task list.
   try { spaxTitleProgress(msg); } catch (_) {}
+  try { spaxTaskProgress(msg); } catch (_) {}
   if (!msg.includes('⏳')) {
     setTimeout(() => { el.style.opacity = '0.6'; }, 3000);
   }
+}
+
+// ── LIVE ACTIVITY UI ──
+// Renders the task registry in two places:
+//   • #taskPanel in the Sync tab — the full list, with per-task ✖ cancel.
+//   • a floating dock under the sync pill — always visible, so "what is
+//     running?" never requires navigating anywhere.
+// Every row names the task, its state, how long it has been going and its own
+// progress detail; active rows carry a cancel button wired to THAT task only.
+function spaxTaskAge(t) {
+  const ms = (t.ended || Date.now()) - t.started;
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+}
+const SPAX_TASK_STATE = {
+  queued:    { icon: '⏳', label: 'Queued',    color: 'var(--muted)' },
+  running:   { icon: '🔄', label: 'Running',   color: 'var(--blue)' },
+  done:      { icon: '✅', label: 'Done',      color: 'var(--green)' },
+  cancelled: { icon: '⏹️', label: 'Cancelled', color: 'var(--amber)' },
+  failed:    { icon: '❌', label: 'Failed',    color: 'var(--red)' }
+};
+function spaxTaskRowHtml(t) {
+  const st = SPAX_TASK_STATE[t.state] || SPAX_TASK_STATE.running;
+  const cancellable = !t.ended && typeof t.cancel === 'function';
+  return '<div style="display:flex;align-items:flex-start;gap:10px;padding:8px 10px;border:1px solid var(--border);' +
+      'border-radius:8px;background:var(--card2);margin-bottom:6px;">' +
+    '<div style="font-size:1rem;line-height:1.3">' + st.icon + '</div>' +
+    '<div style="flex:1;min-width:0">' +
+      '<div style="font-weight:600;font-size:.82rem;color:var(--text)">' + escHtml(t.name) + '</div>' +
+      '<div style="font-size:.72rem;color:' + st.color + '">' + st.label +
+        (t.detail ? ' · ' + escHtml(t.detail) : '') + ' · ' + spaxTaskAge(t) + '</div>' +
+    '</div>' +
+    (cancellable
+      ? '<button class="btn ghost" style="padding:2px 8px;font-size:.72rem;" title="Cancel only this ' +
+        (t.kind === 'save' ? 'save' : 'task') + '" onclick="spaxCancelTaskFromUI(\'' + t.id + '\')">✖</button>'
+      : '') +
+  '</div>';
+}
+function spaxCancelTaskFromUI(id) {
+  const ok = spaxCancelTask(id);
+  if (!ok && typeof toast === 'function') toast('That task already finished');
+  spaxRenderTasks();
+}
+function spaxCancelAllFromUI() {
+  let n = 0;
+  try { n += cloudSaveCancelAll(); } catch (_) {}
+  spaxActiveTasks().filter(t => t.kind !== 'save').forEach(t => { if (spaxCancelTask(t.id)) n += 1; });
+  if (typeof toast === 'function') toast(n ? '⏹️ Cancelling ' + n + ' task(s)' : 'Nothing is running');
+  spaxRenderTasks();
+}
+function spaxTasksHtml() {
+  const active = spaxActiveTasks();
+  const recent = spaxRecentTasks().slice().reverse();
+  let html = '';
+  if (!active.length) {
+    html += '<div style="font-size:.8rem;color:var(--muted);padding:6px 2px">💤 Nothing running — all saves and imports are finished.</div>';
+  } else {
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
+      '<div style="font-size:.78rem;color:var(--text);font-weight:600">' + active.length + ' running / queued</div>' +
+      '<button class="btn ghost" style="padding:2px 8px;font-size:.72rem" onclick="spaxCancelAllFromUI()">⏹️ Cancel all</button></div>';
+    html += active.map(spaxTaskRowHtml).join('');
+  }
+  if (recent.length) {
+    html += '<div style="font-size:.72rem;color:var(--muted);margin:10px 0 4px">Recent</div>' +
+      recent.map(spaxTaskRowHtml).join('');
+  }
+  return html;
+}
+let spaxDockOpen = false;
+function spaxToggleDock() { spaxDockOpen = !spaxDockOpen; spaxRenderTasks(); spaxTaskTick(); }
+function spaxRenderTasks() {
+  if (typeof document === 'undefined' || !document.getElementById) return;
+  const panel = document.getElementById('taskPanel');
+  if (panel) panel.innerHTML = spaxTasksHtml();
+
+  // Floating dock: a chip that counts live work, expanding into the same list.
+  let dock = document.getElementById('taskDock');
+  const active = spaxActiveTasks();
+  if (!dock) {
+    if (!active.length) return; // nothing to show yet — don't create chrome
+    dock = document.createElement('div');
+    dock.id = 'taskDock';
+    dock.style.cssText = 'position:fixed;top:44px;right:8px;z-index:501;max-width:320px;font-size:.78rem;';
+    document.body.appendChild(dock);
+  }
+  if (!active.length && !spaxDockOpen) { dock.innerHTML = ''; return; }
+  const chip = '<div onclick="spaxToggleDock()" style="cursor:pointer;background:var(--card2);border:1px solid var(--border);' +
+    'border-radius:8px;padding:6px 10px;color:var(--text);display:inline-block">' +
+    (active.length ? '🛠️ ' + active.length + ' task' + (active.length > 1 ? 's' : '') + ' running' : '🛠️ Activity') +
+    ' ' + (spaxDockOpen ? '▲' : '▼') + '</div>';
+  const body = spaxDockOpen
+    ? '<div style="margin-top:6px;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px;' +
+      'max-height:60vh;overflow:auto;box-shadow:0 8px 24px rgba(0,0,0,.35)">' + spaxTasksHtml() + '</div>'
+    : '';
+  dock.innerHTML = chip + body;
+}
+// Keep the elapsed timers honest while work is in flight. The ticker only
+// exists while there IS work (or the dock is open) and stops itself the
+// moment everything drains — an always-on interval would keep the page (and
+// any headless host running this layer) awake for nothing.
+let spaxTaskTicker = null;
+function spaxTaskTick() {
+  if (spaxTaskTicker) return;
+  if (typeof setInterval !== 'function') return;
+  spaxTaskTicker = setInterval(() => {
+    try {
+      if (!spaxActiveTasks().length && !spaxDockOpen) {
+        clearInterval(spaxTaskTicker);
+        spaxTaskTicker = null;
+        return;
+      }
+      spaxRenderTasks();
+    } catch (_) {}
+  }, 1000);
+  try { if (spaxTaskTicker && typeof spaxTaskTicker.unref === 'function') spaxTaskTicker.unref(); } catch (_) {}
 }
 
 function addSyncUI() {
@@ -2435,6 +2750,7 @@ function addSyncUI() {
 }
 
 document.addEventListener('DOMContentLoaded', addSyncUI);
+document.addEventListener('DOMContentLoaded', () => { try { spaxRenderTasks(); } catch (_) {} });
 
 
 function getTodayEAT(){
@@ -8444,15 +8760,27 @@ async function handleFiles(fileList) {
   const files = Array.from(fileList || []).filter(Boolean);
   if (!files.length) return;
 
-  // Hold the app active for the whole parse (scanned-PDF OCR takes minutes).
-  try { spaxModalTask(true); } catch (_) {}
+  // Hold the app active for the whole parse (scanned-PDF OCR takes minutes)
+  // and register it as a NAMED, cancellable task so the user can see exactly
+  // which file is being read and stop just this import if they want to.
+  let _task = null;
+  try {
+    _task = spaxBeginLocalTask('📄 Import — ' + (files.length === 1 ? files[0].name : files.length + ' files'),
+      'reading ' + files.length + ' file(s)');
+  } catch (_) { try { spaxModalTask(true); } catch (__) {} }
   try {
   const rows = [];
   let possibleMissed = 0;
   const errors = [];
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
+    if (_task && _task.cancelled) {
+      $('pdfProgress').textContent = '';
+      toast('⏹️ Import cancelled — ' + rows.length + ' row(s) read so far were discarded');
+      return;
+    }
     $('pdfProgress').innerHTML = `<span class="spinner"></span> Parsing ${file.name}… <small>File ${i + 1} of ${files.length}</small>`;
+    if (_task) _task.progress('parsing ' + file.name + ' (' + (i + 1) + '/' + files.length + ')');
     try {
       const parsed = await parseAnyFile(file);
       if (parsed && parsed.length) rows.push(...parsed);
@@ -8475,7 +8803,10 @@ async function handleFiles(fileList) {
   rows.possibleMissed = possibleMissed;
   showPreview(rows, files.length === 1 ? files[0].name : `${files.length} selected files`);
   if (errors.length) toast(`⚠️ ${errors.length} file(s) could not be read. The readable files are shown in the preview.`);
-  } finally { try { spaxModalTask(false); } catch (_) {} }
+  } finally {
+    if (_task) _task.end(_task.cancelled ? 'cancelled' : 'done', _task.cancelled ? 'cancelled by you' : 'parsed ' + files.length + ' file(s)');
+    else { try { spaxModalTask(false); } catch (_) {} }
+  }
 }
 
 // Keep this single-file alias for any callers outside the multi-file picker.
@@ -10171,10 +10502,20 @@ async function handleBackfill(input){
   input.value = '';
   if(files.length === 0) return;
   showSyncStatus('📥 Backfilling...');
-  try { spaxModalTask(true); } catch (_) {}
+  let _task = null;
+  try {
+    _task = spaxBeginLocalTask('📥 Backfill — ' + files.length + ' file(s)', 'starting');
+  } catch (_) { try { spaxModalTask(true); } catch (__) {} }
   try{
     let totalImported = 0, totalDupes = 0;
+    let fileNo = 0;
     for(const file of files){
+      fileNo += 1;
+      if (_task && _task.cancelled) {
+        toast('⏹️ Backfill cancelled — ' + totalImported + ' row(s) already added were kept');
+        break;
+      }
+      if (_task) _task.progress('parsing ' + file.name + ' (' + fileNo + '/' + files.length + ')');
       let rows;
       try{
         rows = await parseAnyFile(file);
@@ -10206,7 +10547,8 @@ async function handleBackfill(input){
     toast('❌ Backfill failed: ' + err.message);
     showSyncStatus('❌ Backfill failed');
   }finally{
-    try { spaxModalTask(false); } catch (_) {}
+    if (_task) _task.end(_task.cancelled ? 'cancelled' : 'done', _task.cancelled ? 'cancelled by you' : 'backfill finished');
+    else { try { spaxModalTask(false); } catch (_) {} }
   }
 }
 

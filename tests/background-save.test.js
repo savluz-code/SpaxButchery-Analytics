@@ -195,6 +195,7 @@ test('an interrupted save resumes with one push on the next boot', async () => {
   env.store.spaxPendingSync = '1757460000000'; // left by a killed session
   assert.strictEqual(env.ctx.spaxResumeInterruptedSave(), true);
   assert.ok(env.status.some((m) => /Resuming interrupted save/.test(m)));
+  assert.ok(env.status.some((m) => /Resumed save/.test(m)), 'the resumed save must be named');
   await tick(50);
   assert.ok(env.calls.some((c) => c.action === 'saveAll'), 'resume must push the database');
   assert.equal('spaxPendingSync' in env.store, false, 'the resumed save clears the flag on drain');
@@ -238,11 +239,15 @@ test('the import modal holds the lock while it works', () => {
 
 test('file parsing and backfill hold the lock for their whole run', () => {
   const files = slice('async function handleFiles(fileList) {', '// Keep this single-file alias');
+  // Named, cancellable local task (falls back to the raw wake-lock helper).
+  assert.match(files, /spaxBeginLocalTask\(/);
   assert.match(files, /spaxModalTask\(true\)/);
-  assert.match(files, /finally \{ try \{ spaxModalTask\(false\);/);
+  assert.match(files, /_task\.end\(/);
+  assert.match(files, /_task\.cancelled/);
   const backfill = slice('async function handleBackfill(input){', '/* ══════════ REBUILD — SCOPED');
-  assert.match(backfill, /spaxModalTask\(true\)/);
-  assert.match(backfill, /spaxModalTask\(false\)/);
+  assert.match(backfill, /spaxBeginLocalTask\(/);
+  assert.match(backfill, /_task\.end\(/);
+  assert.match(backfill, /_task\.cancelled/);
 });
 
 test('boot resumes a save a killed session left behind', () => {

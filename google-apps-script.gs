@@ -1,6 +1,17 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.6  (2026-09-14)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.7  (2026-09-15)
  * ─────────────────────────────────────────────────────────────────
+ * v3.7 adds TARGETED CUSTOMER EDITS (action=updateCustomer):
+ *   • Editing one contact in the Contact Resolver used to cost a whole-
+ *     database upload: a rename rewrites the customer's name on every one of
+ *     their transaction rows, which an append can't express, so the client
+ *     flagged a FULL replace ("large upload, sending in parts" for a single
+ *     phone number). updateCustomer rewrites exactly the affected cells in
+ *     place — the one Customers row, and (on a rename) only that customer's
+ *     `name` cells in Transactions — under the script lock, then invalidates
+ *     the key index so the next delta re-derives identities from the sheet.
+ *     Clients probe for it and fall back to the full save on older
+ *     deployments, so the redeploy is never a hard requirement.
  * v3.6 makes saves VERIFIED and commits IDEMPOTENT:
  *   • Every successful save records a RECEIPT (the client's save tag plus
  *     the fingerprints of the data it carried). A client whose upload timed
@@ -159,7 +170,7 @@ var TABLE_HEADERS = {
      • waitLock's answer is honoured: a save that cannot get the script lock is
        refused instead of running alongside the writer that holds it. */
 
-var BACKEND_VERSION = '3.6';
+var BACKEND_VERSION = '3.7';
 
 var STAGE_SUFFIX = '_Staging';
 var SWAP_TMP_SUFFIX = '_SwapTmp';
@@ -262,6 +273,15 @@ function doPost(e) {
     // as "verify unavailable — retry the save as before".
     if (action === 'status') {
       return json_(status_());
+    }
+
+    // Targeted customer edit (v3.7): one Customers row rewritten in place
+    // and, on a rename, only that customer's name cells in Transactions —
+    // instead of the client re-uploading the whole database because a
+    // rename is not append-shaped. Older deployments answer "unknown
+    // action" and the client falls back to a full save.
+    if (action === 'updateCustomer') {
+      return json_(updateCustomer_(body));
     }
 
     if (action === 'kimiVision') {
@@ -482,6 +502,109 @@ function saveDelta_(body) {
       skippedDuplicates: result.skipped,
       transactions: result.total
     };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ── targeted customer edit (v3.7) ── */
+
+// body.edits = [{ oldName, oldContact, newName, newContact, customer }]
+// `customer` is the full client record after the edit (TABLE_HEADERS.customers
+// fields). The live row is located by the same name+contact merge key the
+// client uses (falling back to name-only for records without a contact) and
+// rewritten in place; a record the sheet does not hold yet is appended.
+// A rename also rewrites the `name` cell of every live transaction row that
+// carried the old name — exactly the rows the client rewrote locally.
+function updateCustomer_(body) {
+  var edits = (body && body.edits) || [];
+  if (!edits.length) return { success: true, customersUpdated: 0, customersAdded: 0, transactionsRenamed: 0 };
+  var lock = LockService.getScriptLock();
+  if (!lock.waitLock(30000)) return backendBusy_();
+  try {
+    ensureSheets_();
+    var ss = getSpreadsheet_();
+    var cu = ss.getSheetByName(SHEETS.customers);
+    ensureSheetHeader_(cu, TABLE_HEADERS.customers);
+    var headers = TABLE_HEADERS.customers;
+    var cuLast = cu.getLastRow();
+    var cuValues = cuLast > 1 ? cu.getRange(2, 1, cuLast - 1, headers.length).getValues() : [];
+    var sheetHeaders = cu.getRange(1, 1, 1, Math.max(cu.getLastColumn(), headers.length)).getValues()[0]
+      .map(function (h) { return String(h || '').trim(); });
+    var nameCol = sheetHeaders.indexOf('name');
+    var contactCol = sheetHeaders.indexOf('contact');
+    if (nameCol < 0) nameCol = 0;
+    if (contactCol < 0) contactCol = 1;
+
+    var updated = 0, added = 0, renamed = 0;
+    var renames = [];
+    edits.forEach(function (e) {
+      if (!e || !e.customer || String(e.customer.name || '').trim() === '') return;
+      var oldName = String(e.oldName == null ? e.customer.name : e.oldName);
+      var oldContact = e.oldContact == null ? e.customer.contact : e.oldContact;
+      var wantKey = gasNormName_(oldName) + '|' + gasNormContact_(oldContact);
+      var wantLoose = gasNormName_(oldName) + '|';
+      var rowIdx = -1, looseIdx = -1;
+      for (var i = 0; i < cuValues.length; i++) {
+        var k = gasNormName_(cuValues[i][nameCol]) + '|' + gasNormContact_(cuValues[i][contactCol]);
+        if (k === wantKey) { rowIdx = i; break; }
+        if (looseIdx < 0 && k === wantLoose) looseIdx = i;
+      }
+      if (rowIdx < 0 && gasNormContact_(oldContact) === '') rowIdx = looseIdx;
+      var row = headers.map(function (h) {
+        var v = e.customer[h];
+        if (v === undefined || v === null) return '';
+        if (typeof v === 'boolean') return v ? 'true' : 'false';
+        return v;
+      });
+      if (rowIdx >= 0) {
+        cu.getRange(rowIdx + 2, 1, 1, headers.length).setValues([row]);
+        cuValues[rowIdx] = row.slice();
+        updated++;
+      } else {
+        cu.getRange(cuValues.length + 2, 1, 1, headers.length).setValues([row]);
+        cuValues.push(row.slice());
+        added++;
+      }
+      var newName = String(e.customer.name);
+      if (e.newName != null) newName = String(e.newName);
+      if (newName !== oldName) renames.push({ from: oldName, to: newName });
+    });
+
+    // The Customers basis is what lets a later one-shot save skip re-staging
+    // an unchanged table; it no longer describes the live sheet.
+    try { PropertiesService.getScriptProperties().deleteProperty('spaxBasis_customers'); } catch (err) {}
+
+    if (renames.length) {
+      var tx = ss.getSheetByName(SHEETS.transactions);
+      var txLast = tx ? tx.getLastRow() : 0;
+      if (txLast > 1) {
+        var txHeaders = tx.getRange(1, 1, 1, tx.getLastColumn()).getValues()[0]
+          .map(function (h) { return String(h || '').trim(); });
+        var txNameCol = txHeaders.indexOf('name');
+        if (txNameCol >= 0) {
+          var range = tx.getRange(2, txNameCol + 1, txLast - 1, 1);
+          var names = range.getValues();
+          var map = {};
+          renames.forEach(function (r) { map[r.from] = r.to; });
+          var changed = false;
+          for (var j = 0; j < names.length; j++) {
+            var cur = String(names[j][0] == null ? '' : names[j][0]);
+            if (Object.prototype.hasOwnProperty.call(map, cur)) {
+              names[j][0] = map[cur];
+              renamed++;
+              changed = true;
+            }
+          }
+          if (changed) {
+            range.setValues(names);
+            // Receipt-less rows are keyed by name — the index is stale now.
+            txKeyInvalidate_();
+          }
+        }
+      }
+    }
+    return { success: true, customersUpdated: updated, customersAdded: added, transactionsRenamed: renamed };
   } finally {
     lock.releaseLock();
   }

@@ -318,7 +318,9 @@ test('destructive edits set the full-replace latch before their next save', () =
     ['scoped rebuild wipe', 'function clearHistoryInPeriod(period)'],
     ['duplicate rollback', 'function reconcileImportedRevenue()'],
     ['customer dedupe/merge', 'function dedupeCustomers()'],
-    ['contact rename', 'function saveContactEdit()'],
+    // v3.7: the rename is pushed as a targeted updateCustomer; the latch now
+    // lives in the fallback that runs when the cloud refuses that edit.
+    ['contact rename (fallback)', 'async function spaxSaveContactEditToCloud(edit, renamed)'],
     ['merchant purge', 'function purgeMerchantData(quiet)']
   ];
   sites.forEach(([label, marker]) => {

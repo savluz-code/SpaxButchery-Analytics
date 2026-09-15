@@ -950,7 +950,7 @@ function doPost(e) {
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.5 · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.5 · <span id="buildStamp">build 2026-09-15</span> · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -10438,6 +10438,108 @@ if('serviceWorker' in navigator){
     }
   }).catch(function(e){ console.log('SW reg failed', e); });
 }
+
+/* ══════════ STALE-BUILD GUARD — no silent "old app" on a phone ══════════
+   An already-open tab (or an installed PWA left running) keeps executing the
+   JS it was loaded with, no matter what gets deployed afterwards. That is how
+   an already-fixed bug "comes back" on a device: the page is still running
+   the pre-fix build — e.g. the one where the statement file input was not
+   reset, so attaching one statement after another looked like the app was
+   broken until the user refreshed. Two complementary guards:
+     1. Guarded auto-update: when a freshly deployed service worker takes
+        control of this page, reload — but NEVER while a save or import task
+        is running (an upload in flight would be lost), and at most once per
+        tab session (after the reload the same worker stays in control, so
+        controllerchange cannot loop).
+     2. New-build check: compares this page's SPAX_BUILD_DATE with the one
+        the site is currently serving. If a newer build exists, a banner
+        offers "Update now"; the reload happens on the user's tap only, so
+        it can never interrupt an upload either.
+   The footer stamps the build date this page is running, so anyone can see
+   at a glance which build a phone is on. */
+const SPAX_BUILD_DATE = '2026-09-15'; // ← bump this on every merge
+
+(function spaxSwUpdateGuard(){
+  if (typeof navigator === 'undefined' || !navigator.serviceWorker || !navigator.serviceWorker.addEventListener) return;
+  const RELOAD_KEY = 'spaxSwReloaded_v1';
+  const PENDING_KEY = 'spaxSwReloadPending_v1';
+  const initialController = navigator.serviceWorker.controller;
+  // The upload/import flows must never be reloaded out from under them:
+  // anything the live task registry or the save queue still carries.
+  function busy() {
+    try { if (typeof spaxActiveTasks === 'function' && spaxActiveTasks().length) return true; } catch (_) {}
+    try { if (typeof spaxLocalTaskCount !== 'undefined' && spaxLocalTaskCount > 0) return true; } catch (_) {}
+    try { if (typeof cloudSaveRunning !== 'undefined' && cloudSaveRunning) return true; } catch (_) {}
+    try { if (typeof cloudSaveQueue !== 'undefined' && cloudSaveQueue.length) return true; } catch (_) {}
+    return false;
+  }
+  function doReload() {
+    try { sessionStorage.setItem(RELOAD_KEY, String(Date.now())); } catch (_) {}
+    try { sessionStorage.removeItem(PENDING_KEY); } catch (_) {}
+    console.log('New app version is active — reloading to run it');
+    location.reload();
+  }
+  function maybeReload() {
+    try {
+      if (sessionStorage.getItem(RELOAD_KEY)) return;   // at most one auto-reload per tab session
+      if (busy()) { try { sessionStorage.setItem(PENDING_KEY, '1'); } catch (_) {} return; }
+      doReload();
+    } catch (_) {}
+  }
+  // Reload only when a DIFFERENT worker takes control (a real deploy update),
+  // not when the very first worker claims the page on first install.
+  try {
+    navigator.serviceWorker.addEventListener('controllerchange', (e) => {
+      try {
+        const nw = e && e.newWorker;
+        if (!nw || nw === initialController) return;
+        maybeReload();
+      } catch (_) {}
+    });
+  } catch (_) {}
+  // A reload deferred because an upload/import was in flight: retry when the
+  // task list drains (polled) and when the page comes back to the foreground.
+  try {
+    setInterval(() => {
+      try { if (sessionStorage.getItem(PENDING_KEY) && !busy()) maybeReload(); } catch (_) {}
+    }, 5000);
+  } catch (_) {}
+  try {
+    document.addEventListener('visibilitychange', () => {
+      try { if (!document.hidden && sessionStorage.getItem(PENDING_KEY)) maybeReload(); } catch (_) {}
+    });
+  } catch (_) {}
+})();
+
+// Compare this page's build date with the one currently served by the site
+// (cache-busted so a stale HTTP cache cannot hide a fresh deploy). When a
+// newer build exists, offer the update — never force it.
+async function spaxCheckForNewBuild(){
+  try {
+    if (typeof fetch === 'undefined' || typeof document === 'undefined') return;
+    const res = await fetch('index.html?buildcheck=' + Date.now(), { cache: 'no-store' });
+    if (!res || !res.ok) return;
+    const text = await res.text();
+    const m = text.match(/const SPAX_BUILD_DATE = '(\d{4}-\d{2}-\d{2})'/);
+    if (!m || m[1] === SPAX_BUILD_DATE) return;
+    let bar = document.getElementById('newBuildBar');
+    if (bar) return;
+    bar = document.createElement('div');
+    bar.id = 'newBuildBar';
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:500;background:var(--blue);color:#04202a;padding:10px 16px;font-size:.85rem;font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:12px;box-shadow:0 4px 16px rgba(0,0,0,.4)';
+    const note = document.createElement('span');
+    note.innerHTML = '🆕 A new version is available (this page runs build ' + SPAX_BUILD_DATE + ') — your data is saved; updating just reloads the app.';
+    const btn = document.createElement('button');
+    btn.className = 'btn';
+    btn.style.cssText = 'padding:6px 14px;background:#04202a;color:#fff;flex:none';
+    btn.textContent = 'Update now';
+    btn.onclick = () => { location.reload(); };
+    bar.appendChild(note);
+    bar.appendChild(btn);
+    document.body.appendChild(bar);
+  } catch (_) { /* offline or fetch blocked — stay quiet */ }
+}
+setTimeout(spaxCheckForNewBuild, 8000);
 
 function urlBase64ToUint8Array(base64String){
   const padding = '='.repeat((4 - base64String.length % 4) % 4);

@@ -1,4 +1,7 @@
-const CACHE_NAME = 'spax-v24';
+// Bumped to spax-v25 (2026-09-15): installed apps / long-open tabs drop the
+// stale shell the same way every earlier bump did, so the no-refresh
+// multi-statement flow and the stale-build guard reach every device.
+const CACHE_NAME = 'spax-v25';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

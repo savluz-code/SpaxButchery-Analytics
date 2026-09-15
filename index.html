@@ -985,8 +985,10 @@ function spaxSetCloudUrl(url) {
   } catch (_) {}
   cloudChunks = false; cloudChunkProbed = false;
   cloudDelta = false; cloudDeltaProbed = false;
+  cloudCustomerEdit = true;
   try { localStorage.removeItem('spaxCloudChunked'); } catch (_) {}
   try { localStorage.removeItem('spaxCloudDelta'); } catch (_) {}
+  try { localStorage.removeItem('spaxCloudCustomerEdit'); } catch (_) {}
   try { spaxClearUploadSession(); } catch (_) {}
   try { spaxMarkTxFullReplace(); } catch (_) {}
   try { spaxSavePushedTx([]); } catch (_) {}
@@ -1051,6 +1053,11 @@ try { cloudChunks = localStorage.getItem('spaxCloudChunked') === '1'; } catch (_
 let cloudDelta = false;       // true once the backend proves it speaks saveDelta / mode:"delta"
 let cloudDeltaProbed = false;
 try { cloudDelta = localStorage.getItem('spaxCloudDelta') === '1'; } catch (_) {}
+// Backend v3.7 targeted customer edits (action=updateCustomer). '0' is cached
+// once a deployment answers "unknown action", so a contact edit on an old
+// backend goes straight to the full save instead of probing every time.
+let cloudCustomerEdit = true;
+try { cloudCustomerEdit = localStorage.getItem('spaxCloudCustomerEdit') !== '0'; } catch (_) {}
 
 // Per-request timeouts. 30s is plenty for a probe, but a one-shot saveAll of
 // the whole database (weak signal + Apps Script rewriting six sheets)
@@ -2241,6 +2248,64 @@ function spaxBuildSavePayload() {
     // reset, so no Code.gs redeploy is required to drop the tables.
     transactions: (DB.transactions || []).filter(t => !isMerchant(t.name) && !isMerchant(t.details))
   };
+}
+
+// ── TARGETED CUSTOMER EDIT (backend v3.7) ──
+// Editing one contact used to cost a whole-database upload: a rename rewrites
+// the customer's name on every one of their transaction rows, which an append
+// cannot express, so saveContactEdit flagged a FULL replace — and the user
+// saw "large upload, sending in parts" for a single phone number. This sends
+// exactly the edit instead: the backend rewrites that one Customers row in
+// place and, on a rename, only that customer's name cells in Transactions.
+//
+// Returns true when the cloud applied it. Any failure returns false and the
+// caller falls back to the old path (mark a full replace on a rename, queue a
+// normal save), so an old deployment, a busy lock or a dead connection can
+// never lose the edit — it just costs the big upload it always did.
+async function spaxPushCustomerEdit(edit) {
+  if (SYNC_MODE === 'local') return false;
+  if (!cloudCustomerEdit) return false;
+  const url = spaxCloudUrl();
+  if (!url || url.includes('YOUR_SCRIPT')) return false;
+  const task = spaxRegisterTask({ kind: 'save', name: '✏️ Contact edit', state: 'running', detail: 'updating one customer in the cloud' });
+  try {
+    showSyncStatus('⏳ Updating ' + (edit.customer && edit.customer.name ? edit.customer.name : 'contact') + ' in the cloud…');
+    const res = await cloudRequest(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action: 'updateCustomer', edits: [edit] })
+    }, CLOUD_TIMEOUT_SMALL, 0);
+    if (!res || res.success !== true) throw new Error((res && res.error) || 'Cloud rejected the contact edit');
+    // The cloud's Transactions sheet now carries the new name on exactly the
+    // rows this device rewrote, and the pushed set is keyed by name for
+    // receipt-less rows — re-derive it from the local rows so the next delta
+    // does not re-send them as "new".
+    if (edit.newName !== edit.oldName && !spaxTxFullReplaceRequired()) {
+      try {
+        const pushed = spaxPushedSet();
+        if (pushed) {
+          const keep = (DB.transactions || []).filter(t => spaxTxAlreadyPushed(pushed, t) ||
+            (t.name === edit.newName && spaxTxAlreadyPushed(pushed, Object.assign({}, t, { name: edit.oldName }))));
+          spaxNoteCloudTransactions(keep);
+        }
+      } catch (_) {}
+    }
+    lastSyncTime = new Date();
+    showSyncStatus('✅ Contact updated in the cloud · ' + lastSyncTime.toLocaleTimeString());
+    lastCloudError = '';
+    spaxFinishTask(task, 'done', 'one customer row updated' + (res.transactionsRenamed ? ', ' + res.transactionsRenamed + ' transaction rows renamed' : ''));
+    return true;
+  } catch (err) {
+    if (isUnknownActionError(err)) {
+      cloudCustomerEdit = false;
+      try { localStorage.setItem('spaxCloudCustomerEdit', '0'); } catch (_) {}
+      console.warn('Cloud backend has no updateCustomer — redeploy Code.gs (v3.7) to make contact edits cheap. Falling back to a full save.');
+    } else {
+      console.warn('Targeted contact edit failed (' + ((err && err.message) || err) + ') — falling back to a full save.');
+    }
+    spaxFinishTask(task, 'failed', 'falling back to a full save');
+    return false;
+  }
 }
 
 // ── INCREMENTAL SAVE (backend v3.4) ──
@@ -9892,6 +9957,7 @@ function saveContactEdit(){
   }
 
   const oldName = c.name;
+  const oldContact = c.contact;
   let changes = [];
 
   // Update name (transaction references move with it; the derived history is
@@ -9927,17 +9993,42 @@ function saveContactEdit(){
     return;
   }
 
-  // A rename rewrites existing cloud rows (and the composite identity of
-  // receipt-less rows) — the next save must fully replace Transactions.
-  if(changes.some(x => x.indexOf('name → ') === 0)) spaxMarkTxFullReplace();
   rebuildCustomerHistory();
   repairDates();
-  save();
+  const renamed = changes.some(x => x.indexOf('name → ') === 0);
+  // Push exactly this edit (backend v3.7): one Customers row rewritten in
+  // place and, on a rename, only that customer's transaction names. The
+  // whole-database upload is now the FALLBACK, not the routine: a rename
+  // rewrites existing cloud rows (and the composite identity of receipt-less
+  // rows), which an append cannot express, so if the targeted push is not
+  // available the next save must fully replace Transactions — as before.
+  spaxSaveContactEditToCloud({
+    oldName, oldContact, newName: c.name, newContact: c.contact,
+    customer: Object.assign({}, c)
+  }, renamed);
   refreshAll();
   closeContactEdit();
   toast('✅ Updated: ' + changes.join(', '));
 }
 window.saveContactEdit = saveContactEdit;
+
+// Local persistence happens at once; the cloud gets the targeted edit, and
+// only a refused/failed edit takes the old full-save route (which also calls
+// spaxMarkTxFullReplace() for renames).
+async function spaxSaveContactEditToCloud(edit, renamed){
+  persistDB().catch(() => false);
+  let pushed = false;
+  try { pushed = await spaxPushCustomerEdit(edit); } catch (_) { pushed = false; }
+  if (pushed) {
+    // Keep the local "small tables already in the cloud" fingerprint honest:
+    // the customers table changed, and this push carried it.
+    try { spaxNoteSavedBasis(spaxBuildSavePayload()); } catch (_) {}
+    return true;
+  }
+  if (renamed) spaxMarkTxFullReplace();
+  save();
+  return false;
+}
 
 // Close contact edit modal on backdrop click
 if($('contactEditModal')){
@@ -10774,8 +10865,11 @@ function spaxBackendDiagHtml() {
     : (typeof cloudChunks !== 'undefined' && cloudChunks) ? 'chunked uploads' : 'one-shot saves only';
   let html = 'v' + escHtml(v) + ' · ' + escHtml(caps);
   try {
+    if (typeof cloudCustomerEdit !== 'undefined' && !cloudCustomerEdit) {
+      html += ' — <span style="color:var(--amber)">contact edits need a full upload on this backend; redeploy Code.gs (v3.7)</span>';
+    }
     if (!cloudDelta && !cloudChunks && cloudChunkProbed && (DB.transactions || []).length > CHUNK_ROWS) {
-      html += ' — <span style="color:var(--amber)">big saves cannot resume on this backend; redeploy Code.gs (v3.6)</span>';
+      html += ' — <span style="color:var(--amber)">big saves cannot resume on this backend; redeploy Code.gs (v3.7)</span>';
     }
   } catch (_) {}
   return html;

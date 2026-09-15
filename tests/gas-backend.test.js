@@ -59,6 +59,11 @@ function makeSheet(name, sheets) {
       }
       return 0;
     },
+    getLastColumn() {
+      let n = 0;
+      sheet.rows.forEach((r) => { if (r) n = Math.max(n, r.length); });
+      return n;
+    },
     getRange(row, col, numRows, numCols) {
       return {
         setValues(data) {
@@ -628,8 +633,8 @@ test('code.html reads the backend version from the file, not from hard-coded mar
   // …and the version it reports is the backend this repo ships. Bump this pin
   // with the header above: a version nobody updated the pin for is exactly the
   // drift this test exists to catch.
-  // (v3.6 supersedes the v3.5 fast-save release: verified saves + idempotent commits.)
-  assert.strictEqual(current.ver, 'v3.6', 'code.html must be offering the fixed backend');
+  // (v3.7 adds targeted customer edits — updateCustomer.)
+  assert.strictEqual(current.ver, 'v3.7', 'code.html must be offering the fixed backend');
 });
 
 /* ── incremental saves (backend v3.4) ───────────────────────────────────────
@@ -1105,4 +1110,94 @@ test('a swap leaves the displaced sheet intact and a later upload cannot inherit
   const loaded = await env.load();
   assert.strictEqual(loaded.transactions.length, 7);
   assert.deepStrictEqual(loaded.transactions.map((t) => t.receipt).slice(5), ['LEAK1', 'LEAK2']);
+});
+
+/* ── targeted customer edits (backend v3.7) ─────────────────────────────────
+ * One contact edit must not cost a whole-database upload. updateCustomer
+ * rewrites exactly one Customers row in place and, on a rename, only that
+ * customer's name cells in Transactions — everything else is untouched. */
+
+// Several customers, including two who share a NAME but differ by contact —
+// the exact case a name-only lookup would corrupt.
+function editFixture() {
+  const db = dbFixture();
+  const base = db.customers[0];
+  db.customers = ['C0', 'C1', 'C2', 'C3'].map((n, i) => ({ ...base, name: n, contact: '25470' + i, spent: 100 + i }));
+  db.customers.push({ ...base, name: 'C2', contact: '0799000000', spent: 999 });
+  return db;
+}
+
+test('updateCustomer rewrites one Customers row in place (phone edit) and leaves transactions alone', async () => {
+  const env = makeEnv();
+  const db = editFixture();
+  assert.deepStrictEqual(await env.post({ action: 'saveAll', ...db }), { success: true });
+  const before = await env.load();
+  const target = before.customers.find((c) => c.name === 'C2' && c.contact === '254702');
+  assert.ok(target);
+
+  const res = await env.post({
+    action: 'updateCustomer',
+    edits: [{ oldName: 'C2', oldContact: target.contact, newName: 'C2', newContact: '0711222333',
+      customer: { ...target, contact: '0711222333', masked: false } }]
+  });
+  assert.deepStrictEqual(res, { success: true, customersUpdated: 1, customersAdded: 0, transactionsRenamed: 0 });
+
+  const after = await env.load();
+  assert.strictEqual(after.customers.length, before.customers.length, 'no row added or lost');
+  const edited = after.customers.find((c) => c.name === 'C2' && c.spent === 102);
+  assert.strictEqual(edited.contact, '0711222333');
+  assert.strictEqual(edited.masked, false);
+  // The same-name twin (different contact) is untouched.
+  assert.strictEqual(after.customers.find((c) => c.name === 'C2' && c.spent === 999).contact, '0799000000');
+  assert.strictEqual(after.customers.filter((c) => c.name === 'C2').length, 2);
+  assert.deepStrictEqual(after.transactions, before.transactions, 'transactions untouched by a phone edit');
+});
+
+test('updateCustomer rename rewrites only that customer\'s transaction names and stays delta-safe afterwards', async () => {
+  const env = makeEnv();
+  const db = editFixture();
+  assert.deepStrictEqual(await env.post({ action: 'saveAll', ...db }), { success: true });
+  const before = await env.load();
+  const target = before.customers.find((c) => c.name === 'C1');
+
+  const res = await env.post({
+    action: 'updateCustomer',
+    edits: [{ oldName: 'C1', oldContact: target.contact, newName: 'Jane Wanjiru', newContact: target.contact,
+      customer: { ...target, name: 'Jane Wanjiru' } }]
+  });
+  assert.deepStrictEqual(res, { success: true, customersUpdated: 1, customersAdded: 0, transactionsRenamed: 1 });
+
+  const after = await env.load();
+  assert.ok(!after.customers.some((c) => c.name === 'C1'));
+  assert.ok(after.customers.some((c) => c.name === 'Jane Wanjiru'));
+  const renamed = after.transactions.filter((t) => t.name === 'Jane Wanjiru');
+  assert.strictEqual(renamed.length, 1);
+  assert.strictEqual(renamed[0].receipt, 'RCPT1');
+  assert.strictEqual(after.transactions.filter((t) => t.name === 'C1').length, 0);
+  assert.strictEqual(after.transactions.length, before.transactions.length);
+
+  // A following delta append must still de-duplicate against the live sheet.
+  const again = await env.post({ action: 'saveDelta', customers: after.customers, monthly: db.monthly,
+    settings: db.settings, txAdd: [after.transactions[1], deltaRow('NEWX1')] });
+  assert.strictEqual(again.success, true);
+  assert.strictEqual(again.added, 1);
+  assert.strictEqual(again.skippedDuplicates, 1);
+});
+
+test('updateCustomer appends a record the sheet does not hold yet, and refuses under a busy lock', async () => {
+  const env = makeEnv();
+  const db = editFixture();
+  assert.deepStrictEqual(await env.post({ action: 'saveAll', ...db }), { success: true });
+  const res = await env.post({
+    action: 'updateCustomer',
+    edits: [{ oldName: 'Nobody', oldContact: '0700000000', newName: 'Nobody', newContact: '0700000000',
+      customer: { name: 'Nobody', contact: '0700000000', spent: 0, visits: 0, days: 0 } }]
+  });
+  assert.deepStrictEqual(res, { success: true, customersUpdated: 0, customersAdded: 1, transactionsRenamed: 0 });
+  assert.strictEqual((await env.load()).customers.length, db.customers.length + 1);
+
+  const busy = makeEnv({ lockBusy: true });
+  const refused = await busy.post({ action: 'updateCustomer', edits: [{ customer: { name: 'X', contact: '' } }] });
+  assert.strictEqual(refused.success, false);
+  assert.match(refused.error, /backend busy/);
 });

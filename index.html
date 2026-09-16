@@ -1393,6 +1393,79 @@ function validCloudCustomers(customers) {
   );
 }
 
+/* ══════════ MERGE TOMBSTONES — dedupe deletions must stick ══════════
+   Deduplicate Customers MERGES records away — but the sync model has no
+   delete primitive: every save pushes the full customer list and every
+   load/merge re-adds any record the other side still has ("never lose
+   imported customers"). Left to that union alone, every merged-away
+   duplicate came straight back from whichever copy still held it — most
+   often the cloud sheet itself, because the dedupe's save is a FULL
+   replace (it re-uploads the whole database) and a phone that kills the
+   tab mid-upload, or any failure before the commit, leaves the sheet in
+   its pre-dedupe state. The next boot then union-merged the stale sheet
+   back over the clean local list — resurrecting the duplicates — and the
+   resumed "interrupted save" pushed the resurrected copies back up, so
+   the dedupe visibly "did not stick" even though a cloud save ran.
+
+   A tombstone is the merge key (customerMergeKey: name|normalised
+   contact) of a record a dedupe removed, with the moment it was removed.
+   Every merge path drops tombstoned records — from the incoming cloud
+   copy AND from local records an older sync already resurrected — and the
+   tombstone set itself rides the settings sheet (union-merged like the
+   rest), so every device converges on the same deletion. Tombstones
+   expire after SPAX_TOMB_MAX_AGE_MS: if a masked statement identity
+   genuinely re-appears months later it is allowed to live again. The set
+   is capped so decades of merges cannot grow the settings row without
+   bound. */
+const SPAX_TOMB_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+// The whole set rides ONE Settings-sheet cell as JSON, so the cap is bounded
+// by Sheets' 50,000-char cell limit (400 keys ≈ 30 KB) as well as by need —
+// a dedupe merges tens of records, and the set only has to outlive the time
+// it takes every device to sync once.
+const SPAX_TOMB_MAX = 400;
+
+function spaxPruneTombstones(tombs) {
+  const now = Date.now();
+  const out = {};
+  Object.keys(tombs || {}).forEach(k => {
+    const ts = Number(tombs[k]) || 0;
+    if (ts && (now - ts) < SPAX_TOMB_MAX_AGE_MS) out[k] = ts;
+  });
+  const keys = Object.keys(out);
+  if (keys.length > SPAX_TOMB_MAX) {
+    keys.sort((a, b) => out[a] - out[b]); // oldest first
+    keys.slice(0, keys.length - SPAX_TOMB_MAX).forEach(k => { delete out[k]; });
+  }
+  return out;
+}
+
+// Union ours with the cloud's set. `cloudValue` arrives as the JSON string
+// the settings sheet stores (an object is tolerated too).
+function spaxMergeTombstoneSets(localTombs, cloudValue) {
+  let cloudTombs = null;
+  if (cloudValue && typeof cloudValue === 'object') cloudTombs = cloudValue;
+  else if (typeof cloudValue === 'string' && cloudValue) {
+    try { cloudTombs = JSON.parse(cloudValue); } catch (_) { cloudTombs = null; }
+  }
+  const merged = Object.assign({}, localTombs || {});
+  if (cloudTombs && typeof cloudTombs === 'object') {
+    Object.keys(cloudTombs).forEach(k => {
+      const ts = Number(cloudTombs[k]) || 0;
+      if (ts) merged[k] = Math.max(Number(merged[k]) || 0, ts);
+    });
+  }
+  return spaxPruneTombstones(merged);
+}
+
+// Drop every record whose merge key a dedupe has tombstoned. Applied to the
+// incoming cloud copy AND to the local list (which an older sync may already
+// have re-polluted) on every merge path.
+function spaxDropTombstonedCustomers(customers) {
+  const tombs = (typeof DB !== 'undefined' && DB && DB.tombstones) || {};
+  if (!Object.keys(tombs).length) return customers || [];
+  return (customers || []).filter(c => !tombs[customerMergeKey(c)]);
+}
+
 async function loadFromCloud() {
   if (GAS_URL.includes('YOUR_SCRIPT')) {
     console.warn('GAS_URL not configured');
@@ -1405,8 +1478,36 @@ async function loadFromCloud() {
     // old-backend hint on failed big saves). Pre-v3.6 backends send none.
     try { spaxNoteBackendVersion(data); } catch (_) {}
 
+    // ── LOCAL-AUTHORITATIVE GUARD ──
+    // The full-replace latch (spaxTxFullReplaceRequired) is set by exactly the
+    // destructive changes an append cannot express — a dedupe, a duplicate
+    // rollback, Delete All, a rename — and cleared only when a save has
+    // actually replaced the cloud sheets. While it is set, the cloud copy is
+    // STALE relative to this device, and union-merging it back is precisely
+    // how merged-away duplicates resurrected: the boot merged the pre-dedupe
+    // sheet over the clean local list, then the resumed push uploaded the
+    // resurrected copies — so the dedupe "never stuck". The pending push is
+    // this device's truth; keep the local list untouched until it lands.
+    if (spaxTxFullReplaceRequired()) {
+      showSyncStatus('⏳ Cloud merge skipped — your cleanup (dedupe/delete) is still syncing up');
+      return true;
+    }
+
+    // Tombstones of dedupe-deleted records are viral like baselineCleared:
+    // union ours with the cloud's set BEFORE any customer row is merged, so
+    // neither side can resurrect a record the other side already merged away.
+    DB.tombstones = spaxMergeTombstoneSets(DB.tombstones, data.settings && data.settings.tombstones);
+
     // Ignore formatting/blank rows returned by a Sheet. They are not cloud data.
-    const cloudCustomers = validCloudCustomers(data.customers);
+    let cloudCustomers = validCloudCustomers(data.customers);
+    if (Object.keys(DB.tombstones).length) {
+      cloudCustomers = spaxDropTombstonedCustomers(cloudCustomers);
+      // Scrub anything an older sync already resurrected locally — this is
+      // what finally deletes duplicates that came back before the fix.
+      const beforeTombs = DB.customers.length;
+      DB.customers = spaxDropTombstonedCustomers(DB.customers);
+      if (DB.customers.length < beforeTombs) persistDB();
+    }
     const hasCloudData = cloudCustomers.length > 0;
 
     if (hasCloudData) {
@@ -2232,7 +2333,12 @@ function spaxBuildSavePayload() {
       importBatch: Number(DB.importBatch) || 0,
       // Delete-All state rides the generic key/value settings sheet, so a
       // wiped-then-pushed database stays wiped on every device that pulls.
-      baselineCleared: DB.baselineCleared ? 1 : 0
+      baselineCleared: DB.baselineCleared ? 1 : 0,
+      // Dedupe tombstones ride the same sheet (MERGE TOMBSTONES): a merge
+      // deletes records a save can only REPLACE, so the deletion itself must
+      // sync — otherwise every other device (and any stale pull) resurrects
+      // the merged-away duplicates on its next merge.
+      tombstones: JSON.stringify(spaxPruneTombstones(DB.tombstones || {}))
     },
     // The `customerTx` history table and the `seen` dedup map are NOT
     // uploaded. Both are fully derivable from the transactions table
@@ -4980,6 +5086,8 @@ async function seedDB(){
     importedRev:0,importedTx:0,resolved:0,seen:{},
     // Import batch counter — isNew is derived from it (see reconcileNewFlags)
     importBatch:0,
+    // Dedupe tombstones (MERGE TOMBSTONES) — a seeded database starts clean.
+    tombstones:{},
     transactions:[],
     customerTx:{},
     dailyLedgers:[],
@@ -5001,6 +5109,7 @@ async function load(){
       if(!DB.seen)DB.seen={};
     if(!DB.transactions)DB.transactions=[];
     if(!DB.customerTx)DB.customerTx={};
+    if(!DB.tombstones)DB.tombstones={}; // dedupe tombstones (MERGE TOMBSTONES)
     if(DB.cogs)delete DB.cogs; // COGS & net margin model removed
     if(!DB.dailyLedgers)DB.dailyLedgers=[];
     if(!DB.dailyExpenses)DB.dailyExpenses=[];
@@ -8849,6 +8958,12 @@ function dedupeCustomers(){
   });
   let merged = 0;
   const survivorIdx = new Set();
+  // Tombstones for every record this dedupe merges away (MERGE TOMBSTONES):
+  // sync has no delete primitive — every load/merge re-adds cloud-only
+  // records — so without them the merged-away duplicates came straight back
+  // from the cloud sheet (or any other stale copy) on the next sync.
+  const tombNow = Date.now();
+  if (!DB.tombstones) DB.tombstones = {};
   groups.forEach(grp => {
     // Choose the primary INDEX: prefer a customer with a real (unmasked)
     // number, then highest lifetime spend.
@@ -8864,6 +8979,9 @@ function dedupeCustomers(){
     grp.forEach(idx => {
       if (idx === primaryIdx) return;
       const o = DB.customers[idx];
+      // Tombstone the removed record's identity so no sync can resurrect it.
+      const tk = customerMergeKey(o);
+      if (tk && tk !== '|') DB.tombstones[tk] = tombNow;
       if (!primary.name && o.name) primary.name = o.name;
       if (isValidKenyanContact(o.contact) && !isValidKenyanContact(primary.contact)){
         primary.contact = normalizeContact(o.contact);
@@ -8895,7 +9013,13 @@ function dedupeCustomers(){
         }
       });
     });
+    // Protect the SURVIVOR: consolidation may have changed the primary's
+    // name/contact, and a removed twin can share its key outright (exact
+    // double rows) — the survivor's final identity must never be tombstoned.
+    const sk = customerMergeKey(primary);
+    if (sk && DB.tombstones[sk] !== undefined) delete DB.tombstones[sk];
   });
+  DB.tombstones = spaxPruneTombstones(DB.tombstones);
   // Rebuild the customer list keeping only the survivor of each group
   const next = [];
   DB.customers.forEach((c, i) => {
@@ -10669,17 +10793,23 @@ async function forcePullFromCloud(){
   try{
     const data = await cloudLoad();
 
+    // Adopt the cloud's dedupe tombstones as a UNION with ours BEFORE the
+    // pulled rows are adopted (MERGE TOMBSTONES): the pull must not bring
+    // back records either side already merged away, and any local tombstone
+    // not yet pushed keeps suppressing stale rows until the next save lands.
+    DB.tombstones = spaxMergeTombstoneSets(DB.tombstones, data.settings && data.settings.tombstones);
+
     const cloudCustomers = validCloudCustomers(data.customers);
     if(cloudCustomers.length === 0){
       $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud is empty. Nothing to pull.</span>';
       return;
     }
 
-    DB.customers = cloudCustomers.map(c => ({
+    DB.customers = spaxDropTombstonedCustomers(cloudCustomers.map(c => ({
       ...c,
       firstVisit: stripTime(c.firstVisit),
       lastVisit: stripTime(c.lastVisit)
-    }));
+    })));
     if(data.monthly) DB.monthly = data.monthly;
     if(data.settings){
       DB.importedRev = Number(data.settings.importedRev) || 0;
@@ -10724,10 +10854,27 @@ async function forcePullFromCloud(){
 
 async function smartMergeCloud(){
   showSyncStatus('🔀 Merging local + cloud...');
+  // A pending full replace means a destructive local change (dedupe, delete,
+  // rollback, rename) has not yet replaced the cloud sheets — the copy this
+  // merge would pull is exactly the stale state that save must overwrite, and
+  // merging then pushing would re-bake it. Land the pending save first.
+  if (spaxTxFullReplaceRequired()) {
+    $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Merge blocked — a cleanup (dedupe/delete) is still syncing. Wait for that save to land (Force Push if it failed), then merge.</span>';
+    showSyncStatus('⚠️ Merge blocked — a cleanup save is still pending');
+    return;
+  }
   try{
     const data = await cloudLoad();
 
-    const cloudCustomers = validCloudCustomers(data.customers);
+    // Union the dedupe tombstones first (MERGE TOMBSTONES): a merge must
+    // never resurrect a record either side has already merged away.
+    DB.tombstones = spaxMergeTombstoneSets(DB.tombstones, data.settings && data.settings.tombstones);
+
+    let cloudCustomers = validCloudCustomers(data.customers);
+    if (Object.keys(DB.tombstones).length) {
+      cloudCustomers = spaxDropTombstonedCustomers(cloudCustomers);
+      DB.customers = spaxDropTombstonedCustomers(DB.customers);
+    }
     if(cloudCustomers.length === 0){
       $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud has no valid customers. No data was changed — recover a known-good cloud copy before pushing.</span>';
       return;
@@ -11389,6 +11536,10 @@ function deleteAllKeepResolved(){
   DB.importBatch = 0;
   DB.resolved = plan.savedCount;
   DB.baselineCleared = true;
+  // A wipe starts a clean history: old dedupe tombstones are dropped, or they
+  // would suppress the reachable-contact records the wipe deliberately KEEPS
+  // (and any identity the statements genuinely re-create from here on).
+  DB.tombstones = {};
   // Every cloud row is about to be deleted — an append-only delta cannot do
   // that. The wipe's save must fully replace the Transactions sheet.
   spaxMarkTxFullReplace();

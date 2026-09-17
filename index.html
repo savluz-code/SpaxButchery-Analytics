@@ -1083,10 +1083,14 @@ const CLOUD_TIMEOUT_BIG_SAVE = 180000; // one-shot saveAll fallback (whole DB up
 // Script's lock for minutes (the client may have already timed out while the
 // server is still writing). Short 2s/5s retries made "backend busy" look
 // permanent — nothing unknown was saving; it was OUR previous attempt, or
-// another tab, still finishing. Six tries spanning ~2.5 min outlast a typical
-// write without hammering the lock.
-const CLOUD_BUSY_RETRIES = 6;
-const CLOUD_BUSY_RETRY_DELAYS = [3000, 8000, 15000, 30000, 45000, 60000];
+// another tab, still finishing. The budget must OUTLAST the longest possible
+// lock holder: an Apps Script execution runs up to its ~6-minute quota, so
+// eight tries spanning ~6 min of backoff (plus each refusal's own 30s
+// server-side waitLock) cover a zombie from just after it started — the
+// reported "Resumed save … backend busy … 4m 33s" died a ~90s-short of a
+// writer that needed the full quota.
+const CLOUD_BUSY_RETRIES = 8;
+const CLOUD_BUSY_RETRY_DELAYS = [3000, 8000, 15000, 30000, 45000, 60000, 90000, 120000];
 
 // Google's /exec edge occasionally answers a LIVE deployment with transient
 // HTTP errors (404/429/5xx) — the "Save failed — Cloud returned HTTP 404"
@@ -1717,6 +1721,11 @@ let cloudStoppedUpload = null;
 //   4. Progress mirrored into document.title (visible in the task switcher)
 //      and a completion notification if the save finished while hidden.
 const SPAX_PENDING_KEY = 'spaxPendingSync';
+// An Apps Script execution a client timed out on keeps writing — and holding
+// the cloud lock — for up to its ~6-minute quota. The boot resume waits out
+// the remainder of this window instead of fighting the zombie for the lock
+// (see spaxResumeInterruptedSave).
+const SPAX_SERVER_EXEC_WINDOW_MS = 6.5 * 60 * 1000;
 let spaxWakeLock = null;
 let spaxSaveWanted = false;   // a cloud save is queued or running
 let spaxModalWanted = false;  // an import/parse task (modal or file handler) is running
@@ -1942,31 +1951,82 @@ function spaxResumeInterruptedSave() {
   let pending = null;
   try { pending = localStorage.getItem(SPAX_PENDING_KEY); } catch (_) { pending = null; }
   if (!pending) return false;
-  try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
-  if (typeof SYNC_MODE !== 'undefined' && SYNC_MODE === 'local') return false;
-  if (cloudSaveRunning || cloudSaveQueue.length) return false;
+  if (typeof SYNC_MODE !== 'undefined' && SYNC_MODE === 'local') {
+    try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
+    return false;
+  }
+  if (cloudSaveRunning || cloudSaveQueue.length) {
+    // The live job snapshots the live DB when it runs, so it carries whatever
+    // the interrupted save was pushing — consume the flag; the drain re-plants
+    // it if that save fails.
+    try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
+    return false;
+  }
+  // ── WAIT OUT THE INTERRUPTED UPLOAD'S SERVER-SIDE WRITER ──
+  // The pending stamp is the interrupted save's start time, and an Apps
+  // Script execution that the client gave up on keeps WRITING (and holding
+  // the cloud lock) for up to its ~6-minute quota. Resuming immediately
+  // after a kill-and-reopen spent the whole busy-retry budget fighting
+  // that zombie — the reported "Resumed save … backend busy … 4m 33s" —
+  // and then failed. Sitting out the remainder of the window locally costs
+  // nothing (the data is safe here) and finds the lock free. The flag stays
+  // planted until the resume actually runs or stands down, so a tab killed
+  // inside the wait simply defers again — or pushes — on the next boot.
+  const startedAt = Number(pending) || 0;
+  const remainMs = SPAX_SERVER_EXEC_WINDOW_MS - (Date.now() - startedAt);
+  if (startedAt && remainMs > 0) {
+    if (!spaxResumeDeferred) {
+      spaxResumeDeferred = true;
+      try {
+        showSyncStatus('⏳ Resumed save waiting — the interrupted upload is still being written on the server (lock frees in ~' + Math.max(1, Math.ceil(remainMs / 60000)) + ' min)');
+      } catch (_) {}
+      setTimeout(() => { spaxResumeDeferred = false; spaxResumeNow(startedAt); }, remainMs);
+    }
+    return true;
+  }
+  return spaxResumeNow(startedAt);
+}
+let spaxResumeDeferred = false;
+function spaxResumeNow(startedAt) {
+  if (cloudSaveRunning || cloudSaveQueue.length) {
+    try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
+    return false;
+  }
   try {
     if (typeof DB !== 'undefined' && DB && typeof spaxComputeDeltaRows === 'function' &&
         typeof spaxCloudAlreadyCurrent === 'function' && typeof spaxBuildSavePayload === 'function') {
       const allTx = DB.transactions || [];
       if (spaxCloudAlreadyCurrent(spaxBuildSavePayload(), spaxComputeDeltaRows(allTx))) {
+        try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
         try { showSyncStatus('✅ Interrupted save already landed — nothing to resume'); } catch (_) {}
         return false;
       }
     }
   } catch (_) {}
+  try { localStorage.removeItem(SPAX_PENDING_KEY); } catch (_) {}
   // No popup toast on resume — the sync pill already announces and tracks the
   // resumed upload, and a boot-time toast made every restart feel like an error.
   // Name it and say WHEN it was interrupted — a resumed save is a real,
   // listed, cancellable task like any other, not an anonymous "something".
   let when = '';
   try {
-    const ts = Number(pending);
-    if (ts) when = ' (started ' + new Date(ts).toLocaleTimeString() + ')';
+    if (startedAt) when = ' (started ' + new Date(startedAt).toLocaleTimeString() + ')';
   } catch (_) {}
   const resumeName = (typeof CLOUD_SAVE_NAMES !== 'undefined' ? CLOUD_SAVE_NAMES.resume : '🔄 Resumed save');
+  // The interrupted attempt may have LANDED after the client gave up — its
+  // receipt is on the v3.6 backend's lock-free `status` answer. Hand this
+  // attempt its fingerprints so the FIRST thing it does is verify, instead
+  // of re-uploading a whole database that may already be up there.
+  let verifyFirst = null;
+  try {
+    if (typeof DB !== 'undefined' && DB && typeof spaxBuildSavePayload === 'function' &&
+        typeof spaxTableBasis === 'function' && typeof spaxSmallBasis === 'function') {
+      const payload = spaxBuildSavePayload();
+      verifyFirst = { txBasis: spaxTableBasis(payload.transactions || []), smallBasis: spaxSmallBasis(payload) };
+    }
+  } catch (_) {}
   try { showSyncStatus('🔄 Resuming interrupted save — ' + resumeName + when); } catch (_) {}
-  try { saveToCloud(true, resumeName); } catch (_) {}
+  try { saveToCloud(true, resumeName, verifyFirst); } catch (_) {}
   return true;
 }
 // Warn before the tab is closed mid-save; track hidden saves so the finish is
@@ -2057,7 +2117,7 @@ function cloudSaveLiveTotal() {
   return cloudSavePos + cloudSaveQueue.length; // finished jobs are behind pos
 }
 
-function saveToCloud(force = false, name) {
+function saveToCloud(force = false, name, verifyFirst) {
   if (SYNC_MODE === 'local') return Promise.resolve(false);
   // Background saves coalesce into one slot: if one is already queued or
   // running, this request rides the same promise. The queued save reads the
@@ -2068,7 +2128,10 @@ function saveToCloud(force = false, name) {
   // Every job is named. A caller that forgets still gets a real name rather
   // than the old anonymous slot that surfaced as "another save".
   const label = name || (force ? CLOUD_SAVE_NAMES.save : CLOUD_SAVE_NAMES.auto);
-  const job = { force: !!force, auto: !force, name: label, cancelled: false, resolve: resolveJob, promise, task: null };
+  // verifyFirst (the resumed save): fingerprints the attempt verifies against
+  // the backend's last-save receipt before uploading — an interrupted attempt
+  // that landed server-side is adopted, not re-uploaded.
+  const job = { force: !!force, auto: !force, name: label, cancelled: false, resolve: resolveJob, promise, task: null, verifyFirst: verifyFirst || null };
   // The SAME forced save twice (Force Push tapped twice, a Rebuild queued
   // behind a Rebuild) would upload the whole database twice — minutes apart
   // and one behind the other, since saves cannot overlap the backend's lock.
@@ -2174,7 +2237,7 @@ function cloudSavePump() {
   spaxUpdateTask(job.task, { state: 'running', detail: 'uploading' });
   cloudSaveAnnounceRunning();
   Promise.resolve()
-    .then(() => SYNC_MODE === 'local' ? false : performSaveToCloud())
+    .then(() => SYNC_MODE === 'local' ? false : performSaveToCloud(0, job.verifyFirst || undefined))
     .then(ok => {
       job.resolve(!!ok);
       if (ok) cloudSaveBatch.push(job.name);

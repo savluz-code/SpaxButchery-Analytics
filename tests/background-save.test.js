@@ -219,7 +219,7 @@ test('import tasks hold the same wake lock as saves', async () => {
 });
 
 test('the save queue marks pending on push and clears on drain', () => {
-  const push = slice('function saveToCloud(force = false, name) {', 'function cloudSaveQueuedNames()');
+  const push = slice('function saveToCloud(force = false, name, verifyFirst) {', 'function cloudSaveQueuedNames()');
   assert.match(push, /spaxMarkPending\(\)/);
   const pump = slice('function cloudSavePump() {', '// ── PRE-EMPTION ──');
   assert.match(pump, /spaxClearPending\(\)/);

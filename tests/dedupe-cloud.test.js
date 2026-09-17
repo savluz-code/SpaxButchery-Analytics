@@ -256,9 +256,11 @@ test('an interrupted dedupe save can no longer resurrect the duplicates (the rep
   assert.equal(cloud.customers.filter(c => c.name === 'Test Kamau').length, 2, 'the stale pair is still up there');
   assert.equal(store.has('spaxPendingSync'), true, 'the interrupted save plants the resume flag');
 
-  // Next boot: the stale cloud must NOT be unioned back over the clean local
-  // list while the full-replace latch is set.
+  // Next boot (after the zombie's ~6-minute lock window has elapsed — a fresh
+  // stamp would defer the resume until then): the stale cloud must NOT be
+  // unioned back over the clean local list while the full-replace latch is set.
   cloud.failSaves = 0;
+  store.set('spaxPendingSync', String(Date.now() - 3600000));
   ctx = bootApp({ store, idb, cloud });
   await sleep(250); ctx.repairDates();
   assert.equal(duplicatesOf(ctx), 1, 'the boot merge no longer resurrects the pair');

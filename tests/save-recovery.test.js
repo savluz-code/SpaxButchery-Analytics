@@ -291,6 +291,69 @@ test('the resume still pushes when data is genuinely unpushed', async () => {
   assert.ok(cloud.calls.some((c) => c.action === 'saveAll'), 'the unpushed data must go up');
 });
 
+/* ── the resume waits out the interrupted upload's zombie writer ─────────── */
+// A client timeout does not stop the server: the Apps Script execution keeps
+// writing — and holding the lock — for up to its ~6-minute quota. The old
+// resume fired at boot and burned its entire busy-retry budget fighting that
+// zombie ("Resumed save … backend busy … 4m 33s"), then failed. Now a FRESH
+// pending stamp defers the resume until the window can have elapsed, and the
+// resume probes the lock-free `status` receipt before re-uploading data the
+// zombie may already have landed.
+
+function runCtxWith(src, cloud, db, status) {
+  const ctx = vm.createContext(makeSandbox(cloud, db, status));
+  vm.runInContext(src, ctx);
+  return ctx;
+}
+const syncLayerSourceFastSmallWindow = () => syncLayerSourceFast()
+  .replace(/const SPAX_SERVER_EXEC_WINDOW_MS = [^;]+;/, 'const SPAX_SERVER_EXEC_WINDOW_MS = 150;');
+
+test('a fresh interruption defers the resume until the server-side writer can be done', async () => {
+  const cloud = makeCloud({});
+  const status = [];
+  const ctx = runCtxWith(syncLayerSourceFastSmallWindow(), cloud, smallDB(), status);
+  cloud.store.spaxPendingSync = String(Date.now()); // interrupted seconds ago
+  assert.strictEqual(vm.runInContext('spaxResumeInterruptedSave()', ctx), true, 'a resume is scheduled');
+  await new Promise((r) => setTimeout(r, 40));
+  assert.strictEqual(cloud.attempts('saveAll') || 0, 0, 'no push may race the zombie writer');
+  assert.strictEqual(vm.runInContext('cloudSaveRunning', ctx), false);
+  assert.ok(status.some((m) => /still being written on the server/.test(m)),
+    'the wait must say why: ' + JSON.stringify(status));
+  // The flag survives the wait: killing the tab inside the window must not
+  // lose the resume.
+  assert.equal(cloud.store.spaxPendingSync && true, true, 'the flag stays planted during the defer');
+  await new Promise((r) => setTimeout(r, 400)); // window elapses → probe → push
+  assert.ok(cloud.attempts('saveAll') >= 1, 'the deferred resume must push once the window passes');
+  assert.equal('spaxPendingSync' in cloud.store, false, 'consumed once the resume runs');
+});
+
+test('the resume verifies against the lock-free status receipt before re-uploading', async () => {
+  const cloud = makeCloud({});
+  const status = [];
+  const ctx = runCtx(cloud, smallDB(), status);
+  // The zombie landed our exact data after the client gave up: the receipt
+  // echoes the current payload's fingerprints.
+  cloud.landed.n = 1;
+  cloud.landed.saveTag = 'zombie';
+  cloud.landed.txBasis = vm.runInContext('spaxTableBasis(DB.transactions)', ctx);
+  cloud.landed.smallBasis = vm.runInContext('spaxSmallBasis(spaxBuildSavePayload())', ctx);
+  cloud.store.spaxPendingSync = String(Date.now() - 3600000);
+  assert.strictEqual(vm.runInContext('spaxResumeInterruptedSave()', ctx), true);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.strictEqual(cloud.attempts('status'), 1, 'the first attempt verifies via the lock-free status probe');
+  assert.strictEqual(cloud.attempts('saveAll') || 0, 0, 'landed data must not be re-uploaded');
+  assert.ok(status.some((m) => /already landed|checking whether the last attempt landed/.test(m)));
+  assert.equal('spaxPendingSync' in cloud.store, false, 'the stale flag is consumed');
+});
+
+test('structural pins: the resume defers inside the server-exec window and verifies before pushing', () => {
+  assert.match(HTML, /const SPAX_SERVER_EXEC_WINDOW_MS = /, 'the zombie window must exist');
+  assert.match(HTML, /spaxResumeDeferred = true/, 'the defer must be scheduled once');
+  assert.match(HTML, /saveToCloud\(true, resumeName, verifyFirst\)/, 'the resume must carry fingerprints to verify before uploading');
+  assert.match(HTML, /performSaveToCloud\(0, job\.verifyFirst/, 'the pump must hand the job its verifyFirst');
+  assert.match(HTML, /const CLOUD_BUSY_RETRIES = 8/, 'the busy budget must outlast a ~6-minute lock holder');
+});
+
 /* ── the drain re-plants the flag only for retry-worthy failures ────────── */
 
 test('a retry-worthy failure re-marks the resume flag for the next boot', async () => {
@@ -335,7 +398,10 @@ test('verify-before-re-uploading stays wired into the save path', () => {
   assert.match(HTML, /save proceeds exactly as before/, 'an unverifiable attempt must upload, not fail');
   assert.ok((HTML.match(/cloudSaveRerouteTimeout\(/g) || []).length >= 6, 'every timeout site must reroute');
   assert.match(HTML, /err\.spaxCommitStep = true/, 'the commit step must be flagged for verify-first');
-  assert.match(HTML, /if \(cloudSaveRunning \|\| cloudSaveQueue\.length\) return false/, 'a live save owns the resume flag');
+  // The resume must stand down (and consume the flag — the live job carries
+  // the data, and its drain re-plants on failure) while a save is live. The
+  // check grew a block body when the flag consumption moved into it.
+  assert.match(HTML, /if \(cloudSaveRunning \|\| cloudSaveQueue\.length\) \{[\s\S]{0,300}return false/, 'a live save owns the resume flag');
   assert.match(HTML, /spaxCloudAlreadyCurrent\(spaxBuildSavePayload\(\), spaxComputeDeltaRows\(allTx\)\)/,
     'the resume must stand down when nothing is unpushed');
   assert.match(HTML, /cloudSaveBatchFailed\.push/, 'failed jobs must be booked for the drain');

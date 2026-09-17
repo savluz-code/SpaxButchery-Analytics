@@ -169,7 +169,10 @@ test('progress from the sync pill lands on the running task row', async () => {
 
 test('a resumed save is named, not anonymous', async () => {
   const env = makeEnv();
-  env.store.spaxPendingSync = String(Date.now());
+  // An OLD stamp: the interrupted upload's server-side writer is long done,
+  // so the resume runs at once. A fresh stamp would defer until the zombie's
+  // ~6-minute lock window can have elapsed (see SPAX_SERVER_EXEC_WINDOW_MS).
+  env.store.spaxPendingSync = String(Date.now() - 3600000);
   assert.strictEqual(env.ctx.spaxResumeInterruptedSave(), true);
   const names = env.ctx.spaxActiveTasks().map((t) => t.name);
   assert.deepEqual(JSON.parse(JSON.stringify(names)), ['🔄 Resumed save']);

@@ -256,7 +256,13 @@ test('boot resumes a save a killed session left behind', () => {
 });
 
 test('the service worker never caches saves and handles background sync', () => {
-  assert.match(SW, /const CACHE_NAME = 'spax-v25';/);
+  // The cache name must carry at least the v26 bump (the 404 edge-hiccup fix):
+  // a stale shell is the one that told the user to redeploy Code.gs and paste
+  // a new /exec URL, which is what turned a transient hiccup into a loop.
+  // Compared numerically so a later bump cannot fail this guard.
+  const cacheName = SW.match(/const CACHE_NAME = '(spax-v\d+)'/);
+  assert.ok(cacheName && Number(cacheName[1].slice('spax-v'.length)) >= 26,
+    'expected the spax-v26 bump (404 edge-hiccup fix) or later, got ' + (cacheName && cacheName[1]));
   assert.match(SW, /event\.request\.method !== 'GET'/);
   assert.match(SW, /script\.google\.com/);
   assert.match(SW, /addEventListener\('sync'/);

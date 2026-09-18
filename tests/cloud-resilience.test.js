@@ -6,9 +6,16 @@
  *   1. Transient HTTP 404/5xx answers from a LIVE deployment are retried
  *      and the save succeeds — the user's data was never in danger, so the
  *      save must not be reported as failed.
- *   2. A persistent 404 (deployment deleted/replaced) fails FAST after the
- *      retries, with a message that tells the user what to do instead of
- *      just "Cloud returned HTTP 404".
+ *   2. A persistent 404 fails FAST after the retries — but it is reported
+ *      as Google's edge refusing the request, never as a verdict that the
+ *      deployment is gone. A 404 is not proof of anything: Google's edge
+ *      serves 404 + HTML for LIVE deployments (a spent one-time redirect
+ *      token on a slow request; the multi-account /u/N redirect bug), and
+ *      the old "deployment appears deleted — Redeploy Code.gs and paste the
+ *      new /exec URL" verdict sent the user to change the URL, which resets
+ *      the upload session and known-pushed set — so the next save became a
+ *      whole-database upload and hit the same edge again. That loop is
+ *      pinned shut below.
  *   3. Permanent client errors (400) are NOT retried.
  *   4. Capability probes (saveBegin/saveDelta) are NOT retried — a blip
  *      there falls back to a path that works (pinned by chunked-save).
@@ -70,7 +77,11 @@ function makeCloud(plan = {}) {
     calls.push({ action, url, attempt: n });
     const out = outcomeFor(action, n);
     if (out.status) {
-      return { ok: false, status: out.status, text: async () => (out.html != null ? out.html : 'HTTP ' + out.status) };
+      // `url` is the host that actually answered. A real fetch follows
+      // Apps Script's 302 to script.googleusercontent.com and reports that
+      // host here, which is how a spent one-time token is told apart from a
+      // deployment that really is missing.
+      return { ok: false, status: out.status, url: out.url, text: async () => (out.html != null ? out.html : 'HTTP ' + out.status) };
     }
     if (action === 'saveAll') live.transactions = (body.transactions || []).slice();
     return { ok: true, status: 200, text: async () => JSON.stringify(out.body) };
@@ -173,21 +184,51 @@ test('a transient 502 on load is retried and the load succeeds', async () => {
 
 /* ── persistent failures fail fast, with an actionable message ──────────── */
 
-test('a persistent 404 fails after the retries with a redeploy hint', async () => {
+test('a persistent 404 blames Google edge, never the deployment', async () => {
   const cloud = makeCloud({ saveAll: [{ status: 404, html: HTML404 }] });
   const { first, status, lastCloudError } = await runClient(cloud, smallDB());
 
-  assert.strictEqual(first, false, 'the save fails — the deployment really is gone');
+  assert.strictEqual(first, false, 'the save still fails after the retries');
   assert.strictEqual(cloud.attempts('saveAll'), 3, 'initial attempt + both retries, then stop');
   assert.strictEqual(cloud.live.transactions.length, 0, 'nothing was written');
-  assert.match(lastCloudError, /404/);
-  assert.match(lastCloudError, /deployment/i, 'the likely cause is named');
-  assert.match(lastCloudError, /Redeploy/i, 'the fix is named');
+  assert.match(lastCloudError, /404/, 'the status is named');
   assert.match(lastCloudError, /safe locally/i, 'the user is told where the data is');
-  // A dead deployment must not read like a mobile drop — otherwise
-  // isTransientNetworkError would swallow it into a second retry wave.
-  assert.ok(!/connection/i.test(lastCloudError), 'no "connection" wording in a deployment error');
+  assert.match(lastCloudError, /Test/, 'the user is pointed at the endpoint test');
+  // The old verdict — "the Apps Script deployment appears deleted or
+  // replaced. Redeploy Code.gs and paste the new /exec URL" — is what turned
+  // one hiccup into a permanent outage, so it must be gone.
+  assert.ok(!/deployment appears deleted|Redeploy/i.test(lastCloudError),
+    'a 404 must never assert the deployment is gone, nor prescribe a redeploy');
+  assert.ok(!/connection/i.test(lastCloudError),
+    'no "connection" wording — isTransientNetworkError would fire a second retry wave');
   assert.ok(status.some((m) => /Cloud hiccup \(HTTP 404\)/.test(m)));
+});
+
+test('a 404 from Google one-time echo host is named as edge noise', async () => {
+  // Apps Script never answers /exec directly: it replies 302 to
+  // script.googleusercontent.com/macros/echo?user_content_key=... — a
+  // single-use URL. A slow save can arrive after that token is spent, and
+  // the echo host then answers 404 + HTML for a deployment that is healthy.
+  const cloud = makeCloud({
+    saveAll: [{
+      status: 404,
+      html: HTML404,
+      url: 'https://script.googleusercontent.com/macros/echo?user_content_key=spent&lib=x'
+    }]
+  });
+  const { lastCloudError } = await runClient(cloud, smallDB());
+  assert.match(lastCloudError, /hiccup at Google/i, 'the edge is named as the cause');
+  assert.ok(!/deployment appears deleted|Redeploy/i.test(lastCloudError),
+    'a spent redirect token must not read as a missing deployment');
+});
+
+test('the 404 classifier sees the post-redirect URL', () => {
+  assert.match(HTML, /spaxIsEchoedResponse\(finalUrl\)/,
+    'the echo host must be recognised');
+  assert.ok(HTML.includes('script\\.googleusercontent\\.com'),
+    'the one-time echo host pattern must be present');
+  assert.match(HTML, /cloudHttpFailure\(response\.status, text, response && response\.url\)/,
+    'the host that answered must reach the classifier');
 });
 
 test('a permanent 400 is not retried', async () => {

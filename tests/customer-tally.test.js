@@ -423,7 +423,9 @@ test('seedDB stamps the report date, and the service worker cache was bumped', (
   const seed = slice('function seedDB(){', 'function load(){');
   assert.match(seed, /seedLastVisit:\s*\(lastVisit && days < 999\) \? _addDays\(lastVisit, days\) : lastVisit/);
   const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
-  assert.match(sw, /const CACHE_NAME = 'spax-v25';/);
+  const cacheName = sw.match(/const CACHE_NAME = '(spax-v\d+)'/);
+  assert.ok(cacheName && Number(cacheName[1].slice('spax-v'.length)) >= 26,
+    'expected the spax-v26 bump (404 edge-hiccup fix) or later, got ' + (cacheName && cacheName[1]));
 });
 
 test('every mutation path re-derives the totals instead of hand-adjusting them', () => {

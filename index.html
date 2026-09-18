@@ -1107,20 +1107,44 @@ const CLOUD_HTTP_RETRY_DELAYS = [4000, 12000];
 function isTransientCloudStatus(status) {
   return status === 404 || status === 429 || status >= 500;
 }
+// True when an answer came from Google's one-time response host rather than
+// from the /exec endpoint itself. Apps Script never answers /exec directly: it
+// replies 302 to script.googleusercontent.com/macros/echo?user_content_key=...
+// and the body is served from that single-use URL. A SLOW request — a big
+// chunk, or a server-side waitLock while another writer owns the script lock
+// — can arrive after the token has been spent, and the echo host then answers
+// "Page Not Found" with its own HTML page while the deployment is healthy.
+function spaxIsEchoedResponse(finalUrl) {
+  return /script\.googleusercontent\.com/i.test(String(finalUrl || ''));
+}
+
 // A non-OK HTTP answer, made actionable: where the data is, what the status
 // most likely means, and what the user can do about it.
-function cloudHttpFailure(status, text) {
+function cloudHttpFailure(status, text, finalUrl) {
   const t = String(text || '');
   if (status === 404) {
-    // A live /exec endpoint answers JSON. HTML is Google's own "not found" —
-    // the deployment was deleted or replaced (or the URL is wrong).
-    // NOTE: neither message may contain the words "connection" or "timeout"
-    // — isTransientNetworkError greps for those and would treat the dead
-    // deployment as a retriable mobile drop (a second, pointless wave).
-    if (t && /<!doctype html|<html/i.test(t)) {
-      return new Error('Cloud URL returns a web page instead of JSON (HTTP 404) — the Apps Script deployment appears deleted or replaced. Redeploy Code.gs (⚙️ Sync tab) and paste the new /exec URL into Cloud URL, then run 🧪 Test. Your data is safe locally.');
+    // A 404 is NOT proof the deployment is gone. A live /exec endpoint does
+    // answer JSON, but Google's edge also answers 404 with its own HTML page
+    // for reasons that have nothing to do with the deployment: a spent
+    // one-time redirect token (see spaxIsEchoedResponse) or the long-standing
+    // multi-Google-account /u/N redirect bug, which 404s a deployment that is
+    // perfectly healthy. Reporting that as "deployment deleted" sent the user
+    // to redeploy Code.gs and paste a NEW /exec URL — and changing the URL
+    // resets the upload session, the known-pushed set and the full-replace
+    // latch, so the next save became a whole-database upload: the slowest
+    // thing this app does and the most likely to hit this again. The advice
+    // caused the loop it was meant to break, so it is gone. Name the edge,
+    // leave the URL alone, and point at 🧪 Test as the authority.
+    //
+    // NOTE: neither message may contain "deployment appears deleted",
+    // "non-JSON response", "connection" or "timeout" — the first two make
+    // isDeadDeploymentError suppress the automatic retry on the next launch,
+    // and the last two make isTransientNetworkError fire a second retry wave.
+    const fromEdge = spaxIsEchoedResponse(finalUrl) || (t && /<!doctype html|<html/i.test(t));
+    if (fromEdge) {
+      return new Error('Google edge answered with a web page instead of JSON (HTTP 404) — a hiccup at Google, not a problem with your data. It usually means a slow save whose one-time redirect link had expired before the answer arrived. Your data is safe locally and will sync on the next save. If this repeats, open the ⚙️ Sync tab and run the 🧪 Test, which asks the deployment directly.');
     }
-    return new Error('Cloud returned HTTP 404 after ' + (CLOUD_HTTP_RETRIES + 1) + ' attempts — the deployment may have been deleted or replaced, or Google\u2019s edge is flaky. Redeploy Code.gs and check Cloud URL / 🧪 Test in the ⚙️ Sync tab. Your data is safe locally.');
+    return new Error('Cloud returned HTTP 404 after ' + (CLOUD_HTTP_RETRIES + 1) + ' attempts — Google edge kept refusing the request. Your data is safe locally and will sync on the next save. Open the ⚙️ Sync tab and run the 🧪 Test, which asks the deployment directly.');
   }
   if (status === 429) {
     return new Error('Cloud rate-limited this save (HTTP 429) — wait a minute and retry; your data is safe locally.');
@@ -1165,7 +1189,7 @@ async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT
       const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
       const text = await response.text();
       if (!response.ok) {
-        lastError = cloudHttpFailure(response.status, text);
+        lastError = cloudHttpFailure(response.status, text, response && response.url);
         // Transient edge failure and attempts left: back off and go again.
         // A cancel arriving meanwhile must win over the backoff.
         if (isTransientCloudStatus(response.status) && attempt <= httpRetries && !(external && external.aborted)) {
@@ -3139,12 +3163,19 @@ function isTimeoutError(err) {
   return /timed out after \d+s/i.test(String((err && err.message) || err));
 }
 
-// Failures that prove the deployment itself is gone or misconfigured: no
-// retry — now or on the next boot — can succeed until a human redeploys
-// Code.gs and pastes the new URL. Every other failure is worth one
-// automatic retry on the next launch (see cloudSavePump's drain).
+// Failures that prove the deployment is MISCONFIGURED — a 200 that is not
+// JSON, i.e. the wrong URL or a web app not published for "Anyone". Only
+// these skip the automatic retry on the next launch (see cloudSavePump's
+// drain), because no retry can fix a misconfiguration.
+//
+// An HTTP 404 deliberately does NOT qualify. Google's edge answers 404 with
+// HTML for live deployments too (a spent one-time redirect token on a slow
+// request; the multi-account /u/N redirect bug), so treating it as proof
+// disabled the boot retry and left the app broken until a human acted — the
+// difference between a transient hiccup and a permanent outage. Retrying
+// costs one request per launch; guessing wrong cost every save after it.
 function isDeadDeploymentError(msg) {
-  return /HTTP 404|deployment appears deleted|non-JSON response/i.test(String(msg || ''));
+  return /non-JSON response/i.test(String(msg || ''));
 }
 
 // Wraps a timeout as a busy-retry round: the server is presumably still
@@ -11109,7 +11140,14 @@ let cloudTestResult = null; // { ok, detail, at }
 function spaxCloudTestHint(errMsg) {
   const m = String(errMsg || '');
   if (/404/.test(m)) {
-    return '<div style="color:var(--muted);margin-top:4px;">The deployment behind this URL is gone (or your network can’t reach Google). Redeploy Code.gs and paste the new /exec URL above, then test again.</div>';
+    // Not "the deployment is gone": this exact 404 is what Google's edge
+    // answers for HEALTHY deployments too (a spent one-time redirect token on
+    // a slow answer, or several Google accounts signed in). Sending the user
+    // straight to a redeploy was the loop, not the fix — a redeploy mints a
+    // NEW /exec URL, and changing the URL here discards the upload session
+    // and the known-pushed set, so the next save re-uploads the whole
+    // database. Re-test first; redeploy only if it keeps failing.
+    return '<div style="color:var(--muted);margin-top:4px;">Google’s edge refused the request — which happens to live deployments as well (a slow answer whose one-time link had expired, or several Google accounts signed in). <b>Hit the Test again</b>; if it succeeds, that was the edge and saves will follow. Only if every retry fails is the deployment itself the suspect — and note a redeploy produces a NEW /exec URL, while changing the URL above resets this device’s sync state, so its next save re-uploads everything.</div>';
   }
   if (/timed out/i.test(m)) {
     return '<div style="color:var(--muted);margin-top:4px;">Apps Script is slow to wake up — hit Test connection again in a few seconds.</div>';

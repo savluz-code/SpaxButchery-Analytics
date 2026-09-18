@@ -93,7 +93,12 @@ function makeCloud(plan = {}, { receiptMode = 'echo' } = {}) {
       });
     }
     if (out && out.status) {
-      return { ok: false, status: out.status, text: async () => (out.html != null ? out.html : 'HTTP ' + out.status) };
+      return { ok: false, status: out.status, url: out.url, text: async () => (out.html != null ? out.html : 'HTTP ' + out.status) };
+    }
+    if (out && out.raw != null) {
+      // A 200 the script did not write (a sign-in page, an error page): the
+      // positive evidence of a MISCONFIGURED deployment, unlike a 404.
+      return { ok: true, status: 200, url: out.url, text: async () => out.raw };
     }
     if (action === 'saveBegin') {
       return { ok: true, status: 200, text: async () => JSON.stringify({ success: true, uploadId: 'u-test', ...(body.mode === 'delta' ? { delta: true } : {}) }) };
@@ -168,7 +173,15 @@ test('timeouts and dead deployments are told apart', () => {
   assert.strictEqual(V(`isTimeoutError(new Error('Cloud connection timed out after 180s (large upload or weak signal).'))`), true);
   assert.strictEqual(V(`isTimeoutError(new Error('backend busy with another save — please retry the save'))`), false);
   assert.strictEqual(V(`isTimeoutError(new Error('Cloud returned HTTP 404 after 3 attempts'))`), false);
-  assert.strictEqual(V(`isDeadDeploymentError('Cloud URL returns a web page instead of JSON (HTTP 404) — the Apps Script deployment appears deleted or replaced.')`), true);
+  // A 404 is NOT positive evidence the deployment is gone: Google's edge
+  // serves 404 + HTML for live deployments too (a spent one-time redirect
+  // token on a slow request; the multi-account /u/N redirect bug). Treating
+  // it as proof suppressed the boot retry and is what made one hiccup
+  // permanent, so 404s must stay retryable.
+  assert.strictEqual(V(`isDeadDeploymentError('Google edge answered with a web page instead of JSON (HTTP 404) — a hiccup at Google, not a problem with your data.')`), false);
+  assert.strictEqual(V(`isDeadDeploymentError('Cloud returned HTTP 404 after 3 attempts — Google edge kept refusing the request.')`), false);
+  // A 200 the script did not write IS positive evidence of a
+  // misconfiguration (wrong URL, or a web app not published for "Anyone").
   assert.strictEqual(V(`isDeadDeploymentError('Cloud returned a non-JSON response. Check that the Apps Script web app is deployed.')`), true);
   assert.strictEqual(V(`isDeadDeploymentError('Cloud connection timed out after 180s (large upload or weak signal).')`), false);
   assert.strictEqual(V(`isDeadDeploymentError('backend busy with another save — please retry the save')`), false);
@@ -366,13 +379,29 @@ test('a retry-worthy failure re-marks the resume flag for the next boot', async 
   assert.strictEqual(cloud.store.spaxPendingSync && true, true, 'the next boot must push automatically');
 });
 
-test('a dead deployment never re-marks the flag', async () => {
-  const gone = { status: 404, html: '<!doctype html><html>not found</html>' };
-  const cloud = makeCloud({ saveAll: [gone] });
+test('a 404 hiccup still re-marks the flag for the next boot', async () => {
+  // A 404 is not proof the deployment is dead — Google's edge 404s healthy
+  // deployments — so the save must retry on the next launch instead of
+  // waiting for a human. That suppression is what made the outage outlive
+  // every app restart.
+  const edge = { status: 404, html: '<!doctype html><html>not found</html>' };
+  const cloud = makeCloud({ saveAll: [edge] });
   const ctx = runCtx(cloud, smallDB(), []);
   assert.strictEqual(await ctx.saveToCloud(true, '🚀 Force Push'), false);
   await new Promise((r) => setTimeout(r, 30)); // the drain runs after the job resolves
-  assert.equal('spaxPendingSync' in cloud.store, false, 'no retry can succeed until a human redeploys');
+  assert.strictEqual(cloud.store.spaxPendingSync && true, true, 'the next boot must push automatically');
+});
+
+test('a misconfigured endpoint never re-marks the flag', async () => {
+  // A 200 that is not JSON — a sign-in page where the database should be —
+  // proves the URL or the deployment's access setting is wrong. No retry can
+  // fix that, so the flag stays off until a human corrects it.
+  const misconfigured = { raw: '<!doctype html><html>Sign in</html>' };
+  const cloud = makeCloud({ saveAll: [misconfigured] });
+  const ctx = runCtx(cloud, smallDB(), []);
+  assert.strictEqual(await ctx.saveToCloud(true, '🚀 Force Push'), false);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal('spaxPendingSync' in cloud.store, false, 'no retry can fix a misconfiguration');
 });
 
 test('a cancelled save never re-marks the flag', async () => {
@@ -405,5 +434,5 @@ test('verify-before-re-uploading stays wired into the save path', () => {
   assert.match(HTML, /spaxCloudAlreadyCurrent\(spaxBuildSavePayload\(\), spaxComputeDeltaRows\(allTx\)\)/,
     'the resume must stand down when nothing is unpushed');
   assert.match(HTML, /cloudSaveBatchFailed\.push/, 'failed jobs must be booked for the drain');
-  assert.match(HTML, /!isDeadDeploymentError\(f\.error\)/, 'dead deployments must not resurrect on boot');
+  assert.match(HTML, /!isDeadDeploymentError\(f\.error\)/, 'misconfigured deployments must not resurrect on boot');
 });

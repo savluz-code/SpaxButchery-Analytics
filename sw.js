@@ -1,7 +1,10 @@
-// Bumped to spax-v25 (2026-09-15): installed apps / long-open tabs drop the
-// stale shell the same way every earlier bump did, so the no-refresh
-// multi-statement flow and the stale-build guard reach every device.
-const CACHE_NAME = 'spax-v25';
+// Bumped to spax-v26 (2026-09-18): a 404 from Google's edge is no longer
+// reported as a dead deployment. The old shell told the user to redeploy
+// Code.gs and paste a new /exec URL — advice that resets the upload session
+// and the known-pushed set, turning the next save into a full-database
+// upload and repeating the failure. Installed apps must drop that shell, so
+// this bump matters as much as the ones before it.
+const CACHE_NAME = 'spax-v26';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

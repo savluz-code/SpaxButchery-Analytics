@@ -1,10 +1,13 @@
-// Bumped to spax-v26 (2026-09-18): a 404 from Google's edge is no longer
-// reported as a dead deployment. The old shell told the user to redeploy
-// Code.gs and paste a new /exec URL — advice that resets the upload session
-// and the known-pushed set, turning the next save into a full-database
-// upload and repeating the failure. Installed apps must drop that shell, so
-// this bump matters as much as the ones before it.
-const CACHE_NAME = 'spax-v26';
+// Bumped to spax-v27 (2026-09-19): a save whose step outlives its own client
+// deadline now converges instead of bouncing off the same wall. Deadlines
+// widen while the link proves it needs more, a round that lands rows keeps
+// its retry budget, and the upload session is identified by an id the client
+// mints itself — so a lost saveBegin answer is recognised by the lock-free
+// status probe and continued, rather than answered with a fresh saveBegin
+// that wipes the staging area the previous attempt had just filled (the
+// reported save that never completes). Installed apps must pick up the new
+// shell for the fix to reach them.
+const CACHE_NAME = 'spax-v27';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

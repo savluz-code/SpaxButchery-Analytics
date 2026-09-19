@@ -363,6 +363,71 @@ test('a newer saveBegin supersedes the previous uploadId; legacy chunks without 
   assert.strictEqual(legacy.success, true);
 });
 
+/* ── v3.8: a lost saveBegin answer is recoverable ────────────────────────── */
+
+test('v3.8: a client-minted uploadId is honoured and status reports its session', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+
+  // An id the client minted itself is stored and enforced exactly like one
+  // the script mints. That is what lets a client whose saveBegin ANSWER was
+  // lost (its own deadline firing, or the network dropping the reply) find
+  // the session it already began and continue it, instead of sending a fresh
+  // saveBegin that wipes the staging area the previous attempt filled.
+  const begin = await env.post({
+    action: 'saveBegin',
+    uploadId: 'client-abc123',
+    customers: db.customers, monthly: db.monthly, settings: db.settings
+  });
+  assert.strictEqual(begin.success, true);
+  assert.strictEqual(begin.uploadId, 'client-abc123');
+
+  const status = await env.post({ action: 'status' });
+  assert.strictEqual(status.version, '3.8');
+  assert.strictEqual(status.session.uploadId, 'client-abc123');
+  assert.strictEqual(status.session.mode, 'full');
+  assert.ok(status.session.at > 0, 'the session reports when saveBegin ran');
+  assert.deepStrictEqual(status.session.staged, { transactions: 0, customerTx: 0, seen: 0 });
+
+  // A slice lands under that id and the next probe shows the staging growing
+  // — the evidence a recovering client needs to continue this session.
+  const chunk = await env.post({
+    action: 'saveChunk', table: 'transactions', uploadId: 'client-abc123', seq: 0,
+    rows: db.transactions.map((t) => ({ ...t, backfillOnly: String(t.backfillOnly) }))
+  });
+  assert.strictEqual(chunk.success, true);
+  assert.strictEqual((await env.post({ action: 'status' })).session.staged.transactions, 5);
+
+  const commit = await env.post({
+    action: 'saveCommit', expect: { transactions: 5, customerTx: 0, seen: 0 }, uploadId: 'client-abc123'
+  });
+  assert.deepStrictEqual(commit, { success: true });
+  assert.strictEqual((await env.load()).transactions.length, 5);
+
+  // A delta session reports its mode too — adopting a full session as an
+  // append (or the other way round) would commit the wrong rows.
+  const delta = await env.post({
+    action: 'saveBegin', uploadId: 'client-delta-1', mode: 'delta',
+    customers: db.customers, monthly: db.monthly, settings: db.settings
+  });
+  assert.strictEqual(delta.uploadId, 'client-delta-1');
+  assert.strictEqual(delta.delta, true);
+  assert.strictEqual((await env.post({ action: 'status' })).session.mode, 'delta');
+});
+
+test('v3.8: anything that is not an opaque token is ignored — the script mints its own id', async () => {
+  const env = makeEnv();
+  const db = dbFixture();
+  for (const bad of ['', 'no', 'has spaces', 'semi;colon', "quote'", 'x'.repeat(81)]) {
+    const begin = await env.post({
+      action: 'saveBegin', uploadId: bad,
+      customers: db.customers, monthly: db.monthly, settings: db.settings
+    });
+    assert.match(begin.uploadId, /^uuid-/, JSON.stringify(bad) + ' must not become a session id');
+    assert.notStrictEqual((await env.post({ action: 'status' })).session.uploadId, bad);
+  }
+});
+
 test('unknown actions still answer "unknown action" (the client probe contract)', async () => {
   const env = makeEnv();
   const res = await env.post({ action: 'saveBegin' }); // no body fields, but the action IS known now
@@ -633,8 +698,8 @@ test('code.html reads the backend version from the file, not from hard-coded mar
   // …and the version it reports is the backend this repo ships. Bump this pin
   // with the header above: a version nobody updated the pin for is exactly the
   // drift this test exists to catch.
-  // (v3.7 adds targeted customer edits — updateCustomer.)
-  assert.strictEqual(current.ver, 'v3.7', 'code.html must be offering the fixed backend');
+  // (v3.8: a client-minted uploadId + the staging session in `status`.)
+  assert.strictEqual(current.ver, 'v3.8', 'code.html must be offering the fixed backend');
 });
 
 /* ── incremental saves (backend v3.4) ───────────────────────────────────────

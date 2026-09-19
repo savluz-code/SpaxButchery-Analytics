@@ -950,7 +950,7 @@ function doPost(e) {
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.5 · <span id="buildStamp">build 2026-09-15</span> · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.5 · <span id="buildStamp">build 2026-09-19</span> · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -1104,6 +1104,45 @@ const CLOUD_BUSY_RETRY_DELAYS = [3000, 8000, 15000, 30000, 45000, 60000, 90000, 
 const CLOUD_HTTP_RETRIES = 2;
 const CLOUD_HTTP_RETRY_DELAYS = [4000, 12000];
 
+// ── ADAPTIVE DEADLINES ──
+// A client-side timeout is not proof the cloud is unreachable: it means THIS
+// request needed longer than the deadline this network allows. Retrying the
+// same step at the same deadline then times out again, and again — the
+// reported "save does not complete, no matter how long I wait". The worst
+// case is saveBegin: the uploadId rides the answer that never arrives, so the
+// save can never leave the first step; every retry re-begins, wipes the
+// staging area the previous attempt filled, and after the retry budget is
+// spent the user is told "the cloud is still busy after retries — Wait ~1 min
+// then Force Push", which is exactly as useful as it sounds when nothing is
+// actually wrong except that this link is slow.
+//
+// So the client adapts: every request aborted on its OWN deadline doubles the
+// deadline for the requests that follow (capped), and a fast answer halves it
+// back. The scale only ever ALLOWS more time — it never makes a request wait
+// longer than the server takes to answer it.
+const CLOUD_TIMEOUT_SCALE_MAX = 4;
+const CLOUD_TIMEOUT_CEILING_MS = 300000; // 5 min: the longest a single request may run
+let cloudTimeoutScale = 1;
+// The heaviest step the widening was earned by (its base timeout). Only a
+// request at least that heavy can give the time back, so a 1ms answer to a
+// 30s probe can never cancel the extra time a 3-minute saveAll needed.
+let cloudTimeoutScaleBase = 0;
+
+function cloudDeadline(ms) {
+  return Math.min(CLOUD_TIMEOUT_CEILING_MS, Math.round(ms * cloudTimeoutScale));
+}
+function cloudNoteDeadlineAbort(baseMs) {
+  cloudTimeoutScaleBase = Math.max(cloudTimeoutScaleBase, Number(baseMs) || 0);
+  if (cloudTimeoutScale < CLOUD_TIMEOUT_SCALE_MAX) cloudTimeoutScale *= 2;
+  return cloudTimeoutScale;
+}
+function cloudNoteFastAnswer(elapsedMs, baseMs) {
+  if (cloudTimeoutScale > 1 && Number(baseMs) >= cloudTimeoutScaleBase && elapsedMs < baseMs / 2) {
+    cloudTimeoutScale = Math.max(1, cloudTimeoutScale / 2);
+    if (cloudTimeoutScale === 1) cloudTimeoutScaleBase = 0;
+  }
+}
+
 function isTransientCloudStatus(status) {
   return status === 404 || status === 429 || status >= 500;
 }
@@ -1172,11 +1211,16 @@ function cloudSaveRetrySleep(ms, signal) {
 // HTTP-level retries for transient edge failures. `options` may carry the
 // pre-empt signal (its abort wins over every retry); `httpRetries` opts a
 // capability probe out of the retry.
-async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT, httpRetries = CLOUD_HTTP_RETRIES) {
+async function cloudRequest(url, options = {}, stepTimeoutMs = CLOUD_TIMEOUT_DEFAULT, httpRetries = CLOUD_HTTP_RETRIES) {
   const external = options && options.signal;
   let lastError = null;
   for (let attempt = 1; attempt <= httpRetries + 1; attempt++) {
     const controller = new AbortController();
+    // The deadline this attempt runs under (see ADAPTIVE DEADLINES): the step's
+    // own timeout, widened while the link has been proving it needs more. The
+    // step's base timeout is kept so a fast answer can give the time back.
+    const timeoutMs = cloudDeadline(stepTimeoutMs);
+    const startedAt = Date.now();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     // An external signal lets a higher-priority save (Delete All) abort this
     // request mid-flight. The local controller stays the only one handed to
@@ -1188,6 +1232,9 @@ async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT
     try {
       const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'follow' });
       const text = await response.text();
+      // Answered well inside the step's own deadline: this link no longer
+      // needs the widened deadline the last timeouts asked for.
+      cloudNoteFastAnswer(Date.now() - startedAt, stepTimeoutMs);
       if (!response.ok) {
         lastError = cloudHttpFailure(response.status, text, response && response.url);
         // Transient edge failure and attempts left: back off and go again.
@@ -1217,7 +1264,12 @@ async function cloudRequest(url, options = {}, timeoutMs = CLOUD_TIMEOUT_DEFAULT
       // (or as a failure at all — the save that pre-empted it announces itself).
       if (err && err.name === 'AbortError') {
         if (external && external.aborted) throw cloudSaveCancelledError();
-        throw new Error('Cloud connection timed out after ' + Math.round(timeoutMs / 1000) + 's (large upload or weak signal). Your data is safe locally and will sync on the next save.');
+        // Our own deadline fired: this step needs more time than it was
+        // given, so give the next attempt more (capped) instead of retrying
+        // into the same wall. A save that is merely slow then converges
+        // instead of burning its retry budget at a fixed deadline.
+        cloudNoteDeadlineAbort(stepTimeoutMs);
+        throw new Error('Cloud connection timed out after ' + Math.round(timeoutMs / 1000) + 's (large upload or weak signal). Your data is safe locally and the next attempt is given more time.');
       }
       throw err;
     } finally {
@@ -1728,6 +1780,22 @@ let cloudSaveBatchFailed = [];
 // "backend busy" — so the retry message can name the culprit instead of
 // guessing at "another save".
 let cloudStoppedUpload = null;
+// Counts the ROWS that genuinely landed in the current save chain — one per
+// acknowledged slice. A retry round that advanced this counter cannot be a
+// "the cloud is still busy" round (work moved), so it gets a fresh retry
+// budget and the SHORT first backoff. Without this, a long upload on a slow
+// link dies of its own progress: twenty slices that each time out once
+// consume twenty rounds of a budget sized for eight, and the save "fails"
+// with a message about a busy lock while every slice it sent was actually
+// staged. A round that staged nothing — even one that re-established a
+// session, or was refused a slice — still counts against the budget, so a
+// lock (or a supersede race) that refuses everything is still given up on in
+// bounded time: the only way to keep a chain alive is to keep advancing it.
+let cloudSaveProgressSeq = 0;
+function cloudSaveNoteProgress() { cloudSaveProgressSeq += 1; }
+// How deep the current retry chain is (1 = the attempt the queue started).
+// Only the outermost attempt owns isSyncing, whatever the retry numbering.
+let cloudSaveChainDepth = 0;
 
 // ── BACKGROUND PERSISTENCE ──
 // A long save (chunked upload, busy retries) must survive the app being
@@ -2522,12 +2590,18 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
   // let save()/auto-sync fire a second POST while the first was still
   // holding the Apps Script lock. That second POST is what the user saw as
   // permanent "backend busy with another save": the "other save" was this
-  // tab fighting itself. Only the outermost attempt owns the flag. The
-  // queue has already announced this job ("⏳ Saving to cloud… 1/3").
-  if (busyRetry === 0) isSyncing = true;
+  // tab fighting itself. Only the outermost attempt owns the flag — tracked
+  // by chain DEPTH rather than by the retry counter, so a round that gets
+  // its budget back after progress still leaves the flag alone. The queue
+  // has already announced this job ("⏳ Saving to cloud… 1/3").
+  cloudSaveChainDepth += 1;
+  if (cloudSaveChainDepth === 1) isSyncing = true;
   // Which job this attempt belongs to (the drain books failures per job —
   // the global may point at a replacement by unwind time; see the catch).
   const myJob = (typeof cloudSaveRunningJob !== 'undefined') ? cloudSaveRunningJob : null;
+  // Progress already made when this attempt started: anything beyond it was
+  // achieved by THIS round (see cloudSaveProgressSeq).
+  const progressAtEntry = cloudSaveProgressSeq;
 
   try {
     const payload = spaxBuildSavePayload();
@@ -2750,9 +2824,17 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       console.log('Cloud save stopped:', cloudSaveRunningName());
       return false;
     }
-    if (isBackendBusyError(err) && busyRetry < CLOUD_BUSY_RETRIES) {
-      const nextRetry = busyRetry + 1;
-      const delayMs = CLOUD_BUSY_RETRY_DELAYS[nextRetry - 1] || CLOUD_BUSY_RETRY_DELAYS[CLOUD_BUSY_RETRY_DELAYS.length - 1];
+    // A round that moved rows is not a busy round. It gets the budget back
+    // and the first (short) backoff, so a resumable upload can run as long as
+    // it keeps advancing; a round that moved NOTHING keeps the escalating
+    // schedule and counts, which is the zombie-lock case the budget exists
+    // for.
+    const progressed = cloudSaveProgressSeq > progressAtEntry;
+    if (isBackendBusyError(err) && (busyRetry < CLOUD_BUSY_RETRIES || progressed)) {
+      const nextRetry = progressed ? 0 : busyRetry + 1;
+      const delayMs = progressed
+        ? CLOUD_BUSY_RETRY_DELAYS[0]
+        : (CLOUD_BUSY_RETRY_DELAYS[nextRetry - 1] || CLOUD_BUSY_RETRY_DELAYS[CLOUD_BUSY_RETRY_DELAYS.length - 1]);
       const busyTotal = cloudSaveLiveTotal();
       // A rerouted timeout names its own cause (the previous attempt still
       // being written); a genuine lock refusal names the lock holder.
@@ -2760,7 +2842,8 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       showSyncStatus('⏳ ' + cloudSaveRunningName() + ' waiting on the cloud' +
         (busyTotal > 1 ? ' (' + cloudSavePos + '/' + busyTotal + ')' : '') +
         ' — ' + busyWhy +
-        ', retrying in ' + Math.ceil(delayMs / 1000) + 's (' + nextRetry + '/' + CLOUD_BUSY_RETRIES + ')');
+        ', retrying in ' + Math.ceil(delayMs / 1000) + 's (' +
+        (progressed ? 'the upload is moving, budget restarted' : nextRetry + '/' + CLOUD_BUSY_RETRIES) + ')');
       // The wait must be interruptible: sitting out a 30s backoff while a
       // Delete All is trying to take over would defeat the pre-emption.
       await cloudSaveDelay(delayMs);
@@ -2780,13 +2863,22 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
     // answer: name the upload this device stopped if there was one, otherwise
     // say precisely what the two possible writers are — never "another save".
     if (isBackendBusyError(err)) {
+      // Rounds that moved rows restart the budget, so reaching here means the
+      // last rounds moved NOTHING — a writer really is holding the lock.
       showSyncStatus(cloudSaveFailedMessage('the cloud is still busy after retries — ' + ((err && err.spaxBusyWhy) || cloudSaveBusyReason()) + '. Wait ~1 min then Force Push.' + spaxOldBackendHint()));
     } else {
       showSyncStatus(cloudSaveFailedMessage(lastCloudError + spaxOldBackendHint()));
     }
     return false;
   } finally {
-    if (busyRetry === 0) isSyncing = false;
+    cloudSaveChainDepth -= 1;
+    if (cloudSaveChainDepth <= 0) {
+      cloudSaveChainDepth = 0;
+      // Only the outermost attempt of the whole chain (the one the queue
+      // started, never a retry — even one whose budget restarted) clears the
+      // flag, so a concurrent save can never start mid-retry.
+      if (busyRetry === 0) isSyncing = false;
+    }
   }
 }
 
@@ -2916,6 +3008,10 @@ async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tabl
       session.sent = (Number(session.sent) || 0) + slice.length;
       session.ts = Date.now();
       spaxSaveUploadSession(session);
+      // A slice that landed (for the first time, or as a duplicate this
+      // session already staged) is progress: the retry budget must not be
+      // spent on rounds that advanced the upload (see cloudSaveProgressSeq).
+      cloudSaveNoteProgress();
       // Absolute rows, not just a percentage: on a multi-minute upload the
       // user needs to see the counter moving to know it is worth keeping the
       // app open.
@@ -2962,6 +3058,66 @@ async function spaxRunChunkedUpload(post, session, bigTables, totalBigRows, tabl
   const err = new Error(commit.error || 'Cloud rejected the save');
   if (isDeadUploadSessionError(err.message)) err.spaxSessionDead = true;
   throw err;
+}
+
+// The uploadId THIS attempt mints. Backend v3.8 accepts a client-supplied id
+// (an opaque token, stored and enforced exactly like one it minted itself),
+// and that is what makes a lost saveBegin answer recoverable. The answer is
+// what carries the id; on a link where saveBegin itself outlives its deadline
+// the id never arrives, and without this the client re-begins forever — each
+// saveBegin wiping the staging area the attempt before it had just filled —
+// until the retry budget is spent and the user is told the cloud is "busy"
+// (the reported save that never completes). With a self-minted id the client
+// can RECOGNISE its own session in the lock-free status probe and carry on
+// from it. Older backends ignore the field and mint their own id, which the
+// client still adopts from the answer exactly as before.
+function spaxNewUploadId() {
+  return 'c' + Date.now().toString(36) + Math.floor(Math.random() * 0x100000000).toString(36);
+}
+
+// Is this deployment able to report the staging session (v3.8)? A backend
+// whose version already proved older is not asked — the probe would only cost
+// a request to be told there is no `session` field.
+function spaxBackendReportsSessions() {
+  try {
+    if (!cloudBackendVersion) return true; // unknown: ask once, it is one cheap probe
+    const v = parseFloat(String(cloudBackendVersion).replace(/[^0-9.]/g, ''));
+    return !isFinite(v) || v >= 3.8;
+  } catch (_) { return true; }
+}
+
+// Ask the lock-free status probe whether the uploadId this attempt minted is
+// the session the server is currently staging. A match is exact proof: the id
+// carries a per-attempt random component, so no other device (and no other
+// attempt) can own it. Returns a session to continue the upload with, or null
+// when the answer says the saveBegin never landed (or was superseded) — the
+// caller then falls back to its original error handling.
+async function spaxAdoptUploadSession(post, uploadId, mode, expect, basis) {
+  const st = await post({ action: 'status' }, CLOUD_TIMEOUT_DEFAULT, 0);
+  try { spaxNoteBackendVersion(st); } catch (_) {}
+  const sess = st && st.session;
+  if (!sess || String(sess.uploadId || '') !== String(uploadId)) return null;
+  // The mode is part of the session's meaning, not a detail: adopting a
+  // full-replace session as a delta (or the other way round) would make the
+  // commit count or swap the wrong rows. Refuse anything but an exact match.
+  if ((sess.mode || 'full') !== mode) return null;
+  // Stale staging belongs to a different era of this deployment; the boot
+  // resume already refuses sessions older than this, so an adoption does too.
+  const at = Number(sess.at) || 0;
+  if (at && Date.now() - at > CHUNK_SESSION_MAX_AGE_MS) return null;
+  return {
+    v: 2,
+    mode,
+    uploadId: String(uploadId),
+    ts: Date.now(),
+    expect,
+    basis,
+    // Slices this client never got to send begin at 0 again; a slice the
+    // server already staged is recognised by its seq and skipped, so nothing
+    // is staged twice and nothing is lost.
+    cursors: { transactions: 0 },
+    sent: 0
+  };
 }
 
 // mode 'full' stages every table and swaps the live sheets (the original
@@ -3015,12 +3171,17 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode, 
   showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + (mode === 'delta'
     ? ' · sending new rows in parts'
     : ' · large upload, sending in parts'));
-  let begin;
+  // The id this attempt will be recognised by, sent with the probe so the
+  // session can be recovered even when its answer never arrives (v3.8).
+  const myUploadId = spaxNewUploadId();
+  let begin = null;
+  let adopted = null;
   try {
     // httpRetries 0: this is a capability probe — a transient blip here
     // falls back to a path that works instead of paying the backoff.
     begin = await post(Object.assign({
       action: 'saveBegin',
+      uploadId: myUploadId,
       customers: payload.customers,
       monthly: payload.monthly,
       settings: payload.settings
@@ -3032,10 +3193,30 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode, 
     // the whole database as one request is exactly the doomed path chunking
     // exists to avoid.
     if (err) err.probeFailed = true;
-    throw err;
+    // …but first check whether the probe RAN anyway. A lost answer (this
+    // client's own deadline firing, or the network dropping mid-request)
+    // leaves the session staging the data server-side; asking the status
+    // probe whether the id we minted is live turns a lost answer back into a
+    // working upload instead of a fresh saveBegin that wipes it.
+    // Only a LOST answer is worth that extra request: a failure the server
+    // actually answered (HTTP 500, an edge 404 page) is a refusal, and the
+    // existing fallback — replanning under the one-shot path — is both
+    // cheaper and what the recovery tests pin.
+    const answerLost = isTimeoutError(err) || isTransientNetworkError(err);
+    if (answerLost && !(err && err.spaxCancelled) && spaxBackendReportsSessions()) {
+      try {
+        adopted = await spaxAdoptUploadSession(post, myUploadId, mode, expect, basis);
+      } catch (_) { adopted = null; }
+      if (adopted) {
+        showSyncStatus('⏳ Saving to cloud' + cloudSaveTag() + ' · recovered the interrupted upload — continuing where it stopped');
+      }
+    }
+    if (!adopted) throw err;
   }
-  // cloudRequest throws unless success === true, so reaching here means
-  // saveBegin was understood — the backend speaks the chunked protocol.
+  // Reaching here means either saveBegin was understood (cloudRequest throws
+  // otherwise) or its answer was lost and the status probe recovered the
+  // session it had already begun — both prove this backend speaks the
+  // chunked protocol.
   cloudChunks = true;
   cloudChunkProbed = true;
   try { localStorage.setItem('spaxCloudChunked', '1'); } catch (_) {}
@@ -3043,8 +3224,9 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode, 
     // A pre-v3.4 backend accepts the saveBegin but silently ignores the
     // unknown `mode` field — its staging semantics are full-replace, which
     // would refuse our partial commit. The echoed `delta:true` flag proves
-    // the backend is staging this session for an append.
-    if (!begin || begin.delta !== true) {
+    // the backend is staging this session for an append. (An adopted session
+    // was already proved to be a delta session by spaxAdoptUploadSession.)
+    if (!adopted && (!begin || begin.delta !== true)) {
       const err = new Error('unknown action: delta mode');
       err.probeFailed = true;
       throw err;
@@ -3055,8 +3237,9 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode, 
   }
   // Backend v3.0 mints an uploadId per upload session so a second device's
   // save can't interleave slices with ours. Older backends return none —
-  // echo '' and they ignore the field.
-  const session = {
+  // echo '' and they ignore the field. (An adopted session carries the id
+  // this attempt minted, which the server confirmed it is staging.)
+  const session = adopted || {
     v: 2,
     mode,
     uploadId: begin && begin.uploadId ? String(begin.uploadId) : '',
@@ -10766,7 +10949,7 @@ if('serviceWorker' in navigator){
         it can never interrupt an upload either.
    The footer stamps the build date this page is running, so anyone can see
    at a glance which build a phone is on. */
-const SPAX_BUILD_DATE = '2026-09-15'; // ← bump this on every merge
+const SPAX_BUILD_DATE = '2026-09-19'; // ← bump this on every merge
 
 (function spaxSwUpdateGuard(){
   if (typeof navigator === 'undefined' || !navigator.serviceWorker || !navigator.serviceWorker.addEventListener) return;

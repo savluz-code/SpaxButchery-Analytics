@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpaxButchery | Analytics v2.5</title>
+<title>SpaxButchery | Analytics v2.6</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
@@ -303,6 +303,8 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
       <button class="btn ghost" id="saveBaselineBtn">💾 Save Current as Local Baseline</button>
       <button class="btn ghost" id="restoreBaselineBtn">♻️ Restore Local Baseline</button>
       <button class="btn blue" id="exportSeedBtn">🧬 Export as JS Seed Code</button>
+      <button class="btn ghost" id="loadSeedBtn" title="Load a spax_seed_snapshot.js file saved by 'Export as JS Seed Code' — restores customers, monthly totals and transactions in full">📥 Load Seed Snapshot</button>
+      <input type="file" id="seedFileInput" accept=".js,.txt,.json" style="display:none">
       <button class="btn ghost" id="resetBtn" title="Restores the original report baseline in full — this is also how you undo a Delete All">↺ Reset to Original Report Data</button>
       <span style="color:var(--muted);font-size:.8rem" id="importLog"></span>
     </div>
@@ -10058,6 +10060,70 @@ async function restoreLocalBaseline(){
   }
 }
 window.restoreLocalBaseline = restoreLocalBaseline;
+/* ════════════ LOAD SEED SNAPSHOT (the 🧬 export's counterpart) ════════════ */
+// Parses a spax_seed_snapshot.js file (the "Export as JS Seed Code" output)
+// back into data. Scanning is bracket-balanced and string-aware: a lazy regex
+// would truncate on a name that contains "];" or braces inside quotes.
+function spaxParseSeedSnapshot_(text) {
+  function grabConst(name) {
+    const m = text.match(new RegExp('const\\s+' + name + '\\s*='));
+    if (!m) throw new Error('missing constant ' + name);
+    let i = text.indexOf(m[0]) + m[0].length;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    const open = text[i];
+    if (open !== '[' && open !== '{') throw new Error(name + ': expected [ or {');
+    const close = open === '[' ? ']' : '}';
+    let depth = 0, inStr = false, esc = false;
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === open || ch === close) {
+        depth += ch === open ? 1 : -1;
+        if (depth === 0) return JSON.parse(text.slice(i, j + 1));
+      }
+    }
+    throw new Error(name + ': unterminated');
+  }
+  return {
+    customers: grabConst('SEED_SNAPSHOT_CUSTOMERS'),
+    monthly: grabConst('SEED_SNAPSHOT_MONTHLY'),
+    transactions: grabConst('SEED_SNAPSHOT_TRANSACTIONS'),
+    customerTx: grabConst('SEED_SNAPSHOT_CUSTOMER_TX')
+  };
+}
+async function handleSeedSnapshotFile(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  let snap;
+  try { snap = spaxParseSeedSnapshot_(await file.text()); }
+  catch (e) { toast('❌ Not a valid seed snapshot: ' + e.message); input.value = ''; return; }
+  const nC = (snap.customers || []).length, nT = (snap.transactions || []).length, nH = Object.keys(snap.customerTx || {}).length;
+  if (!nC) { toast('❌ Snapshot has no customers'); input.value = ''; return; }
+  const cur = (DB && DB.customers ? DB.customers.length : 0);
+  if (!confirm('Load seed snapshot?\n\n' + nC + ' customers, ' + nT + ' transactions, ' + nH + ' customer-history rows.\n\nThis OVERWRITES the current data (' + cur + ' customers) AND the saved local baseline, and the next save fully replaces the cloud sheets.')) { input.value = ''; return; }
+  const next = {
+    customers: snap.customers,
+    monthly: snap.monthly || {},
+    transactions: snap.transactions || [],
+    customerTx: snap.customerTx || {},
+    seen: {}
+  };
+  if (DB && DB.tombstones) next.tombstones = DB.tombstones; // dedupe tombstones stay viral
+  DB = next;
+  rebuildCustomerHistory();
+  spaxMarkTxFullReplace(); // snapshot may lack rows the cloud still holds → full replace, never append
+  await saveLocalBaseline(); // the snapshot becomes the durable baseline too
+  save();
+  $('importLog').textContent = '🧬 Snapshot loaded: ' + nC + ' customers, ' + nT + ' transactions @ ' + new Date().toLocaleString('en-GB');
+  toast('🧬 Seed snapshot loaded');
+  input.value = '';
+}
 // Serialize the live DB into a paste-ready JS seed snapshot (customers + monthly
 // + transactions + customer history).
 function buildSeedCode(){
@@ -10099,6 +10165,8 @@ window.exportJSSeedCode = exportJSSeedCode;
 if ($('saveBaselineBtn')) $('saveBaselineBtn').onclick = saveLocalBaseline;
 if ($('restoreBaselineBtn')) $('restoreBaselineBtn').onclick = restoreLocalBaseline;
 if ($('exportSeedBtn')) $('exportSeedBtn').onclick = exportJSSeedCode;
+if ($('loadSeedBtn')) $('loadSeedBtn').onclick = () => $('seedFileInput').click();
+if ($('seedFileInput')) $('seedFileInput').onchange = handleSeedSnapshotFile;
 /* ══════════ EXTERNAL AI (your own accounts) ══════════ */
 const AI_URLS={
   chatgpt:q=>'https://chatgpt.com/?q='+encodeURIComponent(q),

@@ -74,11 +74,23 @@ function syncLayerSource() {
  * `failBeginTimes: N` makes the first N saveBegin probes die with an HTTP
  * error — a transient failure that must fall back to saveAll without
  * poisoning the capability cache.
+ * `v38: true` makes the deployment speak v3.8: a client-minted uploadId on
+ * saveBegin is honoured (the session is stored under it and reported by
+ * `status`), so a client whose saveBegin ANSWER was lost can recognise the
+ * session it already began. `slowActionMs: {saveBegin: 150}` keeps an
+ * action's answer pending past the client's own deadline: the client aborts,
+ * while the work the request asked for has already run server-side — exactly
+ * what Apps Script does when an execution outlives the request that started
+ * it. `busyChunkOnce: true` answers every slice's FIRST delivery with the
+ * backend-busy refusal (as a lock collision does) so a later delivery of the
+ * same slice stages it.
  */
-function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDeltaMode = false, failChunk = 0, dropChunk = 0, doubleSend = 0, failBeginTimes = 0 } = {}) {
+function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDeltaMode = false, failChunk = 0, dropChunk = 0, doubleSend = 0, failBeginTimes = 0, v38 = false, slowActionMs = {}, busyChunkOnce = false } = {}) {
+  const busySeen = new Set(); // slices already refused once (see busyChunkOnce)
   const calls = [];
   const staged = { transactions: [], customerTx: [], seen: [] };
   const stagedSeqs = new Set(); // (table, seq) pairs already staged this session
+  let currentSession = null;    // the session v3.8's status answers with
   const store = {};
   // What the LIVE Transactions sheet holds. Full saves replace it (swap);
   // deltas append with identity dedup.
@@ -86,6 +98,28 @@ function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDelta
   let chunkNo = 0;
   let beginNo = 0;
   const respond = (body) => ({ ok: true, text: async () => JSON.stringify(body) });
+  // Resolve `false` after ms, or `true` as soon as the caller's signal aborts.
+  const waitOrAbort = (ms, signal) => new Promise((resolve) => {
+    if (!signal) { setTimeout(() => resolve(false), ms); return; }
+    if (signal.aborted) { resolve(true); return; }
+    const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(false); }, ms);
+    function onAbort() { clearTimeout(timer); resolve(true); }
+    signal.addEventListener('abort', onAbort);
+  });
+  const abortError = () => {
+    const e = new Error('The operation was aborted.');
+    e.name = 'AbortError';
+    return e;
+  };
+  // Hold an action's (already computed) answer for slowActionMs[action] ms —
+  // the client may give up first, but what the request DID has already
+  // happened, exactly like an Apps Script execution outliving its request.
+  const delayAnswer = async (answer, action, signal) => {
+    const ms = slowActionMs[action] || 0;
+    if (!ms) return answer;
+    if (await waitOrAbort(ms, signal)) throw abortError();
+    return answer;
+  };
   const txKey = (r) => {
     const rc = String(r.receipt || '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
     if (rc) return 'R|' + rc + '|' + String(r.date || '') + '|' + (r.time || '');
@@ -120,6 +154,26 @@ function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDelta
       const result = appendLive(body.txAdd || []);
       return respond({ success: true, added: result.added, skippedDuplicates: result.skipped, transactions: live.transactions.length });
     }
+    if (body.action === 'status') {
+      if (!v38) return respond({ success: false, error: 'unknown action' });
+      // Lock-free, exactly like the real status_: the session the newest
+      // saveBegin started, whether or not its answer ever reached the caller.
+      return respond({
+        success: true,
+        version: '3.8',
+        txRows: live.transactions.length,
+        session: currentSession ? {
+          uploadId: currentSession.uploadId,
+          at: currentSession.at,
+          mode: currentSession.mode,
+          staged: {
+            transactions: staged.transactions.length,
+            customerTx: staged.customerTx.length,
+            seen: staged.seen.length
+          }
+        } : null
+      });
+    }
     if (body.action === 'saveBegin') {
       if (!chunked) return respond({ success: false, error: 'unknown action' });
       beginNo += 1;
@@ -128,12 +182,25 @@ function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDelta
       staged.transactions = []; staged.customerTx = []; staged.seen = [];
       stagedSeqs.clear();
       live.mode = body.mode === 'delta' ? 'delta' : 'full';
+      // v3.8 honours the id the client minted (anything that is not an opaque
+      // token is ignored and the server mints its own, like the real script).
+      const mintedId = v38 && /^[A-Za-z0-9_-]{6,80}$/.test(String(body.uploadId || ''))
+        ? String(body.uploadId)
+        : (uploadIds ? 'upload-123' : '');
+      if (v38) currentSession = { uploadId: mintedId, at: Date.now(), mode: live.mode };
       // A pre-v3.4 chunked backend accepts saveBegin but silently ignores the
       // unknown `mode` field: it answers WITHOUT the delta echo, which is how
       // the client tells the two apart.
       const wantsDelta = body.mode === 'delta';
       const echoDelta = wantsDelta && delta && !ignoreDeltaMode;
-      return respond({ success: true, ...(uploadIds ? { uploadId: 'upload-123' } : {}), ...(echoDelta ? { delta: true } : {}) });
+      const answerId = v38 ? mintedId : (uploadIds ? 'upload-123' : '');
+      // slowActionMs.saveBegin holds the ANSWER: the session above is already
+      // live (and wiped the previous staging area) even when the client gives
+      // up waiting for the reply.
+      return delayAnswer(
+        respond({ success: true, ...(answerId ? { uploadId: answerId } : {}), ...(echoDelta ? { delta: true } : {}) }),
+        'saveBegin', options && options.signal
+      );
     }
     if (body.action === 'saveChunk') {
       chunkNo += 1;
@@ -143,6 +210,12 @@ function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDelta
         return respond({ success: false, error: 'delta uploads append transactions only' });
       }
       if (failChunk === chunkNo) return respond({ success: false, error: 'chunk write failed' });
+      // A lock collision: the slice is refused BEFORE anything is staged (the
+      // real backendBusy_ answer), so re-delivering it later stages it.
+      if (busyChunkOnce && !busySeen.has(body.table + ':' + body.seq)) {
+        busySeen.add(body.table + ':' + body.seq);
+        return respond({ success: false, error: 'backend busy with another save — please retry the save' });
+      }
       // `doubleSend` hands the SAME POST to the backend twice — what a
       // retrying proxy or a second tab does. The v3.2 seq bookkeeping makes the
       // second copy a no-op; a backend without it stages the slice twice and
@@ -162,7 +235,8 @@ function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDelta
       return respond(res);
     }
     if (body.action === 'saveCommit') {
-      if (uploadIds && body.uploadId !== 'upload-123') {
+      const wantId = v38 ? ((currentSession && currentSession.uploadId) || '') : 'upload-123';
+      if (uploadIds && body.uploadId !== wantId) {
         return respond({ success: false, error: 'upload superseded by a newer save — please retry the whole save' });
       }
       if (body.mode === 'delta' || live.mode === 'delta') {
@@ -196,7 +270,7 @@ function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDelta
     if (body.action === 'saveAll') {
       // Atomic stage+swap, exactly like the real backend.
       live.transactions = (body.transactions || []).slice();
-      return respond({ success: true });
+      return delayAnswer(respond({ success: true }), 'saveAll', options && options.signal);
     }
     return respond({ success: false, error: 'unknown action' });
   };
@@ -222,7 +296,7 @@ function makeSandbox(cloud, db, status) {
   };
 }
 
-async function runClient(cloud, db, { saveTwice = false, fastBusy = false } = {}) {
+async function runClient(cloud, db, { saveTwice = false, fastBusy = false, patch = [] } = {}) {
   const status = [];
   const ctx = vm.createContext(makeSandbox(cloud, db, status));
   // Busy-retry backoffs are multi-second in production (outlast a server-side
@@ -235,6 +309,10 @@ async function runClient(cloud, db, { saveTwice = false, fastBusy = false } = {}
       'const CLOUD_BUSY_RETRY_DELAYS = [5, 5, 5, 5, 5, 5];'
     );
   }
+  // Tests that exercise the ADAPTIVE DEADLINES shrink them to milliseconds
+  // (the real ones are tens of seconds) so a timeout round is observable
+  // without wall-clock waits.
+  for (const [re, to] of patch) src = src.replace(re, to);
   vm.runInContext(src, ctx);
   const first = await ctx.saveToCloud(true);
   const second = saveTwice ? await ctx.saveToCloud(true) : undefined;
@@ -699,6 +777,82 @@ test('a transient probe failure falls back to one saveAll without poisoning the 
   assert.strictEqual(actions[actions.length - 1], 'saveCommit');
   assert.strictEqual(second, true);
   assert.strictEqual(cloud.store.spaxCloudChunked, '1');
+});
+
+test('a saveBegin whose answer outlives the client deadline is recovered, never re-begun', async () => {
+  // The reported failure: on a link where ONE step takes longer than its own
+  // deadline, saveBegin is aborted client-side — but Apps Script keeps
+  // executing, so the session it started is live (staging the small tables
+  // under the id the client sent). Before v3.8 every retry sent a NEW
+  // saveBegin, which wiped exactly that staging area and timed out again:
+  // same input, same deadline, same abort, forever — and the user was finally
+  // told the cloud was "busy". With the client-minted id the lock-free status
+  // probe recognises the session and the upload continues from it.
+  const cloud = makeCloud({ v38: true, slowActionMs: { saveBegin: 150 } });
+  const { first, ctx } = await runClient(cloud, bigDB(), {
+    fastBusy: true,
+    patch: [
+      [/const CLOUD_TIMEOUT_CHUNK = 60000;/, 'const CLOUD_TIMEOUT_CHUNK = 40;'],
+      [/const CLOUD_TIMEOUT_DEFAULT = 30000;/, 'const CLOUD_TIMEOUT_DEFAULT = 20;']
+    ]
+  });
+
+  assert.strictEqual(first, true, 'the save must complete');
+  const actions = cloud.calls.map((c) => c.action);
+  assert.strictEqual(actions.filter((a) => a === 'saveBegin').length, 1,
+    'the lost answer must be recovered from the session, not answered with a fresh saveBegin');
+  assert.strictEqual(actions[0], 'saveBegin');
+  assert.strictEqual(actions[1], 'status', 'the lock-free status probe recovers the session');
+  assert.strictEqual(actions[actions.length - 1], 'saveCommit');
+  assert.ok(actions.includes('saveChunk'), 'the upload continues in slices');
+  assert.strictEqual(cloud.live.transactions.length, 3000, 'every row must land');
+  assert.ok(cloud.store.spaxPushedTx_v1, 'the confirmed push is recorded locally');
+  assert.strictEqual(vm.runInContext('spaxLoadUploadSession()', ctx), null,
+    'a committed save leaves no interrupted session behind');
+});
+
+test('a step that needs longer than its deadline gets a wider one instead of the same wall again', async () => {
+  // The other half of the same report: no answer was lost here — the link is
+  // simply slower than the step's deadline. Retrying at the same deadline
+  // would abort at the same moment forever, so the client widens the deadline
+  // for the attempts that follow and the save converges.
+  const cloud = makeCloud({ chunked: false, slowActionMs: { saveAll: 55 } });
+  const db = bigDB();
+  db.transactions = db.transactions.slice(0, 5); // small save → one-shot saveAll
+  const { first } = await runClient(cloud, db, {
+    fastBusy: true,
+    patch: [
+      [/const CLOUD_TIMEOUT_SMALL = 60000;/, 'const CLOUD_TIMEOUT_SMALL = 40;'],
+      [/const CLOUD_TIMEOUT_BIG_SAVE = 180000;/, 'const CLOUD_TIMEOUT_BIG_SAVE = 40;'],
+      // The probe stays BELOW the heavy step's base so its (fast) answer can
+      // never hand back the time the slow saveAll needed.
+      [/const CLOUD_TIMEOUT_DEFAULT = 30000;/, 'const CLOUD_TIMEOUT_DEFAULT = 20;']
+    ]
+  });
+
+  assert.strictEqual(first, true, 'the widened deadline must let the slow save land');
+  const saveAlls = cloud.calls.filter((c) => c.action === 'saveAll');
+  assert.strictEqual(saveAlls.length, 2, 'one aborted attempt, one widened retry');
+  assert.strictEqual(cloud.live.transactions.length, 5);
+});
+
+test('a chunked upload that keeps landing slices gets its retry budget back', async () => {
+  // Every slice's FIRST delivery is refused with the backend-busy answer (a
+  // lock collision), so the upload only advances one slice per retry round.
+  // A fixed budget of eight rounds would give up after the eighth — on a big
+  // database that is a save that "never completes", because each round DID
+  // move rows: the budget exists to outlast a writer that is holding the
+  // lock, not to cap a resumable upload that is making progress.
+  const cloud = makeCloud({ busyChunkOnce: true });
+  const { first, status } = await runClient(cloud, bigDB(), {
+    fastBusy: true,
+    patch: [[/const CHUNK_ROWS = 2000;/, 'const CHUNK_ROWS = 300;']]
+  });
+
+  assert.strictEqual(first, true, 'a progressing upload must not be capped out');
+  assert.strictEqual(cloud.live.transactions.length, 3000, 'every slice landed');
+  const busyRounds = status.filter((m) => /waiting on the cloud/.test(m)).length;
+  assert.ok(busyRounds > 8, 'more rounds than the fixed budget proves the budget was restarted (' + busyRounds + ')');
 });
 
 test('forced saves queue behind each other — never two requests in flight', async () => {

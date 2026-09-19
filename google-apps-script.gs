@@ -1,6 +1,23 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.7  (2026-09-15)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.8  (2026-09-19)
  * ─────────────────────────────────────────────────────────────────
+ * v3.8 makes a LOST saveBegin answer recoverable, so a save that outlives
+ * one of its own requests converges instead of restarting forever:
+ *   • A client may mint the session's uploadId itself (an `uploadId` field
+ *     on action=saveBegin). It is stored and enforced exactly like one the
+ *     script mints; anything that is not a 6–80 character opaque token is
+ *     ignored and the script mints its own, so a client that sends nothing
+ *     or nonsense is unaffected.
+ *   • action=status reports the session the newest saveBegin started —
+ *     `session` = {uploadId, at, mode, staged} — without taking the script
+ *     lock, like every other status answer.
+ *   • Together they let a client whose saveBegin request outlived its own
+ *     deadline (or whose reply the network dropped) recognise the session it
+ *     already began and CONTINUE it, instead of sending a fresh saveBegin
+ *     that wipes the staging area the previous attempt had just filled —
+ *     which is how a slow-but-alive upload used to burn its whole retry
+ *     budget and look like a save that never completes. An older client
+ *     ignores both additions.
  * v3.7 adds TARGETED CUSTOMER EDITS (action=updateCustomer):
  *   • Editing one contact in the Contact Resolver used to cost a whole-
  *     database upload: a rename rewrites the customer's name on every one of
@@ -170,7 +187,7 @@ var TABLE_HEADERS = {
      • waitLock's answer is honoured: a save that cannot get the script lock is
        refused instead of running alongside the writer that holds it. */
 
-var BACKEND_VERSION = '3.7';
+var BACKEND_VERSION = '3.8';
 
 var STAGE_SUFFIX = '_Staging';
 var SWAP_TMP_SUFFIX = '_SwapTmp';
@@ -179,6 +196,9 @@ var CHUNK_SEQ_KEY = 'spaxChunkSeqs';
 // The newest uploadId any saveBegin minted (authoritative supersession guard
 // — the script cache above it may be evicted at any time).
 var LAST_BEGIN_KEY = 'spaxLastBeginUpload';
+// When that saveBegin ran (v3.8) — reported by status_ so a client can tell a
+// session of its own that is still fresh from one that is stale/superseded.
+var LAST_BEGIN_AT_KEY = 'spaxLastBeginAt';
 // The uploadId of the last COMMITTED chunked save (duplicate-commit guard).
 var COMMITTED_KEY = 'spaxCommittedUpload';
 // Receipt of the last successful save (see recordSaveReceipt_).
@@ -403,8 +423,50 @@ function status_() {
     version: BACKEND_VERSION,
     txRows: txRows,
     customersRows: customersRows,
-    lastSave: lastSaveReceipt_()
+    lastSave: lastSaveReceipt_(),
+    // v3.8: the staging session the newest saveBegin started. A client whose
+    // saveBegin answer was lost asks for this to recognise the session its
+    // own uploadId created and continue it (see saveBegin_). The mode and the
+    // staged counts let it refuse anything that is not a continuation of its
+    // own upload.
+    session: currentSessionInfo_()
   };
+}
+
+// The session the newest saveBegin started, as `status` reports it. Lock-free
+// and best-effort by design: a status probe must never fail and must never
+// invent a session it cannot read.
+function currentSessionInfo_() {
+  try {
+    var uploadId = String(PropertiesService.getScriptProperties().getProperty(LAST_BEGIN_KEY) || '');
+    if (!uploadId) return null;
+    var at = Number(PropertiesService.getScriptProperties().getProperty(LAST_BEGIN_AT_KEY)) || 0;
+    var state = null;
+    try {
+      var raw = PropertiesService.getScriptProperties().getProperty(CHUNK_SEQ_KEY);
+      if (raw) state = JSON.parse(raw);
+    } catch (seqErr) { state = null; }
+    var staged = {};
+    Object.keys(BIG_TABLES).forEach(function (table) {
+      try {
+        var sheet = stagingSheet_(SHEETS[table]);
+        staged[table] = sheet ? Math.max(0, sheet.getLastRow() - 1) : 0;
+      } catch (sheetErr) { staged[table] = -1; }
+    });
+    return {
+      uploadId: uploadId,
+      at: at,
+      mode: (state && String(state.uploadId) === uploadId && state.delta) ? 'delta' : 'full',
+      staged: staged
+    };
+  } catch (err) { return null; }
+}
+
+// An opaque session token: 6-80 characters of [A-Za-z0-9_-]. Anything else is
+// refused and the server mints its own (see saveBegin_).
+function cleanUploadId_(v) {
+  var s = String(v == null ? '' : v);
+  return /^[A-Za-z0-9_-]{6,80}$/.test(s) ? s : '';
 }
 
 // The receipt of the last successful save, or null when no v3.6 save has
@@ -622,7 +684,14 @@ function saveBegin_(body) {
     stageSmallTables_(body, false);
     // Big staging sheets are reset to header-only and filled by saveChunk.
     resetStaging_();
-    var uploadId = Utilities.getUuid();
+    // v3.8: a client that can mint its own session id sends one. It is stored
+    // and enforced exactly like a server-minted id, and that is what lets a
+    // client whose saveBegin ANSWER was lost (its own deadline on a slow
+    // link, or the network dropping the reply) find this session again via
+    // status_ and continue it, instead of re-beginning and wiping the
+    // staging area it had just filled. Anything that is not a plain opaque
+    // token is ignored and the id is minted here as before.
+    var uploadId = cleanUploadId_(body && body.uploadId) || Utilities.getUuid();
     try {
       CacheService.getScriptCache().put(UPLOAD_KEY, uploadId, 3600);
     } catch (cacheErr) { /* best-effort session guard only */ }
@@ -632,6 +701,9 @@ function saveBegin_(body) {
     try {
       PropertiesService.getScriptProperties().setProperty(LAST_BEGIN_KEY, uploadId);
     } catch (propErr) { /* best-effort — the cache check remains */ }
+    try {
+      PropertiesService.getScriptProperties().setProperty(LAST_BEGIN_AT_KEY, String(new Date().getTime()));
+    } catch (propErr2) { /* best-effort — only the recovery probe reads it */ }
     // A delta session chunks ONLY new transactions and appends them at
     // commit; a full (default) session stages every big table and swaps the
     // live sheets. The mode rides the same per-upload Script Properties

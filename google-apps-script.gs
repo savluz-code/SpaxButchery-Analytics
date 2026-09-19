@@ -1,6 +1,27 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.8  (2026-09-19)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.9  (2026-09-19)
  * ─────────────────────────────────────────────────────────────────
+ * v3.9 moves the save lock from the script lock to the user lock, and makes
+ * every save answer carry its own server-side timings:
+ *   • This web app always executes as its owner ("Execute as: Me"), so every
+ *     execution — any device, any tab, editor runs — holds the SAME user
+ *     lock, and serialisation is identical to the script lock. What changes
+ *     is only WHICH lock object guards the saves: a deployment whose script
+ *     lock is stuck (waitLock failing with no writer behind it — executions
+ *     complete in under a second, yet every save answers "backend busy",
+ *     surviving even a redeploy) gets a fresh, un-stuck lock without moving
+ *     projects or data.
+ *   • Every save answer now echoes `srv`: {wait, work} in milliseconds —
+ *     how long the execution waited for the lock and how long it worked.
+ *     Busy answers carry {wait} too. A refusal that cost ~30s of waiting is
+ *     genuine contention; one that cost ~0s failed instantly with no holder
+ *     (stuck lock / LockService failure) — the client shows the number, so a
+ *     busy storm is diagnosable from the app instead of by guessing.
+ *   • action=status additionally reports `lock`: {free, ms} — a non-blocking
+ *     read of the save lock (acquired and released immediately when free,
+ *     never waited on), so the app can show whether the lock is free RIGHT
+ *     NOW without spending a save attempt to find out.
+ * Older clients ignore the extra fields; the busy error string is unchanged.
  * v3.8 makes a LOST saveBegin answer recoverable, so a save that outlives
  * one of its own requests converges instead of restarting forever:
  *   • A client may mint the session's uploadId itself (an `uploadId` field
@@ -187,7 +208,7 @@ var TABLE_HEADERS = {
      • waitLock's answer is honoured: a save that cannot get the script lock is
        refused instead of running alongside the writer that holds it. */
 
-var BACKEND_VERSION = '3.8';
+var BACKEND_VERSION = '3.9';
 
 var STAGE_SUFFIX = '_Staging';
 var SWAP_TMP_SUFFIX = '_SwapTmp';
@@ -429,7 +450,9 @@ function status_() {
     // own uploadId created and continue it (see saveBegin_). The mode and the
     // staged counts let it refuse anything that is not a continuation of its
     // own upload.
-    session: currentSessionInfo_()
+    session: currentSessionInfo_(),
+    // v3.9: non-blocking read of the save lock itself (see spaxLockProbe_).
+    lock: spaxLockProbe_()
   };
 }
 
@@ -502,8 +525,9 @@ function recordSaveReceipt_(body, txCount) {
 // only after all writes succeed — an aborted or timed-out execution leaves
 // the live database at its previous, complete state instead of truncating it.
 function saveAll_(body) {
-  var lock = LockService.getScriptLock();
-  if (!lock.waitLock(30000)) return backendBusy_();
+  var held = spaxTakeSaveLock_();
+  if (!held.lock) return backendBusy_(held.waited);
+  var tWork = new Date().getTime();
   try {
     prepareStaging_();
     // Only the small tables can be skipped (a table the client re-sends
@@ -516,8 +540,9 @@ function saveAll_(body) {
     // Every sheet is swapped: a client whose response never arrived can now
     // be told its save landed (see status_).
     recordSaveReceipt_(body, (body.transactions || []).length);
+    return spaxWithSrv_({ success: true }, held, tWork);
   } finally {
-    lock.releaseLock();
+    held.lock.releaseLock();
   }
 }
 
@@ -542,8 +567,9 @@ function saveAll_(body) {
    sheet that made the stage-then-swap protocol necessary for full saves. */
 
 function saveDelta_(body) {
-  var lock = LockService.getScriptLock();
-  if (!lock.waitLock(30000)) return backendBusy_();
+  var held = spaxTakeSaveLock_();
+  if (!held.lock) return backendBusy_(held.waited);
+  var tWork = new Date().getTime();
   try {
     prepareStaging_();
     var swapped = stageSmallTables_(body, true);
@@ -558,14 +584,14 @@ function saveDelta_(body) {
     // sheet header-only for the next chunked session.
     writeObjects_(stagingSheet_(SHEETS.transactions), [], TABLE_HEADERS.transactions);
     recordSaveReceipt_(body, result.total);
-    return {
+    return spaxWithSrv_({
       success: true,
       added: result.added,
       skippedDuplicates: result.skipped,
       transactions: result.total
-    };
+    }, held, tWork);
   } finally {
-    lock.releaseLock();
+    held.lock.releaseLock();
   }
 }
 
@@ -581,8 +607,9 @@ function saveDelta_(body) {
 function updateCustomer_(body) {
   var edits = (body && body.edits) || [];
   if (!edits.length) return { success: true, customersUpdated: 0, customersAdded: 0, transactionsRenamed: 0 };
-  var lock = LockService.getScriptLock();
-  if (!lock.waitLock(30000)) return backendBusy_();
+  var held = spaxTakeSaveLock_();
+  if (!held.lock) return backendBusy_(held.waited);
+  var tWork = new Date().getTime();
   try {
     ensureSheets_();
     var ss = getSpreadsheet_();
@@ -666,17 +693,18 @@ function updateCustomer_(body) {
         }
       }
     }
-    return { success: true, customersUpdated: updated, customersAdded: added, transactionsRenamed: renamed };
+    return spaxWithSrv_({ success: true, customersUpdated: updated, customersAdded: added, transactionsRenamed: renamed }, held, tWork);
   } finally {
-    lock.releaseLock();
+    held.lock.releaseLock();
   }
 }
 
 /* ── chunked actions ── */
 
 function saveBegin_(body) {
-  var lock = LockService.getScriptLock();
-  if (!lock.waitLock(30000)) return backendBusy_();
+  var held = spaxTakeSaveLock_();
+  if (!held.lock) return backendBusy_(held.waited);
+  var tWork = new Date().getTime();
   try {
     prepareStaging_();
     // No skip here: a chunked session stages now and swaps at commit,
@@ -714,9 +742,9 @@ function saveBegin_(body) {
     resetChunkSeqs_(uploadId, isDelta);
     var answer = { success: true, uploadId: uploadId };
     if (isDelta) answer.delta = true;
-    return answer;
+    return spaxWithSrv_(answer, held, tWork);
   } finally {
-    lock.releaseLock();
+    held.lock.releaseLock();
   }
 }
 
@@ -728,12 +756,13 @@ function saveChunk_(body) {
   if (!uploadSessionCurrent_(body.uploadId)) {
     return { success: false, error: 'upload superseded by a newer save — please retry the whole save' };
   }
-  var lock = LockService.getScriptLock();
-  if (!lock.waitLock(30000)) return backendBusy_();
+  var held = spaxTakeSaveLock_();
+  if (!held.lock) return backendBusy_(held.waited);
+  var tWork = new Date().getTime();
   try {
     var sheet = stagingSheet_(SHEETS[table]);
     if (!sheet) {
-      return { success: false, error: 'no upload in progress — saveBegin must run before saveChunk' };
+      return spaxWithSrv_({ success: false, error: 'no upload in progress — saveBegin must run before saveChunk' }, held, tWork);
     }
     // A delta session appends transactions only — the other big tables are
     // derivable caches the client never uploads anymore. Routing one of them
@@ -750,18 +779,18 @@ function saveChunk_(body) {
     // arrives (a client retry, a proxy replay, a second tab). Appending it
     // again is what produced "staged 5344 rows, expected 3672".
     if (hasSeq && chunkAlreadyStaged_(body.uploadId, table, seq)) {
-      return { success: true, written: 0, duplicate: true };
+      return spaxWithSrv_({ success: true, written: 0, duplicate: true }, held, tWork);
     }
     var rows = body.rows || [];
     if (!rows.length) {
       if (hasSeq) recordChunkSeq_(body.uploadId, table, seq);
-      return { success: true, written: 0 };
+      return spaxWithSrv_({ success: true, written: 0 }, held, tWork);
     }
     appendObjects_(sheet, rows, TABLE_HEADERS[table]);
     if (hasSeq) recordChunkSeq_(body.uploadId, table, seq);
-    return { success: true, written: rows.length };
+    return spaxWithSrv_({ success: true, written: rows.length }, held, tWork);
   } finally {
-    lock.releaseLock();
+    held.lock.releaseLock();
   }
 }
 
@@ -780,8 +809,9 @@ function saveCommit_(body) {
   if (body.uploadId && committedUploadId_() === String(body.uploadId)) {
     return { success: true, duplicate: true };
   }
-  var lock = LockService.getScriptLock();
-  if (!lock.waitLock(30000)) return backendBusy_();
+  var held = spaxTakeSaveLock_();
+  if (!held.lock) return backendBusy_(held.waited);
+  var tWork = new Date().getTime();
   try {
     // Delta sessions append new transactions instead of swapping tables —
     // they have their own commit (append + dedup, then swap only the small
@@ -789,7 +819,7 @@ function saveCommit_(body) {
     // too, so losing the session bookkeeping can never make a delta commit
     // swap the live Transactions sheet for a staging sheet holding only the
     // appended rows.
-    if (body.mode === 'delta' || sessionIsDelta_(body.uploadId)) return commitDelta_(body);
+    if (body.mode === 'delta' || sessionIsDelta_(body.uploadId)) return spaxWithSrv_(commitDelta_(body), held, tWork);
     // 1) Verify every promised row landed BEFORE touching any live sheet.
     var expect = body.expect || {};
     var tables = Object.keys(BIG_TABLES);
@@ -802,11 +832,11 @@ function saveCommit_(body) {
         // Leave nothing stale behind: the retry starts from an empty staging
         // area instead of inheriting the rows this attempt left lying around.
         resetStaging_();
-        return {
+        return spaxWithSrv_({
           success: false,
           error: 'chunk mismatch on ' + table + ': staged ' + staged + ' rows, expected ' + want +
                  ' — live data left untouched, please retry the save'
-        };
+        }, held, tWork);
       }
     }
     // 2) Counts are exact — swap every live sheet for its staging copy.
@@ -815,9 +845,9 @@ function saveCommit_(body) {
     try { PropertiesService.getScriptProperties().deleteProperty(CHUNK_SEQ_KEY); } catch (propsErr) {}
     rememberCommittedUpload_(body.uploadId);
     recordSaveReceipt_(body, Number((body.expect || {}).transactions || 0));
-    return { success: true };
+    return spaxWithSrv_({ success: true }, held, tWork);
   } finally {
-    lock.releaseLock();
+    held.lock.releaseLock();
   }
 }
 
@@ -864,11 +894,69 @@ function commitDelta_(body) {
   };
 }
 
-// waitLock returning false means another writer still holds the script lock.
+// waitLock returning false means another writer still holds the save lock.
 // Proceeding anyway is how two saves interleave their renames, so refuse the
 // request instead — the client's next save retries with the latest data.
-function backendBusy_() {
-  return { success: false, error: 'backend busy with another save — please retry the save' };
+//
+// v3.9: the save lock is the USER lock, not the script lock (see the header —
+// identical serialisation for an Execute-as-Me web app, but a fresh lock
+// object for deployments whose script lock is stuck). Every acquisition is
+// timed: the wait rides every answer as `srv`, so the client can tell a
+// refusal that waited ~30s behind a real writer from one that failed
+// instantly with no holder. A LockService EXCEPTION (service error) is also
+// answered as busy — with a ~0s wait as the tell — because the client's
+// busy path backs off and retries, while any other failure kills the save
+// outright, and a service blip must never kill a save.
+function spaxTakeSaveLock_() {
+  var t0 = new Date().getTime();
+  var lock = null;
+  var ok = false;
+  try {
+    lock = LockService.getUserLock();
+    ok = lock.waitLock(30000);
+  } catch (err) {
+    ok = false;
+  }
+  var waited = new Date().getTime() - t0;
+  if (!ok) return { lock: null, waited: waited };
+  return { lock: lock, waited: waited };
+}
+
+// Attach the server-side timing to an in-lock answer. Pre-lock refusals
+// (unknown table, superseded session) carry none — no lock was involved.
+function spaxWithSrv_(answer, held, tWork) {
+  if (answer && typeof answer === 'object' && !answer.srv) {
+    answer.srv = { wait: held.waited, work: new Date().getTime() - Number(tWork || 0) };
+  }
+  return answer;
+}
+
+function backendBusy_(waitedMs) {
+  var ans = { success: false, error: 'backend busy with another save — please retry the save' };
+  if (waitedMs !== undefined && waitedMs !== null) ans.srv = { wait: waitedMs };
+  return ans;
+}
+
+// Non-blocking read of the save lock for action=status: acquired and
+// released immediately when free, never waited on, never allowed to fail
+// the probe. Tells the app whether the lock is free RIGHT NOW.
+function spaxLockProbe_() {
+  try {
+    var t0 = new Date().getTime();
+    var free = false;
+    try {
+      var probe = LockService.getUserLock();
+      free = !!probe.tryLock(0);
+      if (free) {
+        try { probe.releaseLock(); } catch (relErr) { /* held for ~0ms; harmless */ }
+      }
+    } catch (tryErr) {
+      return { free: false, ms: new Date().getTime() - t0 };
+    }
+    return { free: free, ms: new Date().getTime() - t0 };
+  } catch (err) {
+    return { free: false, ms: -1 };
+  }
 }
 
 /* ── staging helpers ── */

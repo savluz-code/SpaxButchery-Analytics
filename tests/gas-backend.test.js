@@ -138,10 +138,15 @@ function makeEnv({ lockBusy = false } = {}) {
       })
     },
     LockService: {
-      // Apps Script's waitLock returns a boolean: false means another writer
-      // still holds the lock and this execution must NOT proceed.
-      getScriptLock: () => ({
+      // Backend v3.9 guards saves with the USER lock (identical serialisation
+      // for an Execute-as-Me web app — every execution runs as the owner).
+      // getScriptLock is intentionally absent: touching it throws, which
+      // fails the test and proves the migration is complete. waitLock
+      // returns a boolean: false means another writer still holds the lock
+      // and this execution must NOT proceed.
+      getUserLock: () => ({
         waitLock: () => !lockBusy,
+        tryLock: () => !lockBusy,
         releaseLock: () => {},
         hasLock: () => !lockBusy
       })
@@ -181,7 +186,13 @@ function makeEnv({ lockBusy = false } = {}) {
         'doPost({ postData: { contents: ' + JSON.stringify(JSON.stringify(body)) + ' } })',
         ctx
       );
-      return JSON.parse(out.text);
+      const parsed = JSON.parse(out.text);
+      // v3.9 echoes server-side timings (`srv`) on save answers. This file
+      // pins the pre-v3.9 data-path contract, so the additive field is
+      // stripped here; its presence and shape are pinned in
+      // tests/save-lock-timing.test.js instead.
+      if (parsed && typeof parsed === 'object' && parsed.srv) delete parsed.srv;
+      return parsed;
     },
     async load() {
       const out = await vm.runInContext('doGet({ parameter: { action: "load" } })', ctx);
@@ -383,7 +394,7 @@ test('v3.8: a client-minted uploadId is honoured and status reports its session'
   assert.strictEqual(begin.uploadId, 'client-abc123');
 
   const status = await env.post({ action: 'status' });
-  assert.strictEqual(status.version, '3.8');
+  assert.strictEqual(status.version, '3.9');
   assert.strictEqual(status.session.uploadId, 'client-abc123');
   assert.strictEqual(status.session.mode, 'full');
   assert.ok(status.session.at > 0, 'the session reports when saveBegin ran');
@@ -644,9 +655,9 @@ test('a commit from a superseded session is refused — it cannot swap another d
   assert.deepStrictEqual(ok, { success: true });
 });
 
-/* ── script lock ───────────────────────────────────────────────────────────── */
+/* ── save lock (v3.9: the user lock) ───────────────────────────────────────────────────────────── */
 
-test('a save that cannot get the script lock is refused, not run alongside the other writer', async () => {
+test('a save that cannot get the save lock is refused, not run alongside the other writer', async () => {
   const env = makeEnv({ lockBusy: true });
   const db = dbFixture();
 
@@ -698,8 +709,8 @@ test('code.html reads the backend version from the file, not from hard-coded mar
   // …and the version it reports is the backend this repo ships. Bump this pin
   // with the header above: a version nobody updated the pin for is exactly the
   // drift this test exists to catch.
-  // (v3.8: a client-minted uploadId + the staging session in `status`.)
-  assert.strictEqual(current.ver, 'v3.8', 'code.html must be offering the fixed backend');
+  // (v3.9: user lock + server-side `srv` timings on every save answer.)
+  assert.strictEqual(current.ver, 'v3.9', 'code.html must be offering the fixed backend');
 });
 
 /* ── incremental saves (backend v3.4) ───────────────────────────────────────
@@ -958,7 +969,7 @@ test('delta routing honors the client mode even if the session record were lost 
   // A delta commit misrouted to the full path would swap the live sheet for
   // staging that holds only the appended rows. The session record is
   // authoritative, but body.mode must decide too — belt and braces.
-  assert.match(GAS, /if \(body\.mode === 'delta' \|\| sessionIsDelta_\(body\.uploadId\)\) return commitDelta_\(body\)/);
+  assert.match(GAS, /if \(body\.mode === 'delta' \|\| sessionIsDelta_\(body\.uploadId\)\) return (spaxWithSrv_\()?commitDelta_\(body\)/);
   assert.match(GAS, /var chunkIsDelta = body\.mode === 'delta' \|\| sessionIsDelta_\(body\.uploadId\)/);
 });
 

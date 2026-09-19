@@ -1254,8 +1254,15 @@ async function cloudRequest(url, options = {}, stepTimeoutMs = CLOUD_TIMEOUT_DEF
       catch (_) { throw new Error('Cloud returned a non-JSON response. Check that the Apps Script web app is deployed as “Anyone” and use its /exec URL.'); }
       if (!data || data.success !== true) {
         const detail = data && data.error ? (typeof data.error === 'string' ? data.error : JSON.stringify(data.error)) : 'Unknown cloud error';
-        throw new Error(detail);
+        const failure = new Error(detail);
+        // Backend v3.9 echoes its server-side lock wait on refusals — keep it
+        // on the error (busy pills name the number) and in the session log.
+        try { if (data && data.srv) { failure.spaxSrv = data.srv; spaxNoteServerTiming(data.srv, false); } } catch (_) {}
+        throw failure;
       }
+      // Backend v3.9 echoes {wait, work} on every save answer — the session's
+      // proof of what the server spent its time on (see Sync details).
+      try { if (data && data.srv) spaxNoteServerTiming(data.srv, true); } catch (_) {}
       return data;
     } catch (err) {
       // A raw AbortError tells the user nothing. Name it for what it is — the
@@ -2841,7 +2848,7 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       const busyWhy = (err && err.spaxBusyWhy) || cloudSaveBusyReason();
       showSyncStatus('⏳ ' + cloudSaveRunningName() + ' waiting on the cloud' +
         (busyTotal > 1 ? ' (' + cloudSavePos + '/' + busyTotal + ')' : '') +
-        ' — ' + busyWhy +
+        ' — ' + busyWhy + spaxServerWaitNote() +
         ', retrying in ' + Math.ceil(delayMs / 1000) + 's (' +
         (progressed ? 'the upload is moving, budget restarted' : nextRetry + '/' + CLOUD_BUSY_RETRIES) + ')');
       // The wait must be interruptible: sitting out a 30s backoff while a
@@ -2865,7 +2872,7 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
     if (isBackendBusyError(err)) {
       // Rounds that moved rows restart the budget, so reaching here means the
       // last rounds moved NOTHING — a writer really is holding the lock.
-      showSyncStatus(cloudSaveFailedMessage('the cloud is still busy after retries — ' + ((err && err.spaxBusyWhy) || cloudSaveBusyReason()) + '. Wait ~1 min then Force Push.' + spaxOldBackendHint()));
+      showSyncStatus(cloudSaveFailedMessage('the cloud is still busy after retries — ' + ((err && err.spaxBusyWhy) || cloudSaveBusyReason()) + spaxServerWaitNote() + '. Wait ~1 min then Force Push.' + spaxOldBackendHint()));
     } else {
       showSyncStatus(cloudSaveFailedMessage(lastCloudError + spaxOldBackendHint()));
     }
@@ -3397,8 +3404,34 @@ async function spaxVerifySaveLanded(post, verifyFirst) {
 // Last backend version seen on a load/status answer (null = unknown —
 // either never asked or a deployment that predates version reporting).
 let cloudBackendVersion = null;
+// Last save-lock probe reported by a status answer (backend v3.9 `lock`).
+let cloudBackendLock = null; // { free, ms, at }
+// Last server-side timing echoed by any save answer (backend v3.9 `srv`).
+let cloudLastServerTiming = null; // { wait, work, ok, at }
 function spaxNoteBackendVersion(data) {
   if (data && data.version) cloudBackendVersion = String(data.version);
+  try {
+    if (data && data.lock && typeof data.lock.free === 'boolean') {
+      cloudBackendLock = { free: !!data.lock.free, ms: Number(data.lock.ms), at: Date.now() };
+    }
+  } catch (_) {}
+}
+// Noted centrally in cloudRequest for every answer that carries `srv`
+// (successes and refusals alike), so the number on a busy pill is always
+// this attempt's own server-side lock wait — nothing else posts mid-save.
+function spaxNoteServerTiming(srv, ok) {
+  if (!srv) return;
+  cloudLastServerTiming = { wait: Number(srv.wait), work: Number(srv.work), ok: !!ok, at: Date.now() };
+}
+// Suffix for busy pills: ' · server waited 30.0s for the lock'. A wait near
+// 30s met a real writer; a wait near 0s failed instantly with no holder
+// (stuck lock / LockService failure) — the distinction a busy storm needs.
+function spaxServerWaitNote() {
+  try {
+    const t = cloudLastServerTiming;
+    if (!t || !isFinite(t.wait) || !isFinite(t.at) || Date.now() - t.at > 5 * 60 * 1000) return '';
+    return ' · server waited ' + (Number(t.wait) / 1000).toFixed(1) + 's for the lock';
+  } catch (_) { return ''; }
 }
 
 // Shown on a failed big save when the backend has PROVEN it has no chunked
@@ -11263,6 +11296,7 @@ function updateSyncDetails(){
     <b>Saving Now:</b> ${savingLine}<br>
     <b>Background guard:</b> ${guardLine}<br>
     <b>Cloud Backend:</b> ${spaxBackendDiagHtml()}<br>
+    <b>Server timing:</b> ${spaxServerTimingLineHtml()}<br>
     ${spaxPendingRetryHtml()}
     <b>Last Sync:</b> ${lastSync}<br>
     <b>Local Customers:</b> ${DB.customers.length.toLocaleString()}<br>
@@ -11279,6 +11313,24 @@ function updateSyncDetails(){
 // upload capabilities probed this session. A backend stuck on one-shot saves
 // is the thing to fix when big saves keep failing — no retry strategy can
 // make a non-resumable upload converge on a slow server.
+// Last server-side timing echoed by the backend (v3.9 `srv` on every save
+// answer): how long the execution waited for the save lock and how long it
+// worked. A busy refusal that waited ~30s met a real writer; one that waited
+// ~0s failed instantly with no holder (stuck lock / LockService failure).
+function spaxServerTimingLineHtml() {
+  try {
+    const t = (typeof cloudLastServerTiming !== 'undefined') ? cloudLastServerTiming : null;
+    if (!t || !isFinite(t.wait) || !isFinite(t.at) || Date.now() - t.at > 6 * 60 * 60 * 1000) {
+      return '<span style="color:var(--muted)">no timed save yet this session (backend v3.9 echoes it)</span>';
+    }
+    const w = (Number(t.wait) / 1000).toFixed(1);
+    const work = isFinite(Number(t.work)) ? ' · work ' + (Number(t.work) / 1000).toFixed(1) + 's' : '';
+    return 'lock wait ' + w + 's' + work + ' · ' + (t.ok ? '<span style="color:var(--green)">\u2705</span>' : '<span style="color:var(--red)">\u274C</span>') + ' ' + new Date(t.at).toLocaleTimeString();
+  } catch (_) {
+    return '<span style="color:var(--muted)">unavailable</span>';
+  }
+}
+
 function spaxBackendDiagHtml() {
   const v = (typeof cloudBackendVersion !== 'undefined' && cloudBackendVersion) ? String(cloudBackendVersion) : null;
   if (!v) return '<span style="color:var(--muted)">Unknown yet — shown after the next load or save answers</span>';
@@ -11288,6 +11340,14 @@ function spaxBackendDiagHtml() {
     : (typeof cloudDelta !== 'undefined' && cloudDelta) ? 'delta uploads'
     : (typeof cloudChunks !== 'undefined' && cloudChunks) ? 'chunked uploads' : 'one-shot saves only';
   let html = 'v' + escHtml(v) + ' · ' + escHtml(caps);
+  try {
+    // Backend v3.9 reports the save lock itself on status answers: free NOW
+    // (and when that was observed) vs held — no save attempt spent to learn it.
+    if (typeof cloudBackendLock !== 'undefined' && cloudBackendLock && isFinite(cloudBackendLock.at)) {
+      const ageS = Math.max(0, Math.round((Date.now() - cloudBackendLock.at) / 1000));
+      html += ' · lock ' + (cloudBackendLock.free ? 'free' : 'HELD') + ' (' + ageS + 's ago)';
+    }
+  } catch (_) {}
   try {
     if (typeof cloudCustomerEdit !== 'undefined' && !cloudCustomerEdit) {
       html += ' — <span style="color:var(--amber)">contact edits need a full upload on this backend; redeploy Code.gs (v3.7)</span>';

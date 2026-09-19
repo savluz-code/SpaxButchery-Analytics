@@ -1,3 +1,8 @@
+// Bumped to spax-v28 (2026-09-19): the save lock moved from the script lock
+// to the user lock (identical serialisation for an Execute-as-Me web app,
+// but a fresh lock object for deployments whose script lock answers busy
+// with no writer behind it), and every save answer echoes its server-side
+// lock wait + work time so a busy storm is diagnosable from the app.
 // Bumped to spax-v27 (2026-09-19): a save whose step outlives its own client
 // deadline now converges instead of bouncing off the same wall. Deadlines
 // widen while the link proves it needs more, a round that lands rows keeps
@@ -7,7 +12,7 @@
 // that wipes the staging area the previous attempt had just filled (the
 // reported save that never completes). Installed apps must pick up the new
 // shell for the fix to reach them.
-const CACHE_NAME = 'spax-v27';
+const CACHE_NAME = 'spax-v28';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

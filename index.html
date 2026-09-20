@@ -952,7 +952,7 @@ function doPost(e) {
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.5 · <span id="buildStamp">build 2026-09-19</span> · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.5 · <span id="buildStamp">build 2026-09-20</span> · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -1204,9 +1204,9 @@ function cloudHttpFailure(status, text, finalUrl) {
     // and the last two make isTransientNetworkError fire a second retry wave.
     const fromEdge = spaxIsEchoedResponse(finalUrl) || (t && /<!doctype html|<html/i.test(t));
     if (fromEdge) {
-      return new Error('Google edge answered with a web page instead of JSON (HTTP 404) — a hiccup at Google, not a problem with your data. It usually means a slow save whose one-time redirect link had expired before the answer arrived. Your data is safe locally and will sync on the next save. If this repeats, open the ⚙️ Sync tab and run the 🧪 Test, which asks the deployment directly.');
+      return new Error('Google edge answered with a web page instead of JSON (HTTP 404) — a hiccup at Google, not a problem with your data. It usually means a slow save whose one-time redirect link had expired before the answer arrived. Your data is safe locally and will sync on the next save. Open the ⚙️ Sync tab and run the 🧪 Test, which asks the deployment directly. If 🧪 Test keeps failing after a few retries, the deployment itself may be gone — redeploy Code.gs (Deploy → New deployment → Web app → Anyone) and paste the new /exec URL into the field above.');
     }
-    return new Error('Cloud returned HTTP 404 after ' + (CLOUD_HTTP_RETRIES + 1) + ' attempts — Google edge kept refusing the request. Your data is safe locally and will sync on the next save. Open the ⚙️ Sync tab and run the 🧪 Test, which asks the deployment directly.');
+    return new Error('Cloud returned HTTP 404 after ' + (CLOUD_HTTP_RETRIES + 1) + ' attempts — Google edge kept refusing the request. Your data is safe locally and will sync on the next save. Open the ⚙️ Sync tab and run the 🧪 Test, which asks the deployment directly. If 🧪 Test keeps failing after a few retries, the deployment itself may be gone — redeploy Code.gs (Deploy → New deployment → Web app → Anyone) and paste the new /exec URL into the field above. Changing the URL resets this device’s sync state, so its next save re-uploads everything.');
   }
   if (status === 429) {
     return new Error('Cloud rate-limited this save (HTTP 429) — wait a minute and retry; your data is safe locally.');
@@ -2695,11 +2695,14 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       }
     }
     // ── NOTHING NEW TO SEND ──
-    // Only a BACKGROUND save may stop here. A forced save (Force Push, Delete
-    // All, Manual) is the user asking the cloud to take THIS device's data,
-    // so it always reaches the cloud even when it would be a no-op — the
-    // cloud may hold something a different device pushed since.
-    if (!(cloudSaveRunningJob && cloudSaveRunningJob.force) && spaxCloudAlreadyCurrent(payload, deltaRows)) {
+    // Only a BACKGROUND save may stop here, and only on the incremental path.
+    // Full-save mode (the default) never skips — every save re-sends the whole
+    // database so a cloud that was cleared manually or by a failed deployment
+    // is refilled on the next auto-save instead of looking like success while
+    // the sheet stays empty. A forced save (Force Push, Delete All, Manual)
+    // is the user asking the cloud to take THIS device's data, so it always
+    // reaches the cloud even when it would be a no-op.
+    if (!cloudFullSave && !(cloudSaveRunningJob && cloudSaveRunningJob.force) && spaxCloudAlreadyCurrent(payload, deltaRows)) {
       showSyncStatus('✅ Already up to date — ' + cloudSaveRunningName() +
         ' had nothing new to send' + (cloudSaveLiveTotal() > 1 ? ' (' + cloudSavePos + '/' + cloudSaveLiveTotal() + ')' : ''));
       lastSyncTime = new Date();
@@ -11082,7 +11085,7 @@ if('serviceWorker' in navigator){
         it can never interrupt an upload either.
    The footer stamps the build date this page is running, so anyone can see
    at a glance which build a phone is on. */
-const SPAX_BUILD_DATE = '2026-09-19'; // ← bump this on every merge
+const SPAX_BUILD_DATE = '2026-09-20'; // ← bump this on every merge
 
 (function spaxSwUpdateGuard(){
   if (typeof navigator === 'undefined' || !navigator.serviceWorker || !navigator.serviceWorker.addEventListener) return;
@@ -11199,10 +11202,28 @@ async function forcePushToCloud(){
   try{
     const saved = await saveToCloud(true, CLOUD_SAVE_NAMES.forcePush);
     if (!saved) throw new Error(lastCloudError || 'Cloud did not confirm the save');
-    spaxSetActionResult('<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.</span>');
+    // Verify the sheet actually received the data — a success:true with an
+    // empty sheet (stale deployment, wrong spreadsheet, empty payload) used
+    // to look like a win and left the user staring at 0 customers. A quick
+    // load after the push catches that and turns it into a failure the user
+    // can act on (Test, redeploy, or check the payload).
+    try {
+      const data = await cloudLoad();
+      const nCust = (data.customers || []).length;
+      const nTx = (data.transactions || []).length;
+      if (DB.customers.length > 0 && nCust === 0) {
+        throw new Error('Cloud answered success but now shows 0 customers / ' + nTx + ' transactions — the sheet is still empty. Check that the /exec URL points at the right Apps Script project and that its spreadsheet is the one you are looking at. Try 🧪 Test again, then Force Push.');
+      }
+      spaxSetActionResult('<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully — verified ' + nCust + ' customers / ' + nTx + ' transactions in the sheet.</span>');
+    } catch (verifyErr) {
+      // If verification itself failed (network), keep the push as success but
+      // surface the verification note so the user knows to Test.
+      if (verifyErr && /still empty/i.test(verifyErr.message)) throw verifyErr;
+      spaxSetActionResult('<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.</span> <span style="color:var(--muted)">(verification load failed: ' + (verifyErr && verifyErr.message ? verifyErr.message : verifyErr) + ' — hit 🧪 Test to confirm)</span>');
+    }
     showSyncStatus('✅ Force push complete');
   }catch(err){
-    spaxSetActionResult('<span style="color:var(--red)">❌ Push failed: ' + err.message + '</span>');
+    spaxSetActionResult('<span style="color:var(--red)">❌ Push failed: ' + escHtml(err.message) + '</span>');
     showSyncStatus('❌ Force push failed');
   }
 }

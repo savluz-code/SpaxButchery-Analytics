@@ -394,7 +394,7 @@ test('v3.8: a client-minted uploadId is honoured and status reports its session'
   assert.strictEqual(begin.uploadId, 'client-abc123');
 
   const status = await env.post({ action: 'status' });
-  assert.strictEqual(status.version, '3.9');
+  assert.strictEqual(status.version, '3.10');
   assert.strictEqual(status.session.uploadId, 'client-abc123');
   assert.strictEqual(status.session.mode, 'full');
   assert.ok(status.session.at > 0, 'the session reports when saveBegin ran');
@@ -709,8 +709,8 @@ test('code.html reads the backend version from the file, not from hard-coded mar
   // …and the version it reports is the backend this repo ships. Bump this pin
   // with the header above: a version nobody updated the pin for is exactly the
   // drift this test exists to catch.
-  // (v3.9: user lock + server-side `srv` timings on every save answer.)
-  assert.strictEqual(current.ver, 'v3.9', 'code.html must be offering the fixed backend');
+  // (v3.10: always overwrites small tables to fix empty-sheet after success.)
+  assert.strictEqual(current.ver, 'v3.10', 'code.html must be offering the fixed backend');
 });
 
 /* ── incremental saves (backend v3.4) ───────────────────────────────────────

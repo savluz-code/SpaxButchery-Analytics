@@ -1,6 +1,10 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.9  (2026-09-19)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.10  (2026-09-20)
  * ─────────────────────────────────────────────────────────────────
+ * v3.10 fixes empty-sheet after push success: saveAll now always overwrites
+ * small tables (customers/monthly/settings) instead of skipping when basis
+ * matches — a skipped Customers write left the live sheet empty while the
+ * client reported success. Also returns row counts for verification.
  * v3.9 moves the save lock from the script lock to the user lock, and makes
  * every save answer carry its own server-side timings:
  *   • This web app always executes as its owner ("Execute as: Me"), so every
@@ -208,7 +212,7 @@ var TABLE_HEADERS = {
      • waitLock's answer is honoured: a save that cannot get the script lock is
        refused instead of running alongside the writer that holds it. */
 
-var BACKEND_VERSION = '3.9';
+var BACKEND_VERSION = '3.10';
 
 var STAGE_SUFFIX = '_Staging';
 var SWAP_TMP_SUFFIX = '_SwapTmp';
@@ -530,9 +534,12 @@ function saveAll_(body) {
   var tWork = new Date().getTime();
   try {
     prepareStaging_();
-    // Only the small tables can be skipped (a table the client re-sends
-    // unchanged is not re-written); the big tables are always re-staged.
-    var swapped = stageSmallTables_(body, true);
+    // Force Push is an explicit overwrite — never skip a small table even
+    // when its basis matches the previous one. Skipping left an empty live
+    // sheet looking like success when the staging sheet was header-only and
+    // the live sheet had the same row count but wrong content. Full-save
+    // mode (the default) always overwrites.
+    var swapped = stageSmallTables_(body, false);
     stageBigTable_('transactions', body.transactions || []);
     stageBigTable_('customerTx', flattenCustomerTx_(body.customerTx || {}));
     stageBigTable_('seen', flattenSeen_(body.seen || {}));

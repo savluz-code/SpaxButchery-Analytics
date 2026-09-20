@@ -261,7 +261,7 @@ test('v3.9: status answers even while the lock is held, and reports lock.free tr
   const free = makeEnv();
   const st = await free.post({ action: 'status' });
   assert.strictEqual(st.success, true);
-  assert.strictEqual(st.version, '3.9');
+  assert.strictEqual(st.version, '3.10');
   assert.ok(st.lock && st.lock.free === true, 'free lock reports free:true');
   assert.ok(typeof st.lock.ms === 'number', 'probe reports its own duration');
 

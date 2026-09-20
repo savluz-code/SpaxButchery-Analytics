@@ -201,9 +201,14 @@ test('a persistent 404 blames Google edge, never the deployment', async () => {
   assert.match(lastCloudError, /Test/, 'the user is pointed at the endpoint test');
   // The old verdict — "the Apps Script deployment appears deleted or
   // replaced. Redeploy Code.gs and paste the new /exec URL" — is what turned
-  // one hiccup into a permanent outage, so it must be gone.
-  assert.ok(!/deployment appears deleted|Redeploy/i.test(lastCloudError),
-    'a 404 must never assert the deployment is gone, nor prescribe a redeploy');
+  // one hiccup into a permanent outage. The new guidance still points at
+  // 🧪 Test first, and only if Test keeps failing does it suggest the
+  // deployment may be gone and a redeploy is needed — that breaks the loop
+  // (Test is the authority) while still giving a clear redeploy path when
+  // the URL really is dead.
+  assert.ok(!/deployment appears deleted/i.test(lastCloudError),
+    'a 404 must never use the old "deployment appears deleted" wording');
+  assert.match(lastCloudError, /redeploy/i, 'a persistent 404 now guides redeploy after Test');
   assert.ok(!/connection/i.test(lastCloudError),
     'no "connection" wording — isTransientNetworkError would fire a second retry wave');
   assert.ok(status.some((m) => /Cloud hiccup \(HTTP 404\)/.test(m)));
@@ -223,8 +228,11 @@ test('a 404 from Google one-time echo host is named as edge noise', async () => 
   });
   const { lastCloudError } = await runClient(cloud, smallDB());
   assert.match(lastCloudError, /hiccup at Google/i, 'the edge is named as the cause');
-  assert.ok(!/deployment appears deleted|Redeploy/i.test(lastCloudError),
-    'a spent redirect token must not read as a missing deployment');
+  assert.ok(!/deployment appears deleted/i.test(lastCloudError),
+    'a spent redirect token must not use the old "deployment appears deleted" wording');
+  // Echo-host 404s also guide redeploy as a fallback if Test keeps failing,
+  // but the primary cause is still named as edge noise.
+  assert.match(lastCloudError, /Test/, 'the user is still pointed at Test first');
 });
 
 test('the 404 classifier sees the post-redirect URL', () => {

@@ -11177,6 +11177,17 @@ function urlBase64ToUint8Array(base64String){
 
 
 /* ══════════ FORCE SYNC CONTROLS ══════════ */
+// Every FINAL outcome on the Sync tab's action line carries the time it was
+// written, the way the connection-test line already does. An untimestamped
+// "✅ Pushed 2182 customers" survives for hours — and survives a cloud-URL
+// change — quietly vouching for a push that a later, empty test read then
+// appears to contradict (2026-09-20: one stale ✅, two deployments).
+function spaxSetActionResult(html){
+  const el = $('syncActionResult');
+  if(!el) return;
+  el.innerHTML = html + ' <span style="color:var(--muted)">· ' + new Date().toLocaleTimeString() + '</span>';
+}
+
 async function forcePushToCloud(){
   if(!confirm('🚀 FORCE PUSH\n\nThis will OVERWRITE the Google Sheet with your LOCAL data (' + DB.customers.length + ' customers).\n\nAre you sure?')) return;
 
@@ -11188,10 +11199,10 @@ async function forcePushToCloud(){
   try{
     const saved = await saveToCloud(true, CLOUD_SAVE_NAMES.forcePush);
     if (!saved) throw new Error(lastCloudError || 'Cloud did not confirm the save');
-    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.</span>';
+    spaxSetActionResult('<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.</span>');
     showSyncStatus('✅ Force push complete');
   }catch(err){
-    $('syncActionResult').innerHTML = '<span style="color:var(--red)">❌ Push failed: ' + err.message + '</span>';
+    spaxSetActionResult('<span style="color:var(--red)">❌ Push failed: ' + err.message + '</span>');
     showSyncStatus('❌ Force push failed');
   }
 }
@@ -11211,7 +11222,7 @@ async function forcePullFromCloud(){
 
     const cloudCustomers = validCloudCustomers(data.customers);
     if(cloudCustomers.length === 0){
-      $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud is empty. Nothing to pull.</span>';
+      spaxSetActionResult('<span style="color:var(--amber)">⚠️ Cloud is empty. Nothing to pull.</span>');
       return;
     }
 
@@ -11254,10 +11265,10 @@ async function forcePullFromCloud(){
     spaxReplacePushedFromCloud(DB.transactions || []);
     spaxClearTxFullReplace();
     refreshAll();
-    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Pulled ' + DB.customers.length + ' customers from cloud. Local data overwritten.</span>';
+    spaxSetActionResult('<span style="color:var(--green)">✅ Pulled ' + DB.customers.length + ' customers from cloud. Local data overwritten.</span>');
     showSyncStatus('✅ Force pull complete');
   }catch(err){
-    $('syncActionResult').innerHTML = '<span style="color:var(--red)">❌ Pull failed: ' + err.message + '</span>';
+    spaxSetActionResult('<span style="color:var(--red)">❌ Pull failed: ' + err.message + '</span>');
     showSyncStatus('❌ Force pull failed');
   }
 }
@@ -11269,7 +11280,7 @@ async function smartMergeCloud(){
   // merge would pull is exactly the stale state that save must overwrite, and
   // merging then pushing would re-bake it. Land the pending save first.
   if (spaxTxFullReplaceRequired()) {
-    $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Merge blocked — a cleanup (dedupe/delete) is still syncing. Wait for that save to land (Force Push if it failed), then merge.</span>';
+    spaxSetActionResult('<span style="color:var(--amber)">⚠️ Merge blocked — a cleanup (dedupe/delete) is still syncing. Wait for that save to land (Force Push if it failed), then merge.</span>');
     showSyncStatus('⚠️ Merge blocked — a cleanup save is still pending');
     return;
   }
@@ -11286,7 +11297,7 @@ async function smartMergeCloud(){
       DB.customers = spaxDropTombstonedCustomers(DB.customers);
     }
     if(cloudCustomers.length === 0){
-      $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Cloud has no valid customers. No data was changed — recover a known-good cloud copy before pushing.</span>';
+      spaxSetActionResult('<span style="color:var(--amber)">⚠️ Cloud has no valid customers. No data was changed — recover a known-good cloud copy before pushing.</span>');
       return;
     }
 
@@ -11350,10 +11361,10 @@ async function smartMergeCloud(){
     if (!await saveToCloud(true, CLOUD_SAVE_NAMES.smartMerge)) throw new Error(lastCloudError || 'Cloud did not confirm the save');
     refreshAll();
 
-    $('syncActionResult').innerHTML = '<span style="color:var(--green)">✅ Merged: ' + merged.length + ' total (' + localOnly + ' local-only kept, ' + cloudOnly + ' cloud-only added, ' + mergedCount + ' merged)</span>';
+    spaxSetActionResult('<span style="color:var(--green)">✅ Merged: ' + merged.length + ' total (' + localOnly + ' local-only kept, ' + cloudOnly + ' cloud-only added, ' + mergedCount + ' merged)</span>');
     showSyncStatus('✅ Smart merge complete');
   }catch(err){
-    $('syncActionResult').innerHTML = '<span style="color:var(--red)">❌ Merge failed: ' + err.message + '</span>';
+    spaxSetActionResult('<span style="color:var(--red)">❌ Merge failed: ' + err.message + '</span>');
     showSyncStatus('❌ Smart merge failed');
   }
 }
@@ -11368,7 +11379,7 @@ async function resetLocalData(){
   refreshAll();
 
   // A local reset must never silently overwrite a recoverable cloud copy.
-  $('syncActionResult').innerHTML = '<span style="color:var(--amber)">⚠️ Local reset complete. Cloud data was not changed.</span>';
+  spaxSetActionResult('<span style="color:var(--amber)">⚠️ Local reset complete. Cloud data was not changed.</span>');
   showSyncStatus('⚠️ Local data reset — cloud untouched');
 }
 
@@ -11553,6 +11564,12 @@ function saveCloudUrlField(){
     return;
   }
   try { spaxSetCloudUrl(url); } catch(e) { toast('❌ Could not save the URL: ' + e.message); return; }
+  // The action line still shows the PREVIOUS deployment's verdict — a push,
+  // pull or merge the new endpoint knows nothing about. Void it here instead
+  // of letting a stale ✅ argue with the new deployment's empty test read;
+  // changing the URL also reset this device's sync state, so its next save
+  // re-uploads everything and earns a fresh, correctly-stamped result.
+  spaxSetActionResult('<span style="color:var(--amber)">☁️ Cloud URL changed — earlier push/pull results referred to the previous deployment. Push again to fill this one.</span>');
   toast('☁️ Cloud URL saved on this device — testing it…');
   testCloudConnection();
 }
@@ -11560,6 +11577,9 @@ function saveCloudUrlField(){
 function resetCloudUrlField(){
   try { spaxSetCloudUrl(''); } catch(_) {}
   loadCloudUrlField();
+  // Same stale-verdict trap as saveCloudUrlField: the built-in default is a
+  // different endpoint from any per-device override it replaces.
+  spaxSetActionResult('<span style="color:var(--amber)">☁️ Cloud URL reset — earlier push/pull results referred to the previous deployment. Push again to fill this one.</span>');
   toast('↺ Cloud URL reset to the built-in default');
   testCloudConnection();
 }

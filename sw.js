@@ -1,4 +1,6 @@
-// Bumped to spax-v29 (2026-09-19): Data tab gains "Load Seed Snapshot" (client v2.6).
+// Bumped to spax-v30 (2026-09-20): full-save mode — every save is one atomic
+// saveAll of the whole database; delta/chunked uploads are opt-in via
+// localStorage spaxCloudFullSave='0' (client v2.7).
 // Bumped to spax-v28 (2026-09-19): the save lock moved from the script lock
 // to the user lock (identical serialisation for an Execute-as-Me web app,
 // but a fresh lock object for deployments whose script lock answers busy
@@ -13,7 +15,7 @@
 // that wipes the staging area the previous attempt had just filled (the
 // reported save that never completes). Installed apps must pick up the new
 // shell for the fix to reach them.
-const CACHE_NAME = 'spax-v29';
+const CACHE_NAME = 'spax-v30';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

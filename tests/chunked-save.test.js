@@ -92,6 +92,12 @@ function makeCloud({ chunked = true, uploadIds = true, delta = true, ignoreDelta
   const stagedSeqs = new Set(); // (table, seq) pairs already staged this session
   let currentSession = null;    // the session v3.8's status answers with
   const store = {};
+  // This suite pins the INCREMENTAL upload machinery (saveBegin → saveChunk →
+  // saveCommit, saveDelta), which is OPT-IN since 2026-09-20: the default is
+  // full-save mode (one atomic saveAll per save — see
+  // tests/full-save-mode.test.js). Seeding '0' restores the default these
+  // tests were written against.
+  store.spaxCloudFullSave = '0';
   // What the LIVE Transactions sheet holds. Full saves replace it (swap);
   // deltas append with identity dedup.
   const live = { transactions: [], mode: 'full' };

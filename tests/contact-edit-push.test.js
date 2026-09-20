@@ -41,6 +41,11 @@ const fallback = slice('async function spaxSaveContactEditToCloud(edit, renamed)
 function makeCloud(updateOutcome) {
   const calls = [];
   const store = {};
+  // OPT-IN to the targeted updateCustomer path — the app default since
+  // 2026-09-20 is full-save mode, where contact edits ride the full save
+  // (pinned in tests/full-save-mode.test.js). This suite pins the targeted
+  // machinery itself, so it seeds '0'.
+  store.spaxCloudFullSave = '0';
   const fetchImpl = async (url, options = {}) => {
     const body = JSON.parse(options.body || '{}');
     calls.push(body);

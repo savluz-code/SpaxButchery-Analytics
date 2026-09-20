@@ -1,3 +1,7 @@
+// Bumped to spax-v31 (2026-09-20): Sync-tab action results carry the time
+// they were written, and a saved-URL change (Save URL / Built-in default)
+// voids the previous deployment's push/pull verdict instead of leaving a
+// stale "✅ Pushed …" to argue with the new endpoint's empty test read.
 // Bumped to spax-v30 (2026-09-20): full-save mode — every save is one atomic
 // saveAll of the whole database; delta/chunked uploads are opt-in via
 // localStorage spaxCloudFullSave='0' (client v2.7).
@@ -15,7 +19,7 @@
 // that wipes the staging area the previous attempt had just filled (the
 // reported save that never completes). Installed apps must pick up the new
 // shell for the fix to reach them.
-const CACHE_NAME = 'spax-v30';
+const CACHE_NAME = 'spax-v31';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

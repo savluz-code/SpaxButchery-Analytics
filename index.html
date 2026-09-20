@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpaxButchery | Analytics v2.6</title>
+<title>SpaxButchery | Analytics v2.7</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
@@ -1060,6 +1060,27 @@ try { cloudDelta = localStorage.getItem('spaxCloudDelta') === '1'; } catch (_) {
 // backend goes straight to the full save instead of probing every time.
 let cloudCustomerEdit = true;
 try { cloudCustomerEdit = localStorage.getItem('spaxCloudCustomerEdit') !== '0'; } catch (_) {}
+
+// ── FULL-SAVE MODE (the default since 2026-09-20) ──
+// The user's verdict on three weeks of upload machinery, verbatim: "better
+// the save all with duplicates than the cloud fail I am experiencing."
+// Every refinement of the upload path — delta appends (backend v3.4), chunked
+// sessions (v3.0), recoverable upload sessions (v3.8) — added another way for
+// a save to die on a weak link, and what kept failing was the machinery
+// itself: probes to stage, staging areas to lose, sessions to recover, every
+// step with its own deadline and lock story. Full-save mode takes all of it
+// out of the hot path: EVERY save is one atomic one-shot saveAll — the whole
+// database in a single POST. The backend stages then swaps, so a retry can
+// only ever re-send the same body; the load path union-merges by dedup key,
+// so re-sent rows can never double-count. "With duplicates" is the accepted
+// cost — a full upload where a delta would have carried less — traded
+// knowingly for a save that cannot fail in any of the ways a cleverer path
+// can. It also means no Code.gs redeploy is ever required again: saveAll is
+// the one action every backend version since the beginning has answered.
+// The incremental machinery is still here, code and tests intact, for the day
+// the link can carry it: localStorage spaxCloudFullSave='0' restores it.
+let cloudFullSave = true;
+try { cloudFullSave = localStorage.getItem('spaxCloudFullSave') !== '0'; } catch (_) {}
 
 // Per-request timeouts. 30s is plenty for a probe, but a one-shot saveAll of
 // the whole database (weak signal + Apps Script rewriting six sheets)
@@ -2535,6 +2556,10 @@ function spaxBuildSavePayload() {
 async function spaxPushCustomerEdit(edit) {
   if (SYNC_MODE === 'local') return false;
   if (!cloudCustomerEdit) return false;
+  // Full-save mode: one protocol, one failure surface. A contact edit rides
+  // the caller's fallback (the next full save) instead of a second, targeted
+  // one — "save all" beats another clever path that can fail on its own.
+  if (cloudFullSave) return false;
   const url = spaxCloudUrl();
   if (!url || url.includes('YOUR_SCRIPT')) return false;
   const task = spaxRegisterTask({ kind: 'save', name: '✏️ Contact edit', state: 'running', detail: 'updating one customer in the cloud' });
@@ -2682,7 +2707,9 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       return true;
     }
 
-    if (deltaRows !== null && (cloudDelta || !cloudDeltaProbed)) {
+    // Full-save mode (the default) skips the delta path entirely — see
+    // cloudFullSave. Everything below is the opt-in incremental path.
+    if (!cloudFullSave && deltaRows !== null && (cloudDelta || !cloudDeltaProbed)) {
       try {
         const deltaOk = await saveDeltaToCloud(post, payload, deltaRows);
         if (deltaOk) {
@@ -2735,7 +2762,9 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
     // "unknown action", we remember that for the session, and the save falls
     // straight through to the one-shot request below. Small saves are always
     // a single request, on every backend.
-    if (totalBigRows > CHUNK_ROWS && (cloudChunks || !cloudChunkProbed)) {
+    // Full-save mode (the default) skips this too: the one-shot saveAll below
+    // IS the whole save, however big the database is.
+    if (!cloudFullSave && totalBigRows > CHUNK_ROWS && (cloudChunks || !cloudChunkProbed)) {
       try {
         const chunked = await saveToCloudChunked(post, payload, bigTables, totalBigRows, 'full', { tag: saveTag, txBasis, smallBasis });
         if (chunked) {
@@ -3441,7 +3470,10 @@ function spaxServerWaitNote() {
 // never converge either — redeploying is the fix, not retrying.
 function spaxOldBackendHint() {
   try {
-    if ((DB.transactions || []).length > CHUNK_ROWS && cloudChunkProbed && !cloudChunks) {
+    // Full-save mode never uses chunked uploads, so a backend without them is
+    // not a limitation worth reporting — the hint would ask for a redeploy
+    // that cannot change anything.
+    if (!cloudFullSave && (DB.transactions || []).length > CHUNK_ROWS && cloudChunkProbed && !cloudChunks) {
       return ' The backend answers without chunked uploads — redeploy Code.gs (v3.6): chunked saves resume instead of restarting.';
     }
   } catch (_) {}
@@ -11404,7 +11436,8 @@ function spaxBackendDiagHtml() {
   if (!v) return '<span style="color:var(--muted)">Unknown yet — shown after the next load or save answers</span>';
   const probed = (typeof cloudDeltaProbed !== 'undefined' && cloudDeltaProbed) ||
                  (typeof cloudChunkProbed !== 'undefined' && cloudChunkProbed);
-  const caps = !probed ? 'upload capabilities not probed yet this session'
+  const caps = (typeof cloudFullSave !== 'undefined' && cloudFullSave) ? 'full uploads (simple mode)'
+    : !probed ? 'upload capabilities not probed yet this session'
     : (typeof cloudDelta !== 'undefined' && cloudDelta) ? 'delta uploads'
     : (typeof cloudChunks !== 'undefined' && cloudChunks) ? 'chunked uploads' : 'one-shot saves only';
   let html = 'v' + escHtml(v) + ' · ' + escHtml(caps);
@@ -11417,10 +11450,13 @@ function spaxBackendDiagHtml() {
     }
   } catch (_) {}
   try {
-    if (typeof cloudCustomerEdit !== 'undefined' && !cloudCustomerEdit) {
+    // In full-save mode contact edits and big saves take the full upload BY
+    // DESIGN — these redeploy hints only mean something on the incremental
+    // path, so they stay silent there.
+    if (!cloudFullSave && typeof cloudCustomerEdit !== 'undefined' && !cloudCustomerEdit) {
       html += ' — <span style="color:var(--amber)">contact edits need a full upload on this backend; redeploy Code.gs (v3.7)</span>';
     }
-    if (!cloudDelta && !cloudChunks && cloudChunkProbed && (DB.transactions || []).length > CHUNK_ROWS) {
+    if (!cloudFullSave && !cloudDelta && !cloudChunks && cloudChunkProbed && (DB.transactions || []).length > CHUNK_ROWS) {
       html += ' — <span style="color:var(--amber)">big saves cannot resume on this backend; redeploy Code.gs (v3.7)</span>';
     }
   } catch (_) {}

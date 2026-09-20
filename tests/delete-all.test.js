@@ -47,6 +47,11 @@ function makeCloud({ hangFirstChunk = false } = {}) {
   const state = { session: 0, chunksPerSession: {}, abortSignals: 0 };
   const respond = (body) => ({ ok: true, text: async () => JSON.stringify(body) });
   const store = {};
+  // OPT-IN to the incremental upload paths — the app default since 2026-09-20
+  // is full-save mode (one atomic saveAll per save, pinned in
+  // tests/full-save-mode.test.js). These pre-emption scenarios were written
+  // against a chunked in-flight upload, so they seed '0'.
+  store.spaxCloudFullSave = '0';
   const fetchImpl = async (url, options) => {
     const body = options && options.body ? JSON.parse(options.body) : {};
     calls.push(body);

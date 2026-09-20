@@ -59,6 +59,11 @@ function makeCloud(plan = {}) {
   const calls = [];
   const attemptsByAction = {};
   const store = {};
+  // OPT-IN to the incremental upload paths — the app default since 2026-09-20
+  // is full-save mode (one atomic saveAll per save, pinned in
+  // tests/full-save-mode.test.js). These tests were written against the
+  // incremental default, so they seed '0' to keep exercising that machinery.
+  store.spaxCloudFullSave = '0';
   const live = { transactions: [] };
   const outcomeFor = (action, n) => {
     const list = plan[action];

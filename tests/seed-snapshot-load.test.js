@@ -46,12 +46,12 @@ test('button opens the file picker; file input runs the loader', () => {
     'seedFileInput must run handleSeedSnapshotFile');
 });
 
-test('title + service worker bumps so clients see v2.6', () => {
-  assert.ok(HTML.includes('<title>SpaxButchery | Analytics v2.6</title>'),
-    'title must be v2.6');
+test('title + service worker bumps so clients see v2.7', () => {
+  assert.ok(HTML.includes('<title>SpaxButchery | Analytics v2.7</title>'),
+    'title must be v2.7');
   const m = SW.match(/const CACHE_NAME = 'spax-v(\d+)';/);
-  assert.ok(m && Number(m[1]) >= 29,
-    'expected the spax-v29 bump (Load Seed Snapshot), got ' + (m && m[1]));
+  assert.ok(m && Number(m[1]) >= 30,
+    'expected the spax-v30 bump (full-save mode), got ' + (m && m[1]));
 });
 
 /* ── the parser, executed for real ───────────────────────────────────────── */

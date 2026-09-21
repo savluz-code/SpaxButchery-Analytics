@@ -19,7 +19,13 @@
 // that wipes the staging area the previous attempt had just filled (the
 // reported save that never completes). Installed apps must pick up the new
 // shell for the fix to reach them.
-const CACHE_NAME = 'spax-v32';
+// Bumped to spax-v33 (2026-09-21): a save success from a backend that cannot
+// issue receipts (pre-v3.6 — the deployments that answer hollow successes)
+// is now witnessed by reading the cloud back, and a backend that answers
+// without a version field is finally flagged stale (the amber "update the
+// deployment" note used to stay silent for exactly those endpoints).
+// Installed apps must pick up the new shell for either to reach them.
+const CACHE_NAME = 'spax-v33';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

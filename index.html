@@ -2816,6 +2816,10 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       try {
         const deltaOk = await saveDeltaToCloud(post, payload, deltaRows);
         if (deltaOk) {
+          // A pre-v3.6 backend can claim success without writing; witness
+          // the append in the cloud's own rows before booking it as pushed.
+          const landed = await spaxConfirmWriteLanded(payload, allTx, 'delta', deltaRows);
+          if (!landed.ok) return spaxFailHollowSave(landed.error);
           // Every local row is now accounted for in the cloud — either it
           // was already live there or the append just added it (the server
           // de-duplicates, so rows it skipped were already present).
@@ -2878,6 +2882,12 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       try {
         const chunked = await saveToCloudChunked(post, payload, bigTables, totalBigRows, 'full', { tag: saveTag, txBasis, smallBasis });
         if (chunked) {
+          // Witness the swap in the cloud's own rows before booking pushed.
+          const landed = await spaxConfirmWriteLanded(payload, allTx, 'full');
+          if (!landed.ok) return spaxFailHollowSave(landed.error);
+          // The commit's done pill fired before the verifying line replaced
+          // it — re-affirm it now that the write is witnessed.
+          showSyncStatus(cloudSaveDoneMessage());
           // A full commit just replaced the cloud sheet with these rows.
           spaxNotePushedTransactions(allTx);
           spaxNoteSavedBasis(payload);
@@ -2944,6 +2954,11 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       }
     }
     if (result.success) {
+      // A pre-v3.6 deployment answers `saveAll_(body) || {success:true}` — a
+      // success with no write behind it is indistinguishable from a real one
+      // without asking the cloud what it actually holds now.
+      const landed = await spaxConfirmWriteLanded(payload, allTx, 'full');
+      if (!landed.ok) return spaxFailHollowSave(landed.error);
       // saveAll swapped every live sheet for a freshly staged copy, so any
       // half-finished chunked session's staging area is gone with it. A
       // full save replaced the cloud sheet verbatim, so the pushed set is
@@ -3228,9 +3243,9 @@ function spaxNewUploadId() {
 // a request to be told there is no `session` field.
 function spaxBackendReportsSessions() {
   try {
+    if (cloudBackendPreVersioning) return false; // no status probe at all pre-v3.6
     if (!cloudBackendVersion) return true; // unknown: ask once, it is one cheap probe
-    const v = parseFloat(String(cloudBackendVersion).replace(/[^0-9.]/g, ''));
-    return !isFinite(v) || v >= 3.8;
+    return spaxBackendAtLeast(3, 8); // component compare — parseFloat('3.10') is 3.1
   } catch (_) { return true; }
 }
 
@@ -3554,6 +3569,14 @@ async function spaxVerifySaveLanded(post, verifyFirst) {
 // Last backend version seen on a load/status answer (null = unknown —
 // either never asked or a deployment that predates version reporting).
 let cloudBackendVersion = null;
+// True once a SUCCESSFUL load/status answer arrived WITHOUT a `version`
+// field: definitive proof the deployment predates v3.6 (every backend since
+// reports its version on both answers). Until this flag exists a pre-v3.6
+// endpoint is indistinguishable from "never asked" (cloudBackendVersion
+// null) — so every stale-backend warning stayed silent for exactly the
+// deployments that need it loudest, and saves trusted a backend that can
+// answer hollow successes. Set/cleared centrally in spaxNoteBackendVersion.
+let cloudBackendPreVersioning = false;
 // The spreadsheet the endpoint writes to (backend v3.10 `spreadsheet`) —
 // shown on the Sync tab so "which sheet does this /exec URL push to?" is
 // answerable at a glance instead of by guessing after a hollow ✅.
@@ -3563,7 +3586,16 @@ let cloudBackendLock = null; // { free, ms, at }
 // Last server-side timing echoed by any save answer (backend v3.9 `srv`).
 let cloudLastServerTiming = null; // { wait, work, ok, at }
 function spaxNoteBackendVersion(data) {
-  if (data && data.version) cloudBackendVersion = String(data.version);
+  if (data && data.version) {
+    cloudBackendVersion = String(data.version);
+    cloudBackendPreVersioning = false;
+  } else if (data && data.success === true) {
+    // Answered, but without a version field: the deployment predates v3.6.
+    // Remember that as a FACT — the warnings and the read-back verification
+    // below key off it, and a pre-v3.6 endpoint must never be mistaken for
+    // one we simply have not asked yet.
+    cloudBackendPreVersioning = true;
+  }
   try {
     if (data && data.spreadsheet && data.spreadsheet.url) {
       cloudSpreadsheetInfo = {
@@ -3613,7 +3645,10 @@ function spaxOldBackendHint() {
       return ' The backend answers without chunked uploads — paste Code.gs (v3.10) and UPDATE THE DEPLOYMENT: big saves need the chunked upload to cross a weak link.';
     }
   } catch (_) {}
-  return '';
+  // Every failed save against a deployment this old deserves the one line
+  // that can actually fix it — the amber Sync-tab note is easy to miss on a
+  // phone, and this is the pill the user is staring at.
+  return spaxBackendHint();
 }
 
 // Deployment-drift nag (2026-09-21): the app and the backend ship together,
@@ -3623,21 +3658,143 @@ function spaxOldBackendHint() {
 // (the reported "cloud sync has not worked since …" with a perfectly good
 // client). When the endpoint reports a backend older than this build needs,
 // say exactly what to do — in HTML (Sync tab) and plain text (save pills).
-const SPAX_MIN_BACKEND = 3.10;
+const SPAX_MIN_BACKEND = '3.10';
+// Backend versions are major.minor STRINGS: parseFloat('3.10') is 3.1, which
+// sorted v3.10 BELOW v3.6 and below the 3.10 minimum alike — every gate built
+// on it misjudged the newest backend as ancient. Compare components.
+function spaxBackendAtLeast(major, minor) {
+  const m = String(cloudBackendVersion || '').match(/(\d+)(?:\.(\d+))?/);
+  if (!m) return false;
+  const M = Number(m[1]), n = Number(m[2] || 0);
+  return M > major || (M === major && n >= minor);
+}
 function spaxBackendStale() {
-  const v = parseFloat(cloudBackendVersion);
-  return isFinite(v) && v < SPAX_MIN_BACKEND;
+  // A deployment that answers without ever naming a version IS stale: only
+  // backends older than v3.6 omit the field, and v3.6 is far below the
+  // v3.10 this build expects.
+  if (cloudBackendPreVersioning) return true;
+  if (!cloudBackendVersion) return false; // never asked yet — not proven stale
+  return !spaxBackendAtLeast(3, 10);
+}
+// Can this deployment issue save receipts (v3.6+)? A backend that CANNOT
+// leaves a reported save success unwitnessed — its saves are confirmed by
+// reading the cloud back instead (spaxConfirmWriteLanded). Unknown version
+// (never asked) counts as "cannot": one extra load is cheap next to a
+// hollow "✅ Saved" that leaves the sheet untouched.
+function spaxBackendCanReceipt() {
+  if (cloudBackendPreVersioning) return false;
+  return spaxBackendAtLeast(3, 6);
 }
 function spaxBackendHintHtml() {
   if (!spaxBackendStale()) return '';
-  return '<div style="margin-top:6px;font-size:.75rem;color:var(--amber)">⚠️ This endpoint runs <b>backend v' + escHtml(cloudBackendVersion) +
-    '</b> — this app expects v3.10. Tap <b>Copy Code.gs</b>, paste it into the project behind THIS URL, Save, then ' +
+  const named = cloudBackendPreVersioning
+    ? 'a backend <b>older than v3.6</b> — it answers without even reporting a version'
+    : 'backend <b>v' + escHtml(cloudBackendVersion) + '</b>';
+  return '<div style="margin-top:6px;font-size:.75rem;color:var(--amber)">⚠️ This endpoint runs ' + named +
+    ' — this app expects v3.10. Deployments this old can answer <b>SUCCESS to a save they never wrote</b> (the hollow-success bug fixed server-side in v3.10), so this app now reads the cloud back after every save to them and fails the push loudly when the write did not land. To end the round-trip: tap <b>Copy Code.gs</b>, paste it into the project behind THIS URL, Save, then ' +
     '<b>Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy</b> — saving the file alone does <b>not</b> update /exec.</div>';
 }
 function spaxBackendHint() {
   return spaxBackendStale()
-    ? ' Backend v' + cloudBackendVersion + ' is stale — paste Code.gs v3.10 and Deploy → Manage deployments → New version (saving the file does not update /exec).'
+    ? ' Backend ' + (cloudBackendPreVersioning ? 'older than v3.6' : 'v' + cloudBackendVersion) + ' is stale — paste Code.gs v3.10 and Deploy → Manage deployments → New version (saving the file does not update /exec).'
     : '';
+}
+
+// ── READ-BACK: A SUCCESS FROM A BACKEND THAT CANNOT RECEIPT IS A CLAIM, NOT PROOF ──
+// Deployments before v3.6 answer saveAll with `saveAll_(body) || {success:true}`
+// — any falsy internal outcome (a no-op path, a swallowed error) becomes a
+// reported SUCCESS with no write behind it: precisely the "push shows done,
+// sheet never changes" hollow success that v3.10 removed SERVER-SIDE. A
+// client cannot patch that deployment; receipts (v3.6+) do not exist there
+// either. The only witness left is the cloud itself: after a reported
+// success, load what the endpoint holds and compare it with what this save
+// sent. A match adopts the success; a mismatch fails the save with the one
+// instruction that fixes it (update the deployment) and records NOTHING as
+// pushed, so the next save — and the boot retry — tries again.
+// Comparison is round-trip-tolerant on purpose: transactions by the same
+// basis the save fingerprints them with, customers as an order-independent
+// key set (Sheet cells can come back typed/trimmed differently than they
+// went up; counts and identities cannot drift that way).
+function spaxCustomerKeysBasis(rows) {
+  const keys = (rows || []).map(c => {
+    c = c || {};
+    const name = String(c.name || '').trim().toLowerCase();
+    const contact = String(c.contact || c.phone || '').replace(/[^0-9]/g, '');
+    return name + '|' + contact;
+  }).sort();
+  let h = 0;
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    for (let j = 0; j < k.length; j++) h = (h * 31 + k.charCodeAt(j)) | 0;
+  }
+  return keys.length + ':' + (h >>> 0);
+}
+function spaxHollowSaveError(why) {
+  return 'the cloud reported SUCCESS but the read-back shows the save never landed (' + why +
+    ') — the deployment behind this URL is older than v3.6 and still answers hollow successes. ' +
+    'Fix: Copy Code.gs (v3.10) into the project behind this URL, then Deploy → Manage deployments → Edit → Version: New version → Deploy, then Force Push. Your data is safe on this device and retries automatically.';
+}
+// Returns {ok:true} when the reported save success is witnessed (a receipt-
+// capable backend, a matching read-back, or a read-back that could not be
+// completed — an unreadable cloud disproves nothing), else {ok:false, error}.
+// mode 'full' (saveAll / full chunked commit) replaced every live sheet with
+// exactly this save's rows, so the cloud must now EQUAL what was sent. mode
+// 'delta' only appended this device's new rows, so the cloud may legitimately
+// hold MORE (another device's push) — there the witness is "every sent row is
+// now present". Customers stage-and-swap in both modes, so their key set must
+// match either way.
+async function spaxConfirmWriteLanded(payload, allTx, mode, requiredTx) {
+  // Only a deployment KNOWN to predate v3.6 is read back: it alone combines
+  // the hollow-success answer (`saveAll_(body) || {success:true}`, removed
+  // server-side in v3.10) with NO receipts to cross-examine it with. v3.6–
+  // v3.9 deployments carry receipts (and their saveAll_ answers an explicit
+  // object on every path), and v3.10+ cannot hollow at all. A backend whose
+  // version is still unknown is not read back either: the boot load names it
+  // within seconds of app start, and spending a whole-database load on mere
+  // ignorance would tax every save of every healthy device.
+  if (!spaxBackendStale() || spaxBackendCanReceipt()) return { ok: true };
+  showSyncStatus('⏳ ' + cloudSaveRunningName() + ' — reading the cloud back to confirm the write landed…');
+  let data;
+  try {
+    data = await cloudLoad();
+  } catch (_) {
+    return { ok: true }; // the save's own success answer arrived; a dropped probe disproves nothing
+  }
+  try { spaxNoteBackendVersion(data); } catch (_) {}
+  // A witness must actually name the tables: an answer without them (a bare
+  // {success:true}, a proxy page) proves nothing either way.
+  if (!data || !Array.isArray(data.transactions) || !Array.isArray(data.customers)) return { ok: true };
+  const sentTx = allTx || [];
+  if (mode === 'delta') {
+    const have = new Set(data.transactions.map(spaxTxIdentity));
+    // Only the rows this save APPENDED are its witness: rows the cloud lost
+    // earlier (a reset sheet, another device's overwrite) are a gap delta
+    // cannot express and the next full save heals — not proof of a hollow one.
+    const required = Array.isArray(requiredTx) ? requiredTx : sentTx;
+    const missing = required.filter(t => !have.has(spaxTxIdentity(t)));
+    if (missing.length) {
+      return { ok: false, error: spaxHollowSaveError(missing.length + ' of ' + required.length + ' appended transactions are absent from the cloud') };
+    }
+  } else if (spaxTableBasis(data.transactions) !== spaxTableBasis(sentTx)) {
+    return { ok: false, error: spaxHollowSaveError('transactions: cloud holds ' + data.transactions.length + ' rows, this save sent ' + sentTx.length) };
+  }
+  if (spaxCustomerKeysBasis(data.customers) !== spaxCustomerKeysBasis(payload.customers || [])) {
+    return { ok: false, error: spaxHollowSaveError('customers: the cloud holds a different customer set than this save sent') };
+  }
+  // Witnessed. The caller's own done pill follows (it stamps lastSyncTime
+  // first); the chunked path, whose done pill fired inside the commit,
+  // re-affirms it after this returns.
+  return { ok: true };
+}
+// Books a read-back-proven hollow success as the FAILURE it is: the error
+// line, the job's failure reason (so the boot retry re-pushes), and a plain
+// "not saved" verdict — never a ✅.
+function spaxFailHollowSave(error) {
+  lastCloudError = error;
+  const job = cloudSaveRunningJob;
+  if (job) job.failedWith = error;
+  showSyncStatus(cloudSaveFailedMessage(error));
+  return false;
 }
 
 function showSyncStatus(msg) {
@@ -11760,7 +11917,10 @@ function spaxCloudUrlLineHtml(){
     ? '<br><b>Last test:</b> ' + (cloudTestResult.ok ? '<span style="color:var(--green)">✅</span> ' : '<span style="color:var(--red)">❌</span> ') +
       escHtml(cloudTestResult.detail) + ' · ' + new Date(cloudTestResult.at).toLocaleTimeString()
     : '<br><b>Last test:</b> <span style="color:var(--muted)">Not run — hit 🧪 Test connection in Cloud Sync Control</span>';
-  return urlPart + testPart;
+  // The boot load already knows when the deployment predates v3.6 — do not
+  // make the user hit Test connection to be told their pushes can hollow-
+  // succeed; the note rides the URL line itself.
+  return urlPart + testPart + spaxBackendHintHtml();
 }
 
 function loadCloudUrlField(){

@@ -1,25 +1,33 @@
 'use strict';
 
-// FULL-SAVE MODE — the default since 2026-09-20.
+// FULL-SAVE MODE — the default since 2026-09-20, retuned 2026-09-21.
 //
 // The user's verdict on three weeks of incremental upload machinery,
 // verbatim: "better the save all with duplicates than the cloud fail I am
-// experiencing." Deltas (backend v3.4), chunked sessions (v3.0) and
-// recoverable upload sessions (v3.8) each added another way for a save to
-// die on a weak link, and what kept failing was the machinery itself. The
-// default is now the one path that cannot fail structurally:
+// experiencing." Deltas (backend v3.4) and targeted contact edits added ways
+// for a save to die on a weak link, so the default SEMANTICS are plain:
 //
-//   EVERY save is ONE atomic one-shot saveAll POST of the whole database.
-//   • the backend stages then swaps, so a retry only re-sends the same body;
+//   EVERY save is ONE atomic full replace of the whole database.
+//   • small databases (≤ CHUNK_ROWS rows) ride a one-shot saveAll POST — the
+//     backend stages then swaps, so a retry only re-sends the same body;
+//   • BIG databases ride the resumable chunked transport (saveBegin →
+//     saveChunk×N → saveCommit): ≤250 KB per request, and the commit
+//     count-verifies every promised row before it swaps all live sheets —
+//     the same one-atomic-replace guarantee, deliverable across a weak link.
+//     (The 2026-09-21 lesson: the whole-database one-shot is a ~4 MB POST
+//     that weak signal routinely aborts before the server sees its end —
+//     "push shows done but the sheet has no change" was exactly that death
+//     being papered over with a stale-receipt verify. Semantics were never
+//     the problem; the transport was.)
 //   • the load path union-merges by dedup key, so re-sent rows ("the
 //     duplicates") can never double-count;
-//   • saveAll is the one action every backend version has ever answered, so
-//     no Code.gs redeploy is ever required.
+//   • no delta append and no targeted contact-edit protocol runs in default
+//     mode — fewer ways to fail.
 //
 // The incremental machinery is still in the code, opt-in via localStorage
 // spaxCloudFullSave='0' (the suites that pin it seed that flag). This suite
-// pins the DEFAULT: a backend that speaks every protocol — so the only thing
-// that can make the client send plain saveAll is full-save mode itself.
+// pins the DEFAULT: a backend that speaks EVERY protocol — so the only thing
+// that can make the client send plain saveAll is a SMALL full-save.
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -49,12 +57,14 @@ function txKey(r) {
 
 // A backend that speaks EVERYTHING: chunked sessions (v3.8 semantics),
 // saveDelta (v3.4), updateCustomer (v3.7), receipts on status (v3.6+).
-// `statusUnknown` downgrades status to "unknown action" — an ancient
-// deployment — so convergence can be pinned with no receipt machinery.
+// `plain` downgrades every action except saveAll to "unknown action" — an
+// ancient saveAll-only deployment — so the one-shot fallback and its
+// convergence can be pinned with no receipts, no sessions, nothing.
+// `statusUnknown` downgrades status to "unknown action" alone.
 // `slowSaveAll: {ms, times}` holds the first N saveAll answers longer than
 // the client's (patched) deadline, honouring the abort signal like a real
 // fetch: the answer never arrives, but the write lands server-side.
-function makeCloud({ statusUnknown = false, slowSaveAll = null } = {}) {
+function makeCloud({ statusUnknown = false, plain = false, slowSaveAll = null } = {}) {
   const calls = [];
   const live = { transactions: [] };
   const staged = { transactions: [] };
@@ -78,9 +88,10 @@ function makeCloud({ statusUnknown = false, slowSaveAll = null } = {}) {
       live.transactions = (body.transactions || []).slice(); // atomic stage→swap
       return respond({ success: true });
     }
+    if (plain) return respond({ success: false, error: 'unknown action' });
     if (body.action === 'status') {
       if (statusUnknown) return respond({ success: false, error: 'unknown action' });
-      return respond({ success: true, version: '3.9', lastSave: null, lock: { free: true, ms: 0 } });
+      return respond({ success: true, version: '3.10', lastSave: null, lock: { free: true, ms: 0 } });
     }
     if (body.action === 'saveBegin') {
       staged.transactions = [];
@@ -176,22 +187,41 @@ async function runClient(cloud, db, { patch = [] } = {}) {
 
 const INCREMENTAL_ACTIONS = ['saveBegin', 'saveChunk', 'saveCommit', 'saveDelta', 'updateCustomer'];
 
-test('default: a big save is ONE atomic saveAll — no probes, no sessions, no deltas', async () => {
+test('default: a small save is ONE atomic saveAll — no probes, no sessions, no deltas', async () => {
   const cloud = makeCloud(); // speaks EVERY protocol — must not matter
-  const { ctx } = await runClient(cloud, bigDB());
+  const { ctx } = await runClient(cloud, bigDB(500));
   assert.strictEqual(vm.runInContext('cloudFullSave', ctx), true,
     'full-save mode must be the default when localStorage has no override');
 
   assert.strictEqual(await ctx.saveToCloud(true), true);
   assert.deepStrictEqual(cloud.calls.map(c => c.action), ['saveAll'],
     'exactly one POST, on a backend that could have served every other path');
-  assert.strictEqual(cloud.calls[0].transactions.length, 2501, 'the whole database rides');
-  assert.strictEqual(cloud.live.transactions.length, 2501, 'and it landed');
+  assert.strictEqual(cloud.calls[0].transactions.length, 500, 'the whole database rides');
+  assert.strictEqual(cloud.live.transactions.length, 500, 'and it landed');
+});
+
+test('default: a BIG save rides the resumable chunked transport — count-verified atomic replace, no deltas', async () => {
+  const cloud = makeCloud(); // speaks EVERY protocol — chunked wins on size alone
+  const { ctx } = await runClient(cloud, bigDB(2501));
+  assert.strictEqual(vm.runInContext('cloudFullSave', ctx), true);
+
+  assert.strictEqual(await ctx.saveToCloud(true), true);
+  assert.deepStrictEqual(cloud.calls.map(c => c.action),
+    ['saveBegin', 'saveChunk', 'saveChunk', 'saveCommit'],
+    'the ~4 MB one-shot is replaced by ≤250 KB slices: begin, 2 slices (2000+501), commit');
+  assert.ok(!cloud.calls.some(c => c.action === 'saveDelta' || c.action === 'updateCustomer'),
+    'full-save mode never appends or edits in place');
+  const chunks = cloud.calls.filter(c => c.action === 'saveChunk');
+  assert.strictEqual(chunks.flatMap(c => c.rows).length, 2501, 'every row is staged exactly once');
+  const commit = cloud.calls.find(c => c.action === 'saveCommit');
+  assert.deepStrictEqual(commit.expect, { transactions: 2501 }, 'the commit promises the full set');
+  assert.strictEqual(cloud.live.transactions.length, 2501,
+    'the commit swaps the whole sheet in — one atomic replace');
 });
 
 test('a routine background save is full too: rows the cloud already holds are re-sent ("with duplicates")', async () => {
   const cloud = makeCloud();
-  const db = bigDB();
+  const db = bigDB(500);
   const { ctx } = await runClient(cloud, db);
   assert.strictEqual(await ctx.saveToCloud(true), true); // baseline: everything pushed
 
@@ -201,14 +231,19 @@ test('a routine background save is full too: rows the cloud already holds are re
 
   const calls = cloud.calls.slice(before);
   assert.deepStrictEqual(calls.map(c => c.action), ['saveAll'],
-    'the routine save must not probe, append or slice');
-  assert.strictEqual(calls[0].transactions.length, 2502,
-    'ALL rows are re-sent — the 2501 the cloud already holds included');
-  assert.strictEqual(cloud.live.transactions.length, 2502);
+    'the routine small save must not probe, append or slice');
+  assert.strictEqual(calls[0].transactions.length, 501,
+    'ALL rows are re-sent — the 500 the cloud already holds included');
+  assert.strictEqual(cloud.live.transactions.length, 501);
 });
 
-test('a timed-out saveAll converges by re-sending the SAME full body — on a backend that predates every receipt', async () => {
-  const cloud = makeCloud({ statusUnknown: true, slowSaveAll: { ms: 200, times: 1 } });
+test('a timed-out saveAll converges by re-sending the SAME full body — on a saveAll-only backend', async () => {
+  // A deployment that predates receipts AND chunked actions: the chunked
+  // probe is refused ("unknown action") and the save falls through to the
+  // one-shot saveAll — whose deadline is CLOUD_TIMEOUT_BIG_SAVE for a big
+  // payload. The first attempt aborts client-side while the server write
+  // completes anyway; convergence must re-send the same full body.
+  const cloud = makeCloud({ plain: true, slowSaveAll: { ms: 200, times: 1 } });
   const { ctx } = await runClient(cloud, bigDB(), {
     patch: [
       [/const CLOUD_TIMEOUT_BIG_SAVE = \d+;/, 'const CLOUD_TIMEOUT_BIG_SAVE = 40;'],
@@ -217,18 +252,20 @@ test('a timed-out saveAll converges by re-sending the SAME full body — on a ba
   });
   assert.strictEqual(await ctx.saveToCloud(true), true, 'the save must eventually succeed');
 
+  assert.strictEqual(cloud.calls.filter(c => c.action === 'saveBegin').length, 1,
+    'the chunked probe is asked once and refused');
   const saveAlls = cloud.calls.filter(c => c.action === 'saveAll');
   assert.ok(saveAlls.length >= 2, 'the timed-out attempt must be retried, not abandoned');
   saveAlls.forEach((c) => assert.strictEqual(c.transactions.length, 2501,
     'every attempt carries the whole database'));
-  assert.ok(!cloud.calls.some(c => INCREMENTAL_ACTIONS.includes(c.action)),
+  assert.ok(!cloud.calls.some(c => c.action === 'saveDelta' || c.action === 'updateCustomer' || c.action === 'saveChunk'),
     'the retry must never fall into the incremental machinery');
   assert.strictEqual(cloud.live.transactions.length, 2501, 'the retried body landed whole');
 });
 
 test('a contact edit rides the full save — no second protocol to fail', async () => {
   const cloud = makeCloud();
-  const { ctx } = await runClient(cloud, bigDB());
+  const { ctx } = await runClient(cloud, bigDB(500));
   const edit = {
     oldName: 'C0', oldContact: '25470', newName: 'C0', newContact: '254711122233',
     customer: { name: 'C0', contact: '254711122233', spent: 100, visits: 1 }
@@ -260,8 +297,10 @@ test('source pins: the default is full-save and every clever path is behind the 
     'absence of the key must mean ON (no legacy device silently keeps the failing path)');
   assert.ok(/if \(!cloudFullSave && deltaRows !== null && \(cloudDelta \|\| !cloudDeltaProbed\)\)/.test(HTML),
     'the delta path must be gated');
-  assert.ok(/if \(!cloudFullSave && totalBigRows > CHUNK_ROWS && \(cloudChunks \|\| !cloudChunkProbed\)\)/.test(HTML),
-    'the chunked path must be gated');
+  // The chunked transport serves FULL-REPLACE saves in default mode (a size
+  // decision, not a semantics decision), and delta sessions behind the flag.
+  assert.ok(/if \(totalBigRows > CHUNK_ROWS && \(cloudChunks \|\| !cloudChunkProbed\)\)/.test(HTML),
+    'the chunked gate must key on size (and capability) alone — not on the delta flag');
   const fn = HTML.slice(HTML.indexOf('async function spaxPushCustomerEdit'), HTML.indexOf('function spaxComputeDeltaRows'));
   assert.ok(/if \(cloudFullSave\) return false;/.test(fn),
     'the targeted contact-edit push must stand down in full-save mode');

@@ -19,7 +19,7 @@
 // that wipes the staging area the previous attempt had just filled (the
 // reported save that never completes). Installed apps must pick up the new
 // shell for the fix to reach them.
-const CACHE_NAME = 'spax-v31';
+const CACHE_NAME = 'spax-v32';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

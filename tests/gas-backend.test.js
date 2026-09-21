@@ -115,6 +115,8 @@ function makeEnv({ lockBusy = false } = {}) {
 
   const spreadsheet = {
     getId: () => 'SSID-1',
+    getName: () => 'Spax Test Sheet',
+    getUrl: () => 'https://docs.google.com/spreadsheets/d/SSID-1/edit',
     getSheetByName: (n) => sheets.get(n) || null,
     insertSheet: (n) => {
       const s = makeSheet(n, sheets);
@@ -394,7 +396,7 @@ test('v3.8: a client-minted uploadId is honoured and status reports its session'
   assert.strictEqual(begin.uploadId, 'client-abc123');
 
   const status = await env.post({ action: 'status' });
-  assert.strictEqual(status.version, '3.9');
+  assert.strictEqual(status.version, '3.10');
   assert.strictEqual(status.session.uploadId, 'client-abc123');
   assert.strictEqual(status.session.mode, 'full');
   assert.ok(status.session.at > 0, 'the session reports when saveBegin ran');
@@ -709,8 +711,8 @@ test('code.html reads the backend version from the file, not from hard-coded mar
   // …and the version it reports is the backend this repo ships. Bump this pin
   // with the header above: a version nobody updated the pin for is exactly the
   // drift this test exists to catch.
-  // (v3.9: user lock + server-side `srv` timings on every save answer.)
-  assert.strictEqual(current.ver, 'v3.9', 'code.html must be offering the fixed backend');
+  // (v3.10: answers name their spreadsheet; no hollow saveAll success.)
+  assert.strictEqual(current.ver, 'v3.10', 'code.html must be offering the fixed backend');
 });
 
 /* ── incremental saves (backend v3.4) ───────────────────────────────────────
@@ -1276,4 +1278,43 @@ test('updateCustomer appends a record the sheet does not hold yet, and refuses u
   const refused = await busy.post({ action: 'updateCustomer', edits: [{ customer: { name: 'X', contact: '' } }] });
   assert.strictEqual(refused.success, false);
   assert.match(refused.error, /backend busy/);
+});
+
+/* ── v3.10: answers name their spreadsheet; no hollow saveAll success ────── */
+
+test('v3.10: status and load name the spreadsheet this endpoint writes to', async () => {
+  const env = makeEnv();
+  const st = await env.post({ action: 'status' });
+  assert.deepStrictEqual(st.spreadsheet, {
+    id: 'SSID-1',
+    name: 'Spax Test Sheet',
+    url: 'https://docs.google.com/spreadsheets/d/SSID-1/edit'
+  });
+  const full = await env.load();
+  assert.deepStrictEqual(full.spreadsheet, st.spreadsheet,
+    'load carries the same identity — the client shows it beside every verdict');
+
+  // The identity is best-effort: a spreadsheet that cannot describe itself
+  // must not break the action it rides on.
+  const mute = makeEnv();
+  mute.ctx.SpreadsheetApp = {
+    getActiveSpreadsheet: () => null,
+    openById: () => { throw new Error('no metadata'); },
+    create: () => { throw new Error('no metadata'); }
+  };
+  const st2 = await mute.post({ action: 'status' });
+  assert.strictEqual(st2.success, true);
+  assert.strictEqual(st2.spreadsheet, null);
+});
+
+test('v3.10: a saveAll handler that produces no answer is NOT reported as saved', () => {
+  // doPost must never paper over a handler that returned nothing with a
+  // hollow {success:true} — "push shows done but the sheet has no change"
+  // is exactly what such a lie produces on the client. The save action
+  // falls back to an explicit failure the client can retry.
+  const doPost = GAS.slice(GAS.indexOf('function doPost'));
+  assert.match(doPost, /saveAllAnswer \|\| \{ success: false/,
+    'doPost must answer {success:false} when saveAll_ produces no answer');
+  assert.ok(!/return json_\(saveAll_\(body\) \|\| \{ success: true \}\)/.test(doPost),
+    'the old one-line hollow-success fallback must be gone');
 });

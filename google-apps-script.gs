@@ -1,6 +1,22 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.9  (2026-09-19)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.10  (2026-09-21)
  * ─────────────────────────────────────────────────────────────────
+ * v3.10 makes every answer self-identifying and kills the last hollow-success
+ * path — the "push shows done but the sheet never changes" class of bug:
+ *   • action=status and action=load now report `spreadsheet`: {id, name, url}
+ *     — WHICH Google Sheet this deployment actually writes. Two deployments
+ *     (a "New deployment" made during fix attempts, each with its own /exec
+ *     URL and its own spreadsheet) are the classic way pushes "succeed"
+ *     against a sheet nobody is watching. The Sync tab shows this URL so the
+ *     user can compare it with the sheet they have open, one glance.
+ *   • doPost no longer answers `{success: true}` for a saveAll that returned
+ *     NOTHING. The old `saveAll_(body) || { success: true }` fallback turned
+ *     any falsy return into a reported SUCCESS without proof of a write. A
+ *     saveAll that produces no answer is now reported as NOT SAVED.
+ *   • BACKEND_VERSION is what the client's staleness check compares against:
+ *     an app talking to an older deployment now says "paste Code.gs v3.10 and
+ *     UPDATE THE DEPLOYMENT (Version: New version)" instead of failing
+ *     silently — saving the file in the editor does not change /exec.
  * v3.9 moves the save lock from the script lock to the user lock, and makes
  * every save answer carry its own server-side timings:
  *   • This web app always executes as its owner ("Execute as: Me"), so every
@@ -208,7 +224,7 @@ var TABLE_HEADERS = {
      • waitLock's answer is honoured: a save that cannot get the script lock is
        refused instead of running alongside the writer that holds it. */
 
-var BACKEND_VERSION = '3.9';
+var BACKEND_VERSION = '3.10';
 
 var STAGE_SUFFIX = '_Staging';
 var SWAP_TMP_SUFFIX = '_SwapTmp';
@@ -280,9 +296,14 @@ function doPost(e) {
     var action = body.action || '';
 
     if (action === 'saveAll') {
-      // saveAll_ returns a failure object when it could not take the script
-      // lock; anything else means the stage-and-swap completed.
-      return json_(saveAll_(body) || { success: true });
+      // saveAll_ answers an explicit object: the busy refusal, or the success
+      // (returned AFTER the stage-and-swap completed). The old
+      // `saveAll_(body) || { success: true }` fallback reported any falsy
+      // return as a SUCCESS — the client then showed "✅ Pushed" for a save
+      // that may never have written ("push done, sheet unchanged"). A
+      // saveAll that produces no answer is a failure, never a success.
+      var saveAllAnswer = saveAll_(body);
+      return json_(saveAllAnswer || { success: false, error: 'save produced no answer — treat as NOT saved and retry the save' });
     }
 
     if (action === 'saveDelta') {
@@ -406,6 +427,7 @@ function loadAll_() {
   return {
     success: true,
     version: BACKEND_VERSION,
+    spreadsheet: spreadsheetInfo_(),
     customers: customers,
     monthly: monthly,
     settings: settings,
@@ -413,6 +435,21 @@ function loadAll_() {
     customerTx: customerTx,
     seen: seen
   };
+}
+
+// Identity of the spreadsheet this deployment reads and writes (v3.10) —
+// name + URL so the app can put it on the Sync tab next to every verdict.
+// Best-effort by design: a probe that cannot resolve the spreadsheet still
+// answers everything else.
+function spreadsheetInfo_() {
+  try {
+    var ss = getSpreadsheet_();
+    return {
+      id: String(ss.getId()),
+      name: String(ss.getName()),
+      url: String(ss.getUrl())
+    };
+  } catch (err) { return null; }
 }
 
 /* ══════════ STATUS + SAVE RECEIPTS (v3.6) ══════════
@@ -444,6 +481,12 @@ function status_() {
     version: BACKEND_VERSION,
     txRows: txRows,
     customersRows: customersRows,
+    // v3.10: WHICH spreadsheet this deployment writes. The "push done but my
+    // sheet never changed" confusion is almost always two deployments each
+    // with their own /exec URL and their own spreadsheet — this field lets
+    // the app SHOW the user the sheet it talks to, so the mismatch is one
+    // glance instead of three weeks of guessing.
+    spreadsheet: spreadsheetInfo_(),
     lastSave: lastSaveReceipt_(),
     // v3.8: the staging session the newest saveBegin started. A client whose
     // saveBegin answer was lost asks for this to recognise the session its

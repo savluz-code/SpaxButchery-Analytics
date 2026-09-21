@@ -340,16 +340,21 @@ test('a fresh interruption defers the resume until the server-side writer can be
   assert.equal('spaxPendingSync' in cloud.store, false, 'consumed once the resume runs');
 });
 
-test('the resume verifies against the lock-free status receipt before re-uploading', async () => {
+test('the resume verifies ITS OWN interrupted attempt (by tag) before re-uploading', async () => {
   const cloud = makeCloud({});
   const status = [];
   const ctx = runCtx(cloud, smallDB(), status);
-  // The zombie landed our exact data after the client gave up: the receipt
-  // echoes the current payload's fingerprints.
+  // The zombie landed OUR ATTEMPT after the client gave up: the receipt
+  // echoes that attempt's unique tag and fingerprints — which the attempt
+  // persisted before its first request went out (the state a killed tab
+  // leaves behind).
+  const txBasis = vm.runInContext('spaxTableBasis(DB.transactions)', ctx);
+  const smallBasis = vm.runInContext('spaxSmallBasis(spaxBuildSavePayload())', ctx);
   cloud.landed.n = 1;
   cloud.landed.saveTag = 'zombie';
-  cloud.landed.txBasis = vm.runInContext('spaxTableBasis(DB.transactions)', ctx);
-  cloud.landed.smallBasis = vm.runInContext('spaxSmallBasis(spaxBuildSavePayload())', ctx);
+  cloud.landed.txBasis = txBasis;
+  cloud.landed.smallBasis = smallBasis;
+  cloud.store.spaxSaveAttempt_v1 = JSON.stringify({ tag: 'zombie', txBasis, smallBasis, ts: Date.now() - 3600000 });
   cloud.store.spaxPendingSync = String(Date.now() - 3600000);
   assert.strictEqual(vm.runInContext('spaxResumeInterruptedSave()', ctx), true);
   await new Promise((r) => setTimeout(r, 100));
@@ -357,6 +362,32 @@ test('the resume verifies against the lock-free status receipt before re-uploadi
   assert.strictEqual(cloud.attempts('saveAll') || 0, 0, 'landed data must not be re-uploaded');
   assert.ok(status.some((m) => /already landed|checking whether the last attempt landed/.test(m)));
   assert.equal('spaxPendingSync' in cloud.store, false, 'the stale flag is consumed');
+});
+
+test('the resume never adopts a STALE receipt — same fingerprints, another save\'s tag', async () => {
+  // The "push shows done but the sheet has no change" trap: the receipt on
+  // the backend belongs to an OLDER save (the last one that ever wrote). It
+  // carries identical fingerprints (the local data never changed — the user
+  // was re-pushing the same database) but a different tag. Matching on
+  // fingerprints alone adopted it as "the interrupted attempt landed", the
+  // app showed ✅, recorded everything as pushed — and the upload it vouched
+  // for had never written a cell. The tag is the proof; without it the save
+  // must re-upload.
+  const cloud = makeCloud({});
+  const status = [];
+  const ctx = runCtx(cloud, smallDB(), status);
+  const txBasis = vm.runInContext('spaxTableBasis(DB.transactions)', ctx);
+  const smallBasis = vm.runInContext('spaxSmallBasis(spaxBuildSavePayload())', ctx);
+  cloud.landed.n = 1;
+  cloud.landed.saveTag = 'an-older-save';       // NOT the interrupted attempt
+  cloud.landed.txBasis = txBasis;               // …but identical fingerprints
+  cloud.landed.smallBasis = smallBasis;
+  cloud.store.spaxSaveAttempt_v1 = JSON.stringify({ tag: 'zombie', txBasis, smallBasis, ts: Date.now() - 3600000 });
+  cloud.store.spaxPendingSync = String(Date.now() - 3600000);
+  assert.strictEqual(vm.runInContext('spaxResumeInterruptedSave()', ctx), true);
+  await new Promise((r) => setTimeout(r, 150));
+  assert.strictEqual(cloud.attempts('status'), 1, 'the receipt is asked for');
+  assert.ok((cloud.attempts('saveAll') || 0) >= 1, 'a stale receipt must NOT shortcut the upload');
 });
 
 test('structural pins: the resume defers inside the server-exec window and verifies before pushing', () => {

@@ -952,7 +952,7 @@ function doPost(e) {
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.5 · <span id="buildStamp">build 2026-09-19</span> · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.5 · <span id="buildStamp">build 2026-09-21</span> · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -1061,24 +1061,29 @@ try { cloudDelta = localStorage.getItem('spaxCloudDelta') === '1'; } catch (_) {
 let cloudCustomerEdit = true;
 try { cloudCustomerEdit = localStorage.getItem('spaxCloudCustomerEdit') !== '0'; } catch (_) {}
 
-// ── FULL-SAVE MODE (the default since 2026-09-20) ──
-// The user's verdict on three weeks of upload machinery, verbatim: "better
-// the save all with duplicates than the cloud fail I am experiencing."
-// Every refinement of the upload path — delta appends (backend v3.4), chunked
-// sessions (v3.0), recoverable upload sessions (v3.8) — added another way for
-// a save to die on a weak link, and what kept failing was the machinery
-// itself: probes to stage, staging areas to lose, sessions to recover, every
-// step with its own deadline and lock story. Full-save mode takes all of it
-// out of the hot path: EVERY save is one atomic one-shot saveAll — the whole
-// database in a single POST. The backend stages then swaps, so a retry can
-// only ever re-send the same body; the load path union-merges by dedup key,
-// so re-sent rows can never double-count. "With duplicates" is the accepted
-// cost — a full upload where a delta would have carried less — traded
-// knowingly for a save that cannot fail in any of the ways a cleverer path
-// can. It also means no Code.gs redeploy is ever required again: saveAll is
-// the one action every backend version since the beginning has answered.
-// The incremental machinery is still here, code and tests intact, for the day
-// the link can carry it: localStorage spaxCloudFullSave='0' restores it.
+// ── FULL-SAVE MODE (the default since 2026-09-20, retuned 2026-09-21) ──
+// The user's verdict on three weeks of INCREMENTAL machinery, verbatim:
+// "better the save all with duplicates than the cloud fail I am
+// experiencing." Deltas (backend v3.4) and targeted contact edits added ways
+// for a save to die on a weak link — probes to stage, staging areas to lose,
+// deltas that can never express a deletion — so the default SEMANTICS are
+// deliberately plain: EVERY save is ONE atomic full replace of the whole
+// database. The backend stages then swaps (or count-verifies then swaps the
+// chunked commit), so a retry can only ever re-send the same content; the
+// load path union-merges by dedup key, so re-sent rows ("the duplicates")
+// can never double-count. "With duplicates" is the accepted cost.
+// 2026-09-21: what the one-shot got WRONG was the transport, not the
+// semantics. The whole database is a ~4 MB POST — weak mobile signal
+// routinely aborts it before the server ever sees its end, and every retry
+// died the same death (the reported "push shows done but the sheet has no
+// change" — the ✅ came from verify step adopting a stale receipt, never
+// from a write). A big full replace therefore rides the RESUMABLE chunked
+// transport (saveBegin → saveChunk×N → saveCommit, ≤250 KB per request,
+// count-verified atomic swap at commit — the same one-atomic-replace
+// guarantee, delivered across drops). Small saves stay a single one-shot
+// saveAll POST, which every backend version has always answered. The
+// delta/contact-edit machinery is still here, code and tests intact, opt-in
+// via localStorage spaxCloudFullSave='0'.
 let cloudFullSave = true;
 try { cloudFullSave = localStorage.getItem('spaxCloudFullSave') !== '0'; } catch (_) {}
 
@@ -1424,6 +1429,44 @@ function spaxNoteCloudTransactions(rows) {
 function spaxReplacePushedFromCloud(rows) {
   spaxSavePushedTx((rows || []).map(spaxTxIdentity).filter(Boolean));
   spaxClearTxFullReplace();
+}
+
+// ── ATTEMPT RECEIPTS: A "LANDED" MUST MEAN LANDED ──
+// (2026-09-21: the "push shows done but the sheet has no change" bug.)
+// Every upload attempt gets a unique saveTag, and that tag is what a receipt
+// must echo before an interrupted attempt may be adopted as "already landed".
+// The old check matched only the data FINGERPRINTS (txBasis/smallBasis) — so
+// after a saveAll that timed out (a ~4 MB one-shot upload routinely does on a
+// weak link), the retry's verify step found an OLD receipt — the last save
+// that ever wrote, weeks ago — carrying the same fingerprints (the local
+// data had not changed: the user was re-pushing the same database) and
+// adopted it as proof that the NEW attempt landed. The app then showed
+// "✅ Pushed 2182 customers" and recorded everything as pushed, while the
+// attempt it was vouching for had never written a single cell. Every retry
+// repeated the same false adoption against the same stale receipt: push
+// "done" forever, sheet unchanged forever.
+// A receipt is therefore proof ONLY when its `tag` is this exact attempt's
+// tag. The identity of the attempt in flight is persisted here BEFORE the
+// request goes out, so a killed tab's resume can still name the attempt it
+// is asking about — and a receipt for any other attempt (even with identical
+// content) is never adopted.
+const SPAX_ATTEMPT_KEY = 'spaxSaveAttempt_v1';
+
+function spaxSaveAttempt(attempt) {
+  try {
+    localStorage.setItem(SPAX_ATTEMPT_KEY, JSON.stringify({
+      tag: attempt.tag,
+      txBasis: attempt.txBasis,
+      smallBasis: attempt.smallBasis,
+      ts: Date.now()
+    }));
+  } catch (_) {}
+}
+function spaxLoadAttempt() {
+  try {
+    const a = JSON.parse(localStorage.getItem(SPAX_ATTEMPT_KEY) || 'null');
+    return a && a.tag && a.txBasis && a.smallBasis ? a : null;
+  } catch (_) { return null; }
 }
 
 // ── NOTHING-NEW SAVES ──
@@ -2137,14 +2180,23 @@ function spaxResumeNow(startedAt) {
   const resumeName = (typeof CLOUD_SAVE_NAMES !== 'undefined' ? CLOUD_SAVE_NAMES.resume : '🔄 Resumed save');
   // The interrupted attempt may have LANDED after the client gave up — its
   // receipt is on the v3.6 backend's lock-free `status` answer. Hand this
-  // attempt its fingerprints so the FIRST thing it does is verify, instead
-  // of re-uploading a whole database that may already be up there.
+  // resume the persisted IDENTITY of that interrupted attempt (its unique
+  // tag, minted and stored before its first request went out) so the FIRST
+  // thing it does is verify THAT attempt — a receipt for any other save,
+  // even with identical fingerprints, is never adopted (see
+  // SPAX_ATTEMPT_KEY). No persisted identity (an interrupted save from an
+  // older build) means no verification: the save proceeds exactly as before.
   let verifyFirst = null;
   try {
-    if (typeof DB !== 'undefined' && DB && typeof spaxBuildSavePayload === 'function' &&
+    const att = (typeof spaxLoadAttempt === 'function') ? spaxLoadAttempt() : null;
+    if (att && typeof DB !== 'undefined' && DB && typeof spaxBuildSavePayload === 'function' &&
         typeof spaxTableBasis === 'function' && typeof spaxSmallBasis === 'function') {
       const payload = spaxBuildSavePayload();
-      verifyFirst = { txBasis: spaxTableBasis(payload.transactions || []), smallBasis: spaxSmallBasis(payload) };
+      const txBasis = spaxTableBasis(payload.transactions || []);
+      const smallBasis = spaxSmallBasis(payload);
+      // Only when the database is still exactly what the interrupted attempt
+      // was sending do its fingerprints describe this save.
+      if (att.txBasis === txBasis && att.smallBasis === smallBasis) verifyFirst = att;
     }
   } catch (_) {}
   try { showSyncStatus('🔄 Resuming interrupted save — ' + resumeName + when); } catch (_) {}
@@ -2501,6 +2553,52 @@ function cloudSaveFailedMessage(msg) {
     (total > 1 ? ' (' + cloudSavePos + '/' + total + ')' : '') + ': ' + msg;
 }
 
+// ── POST-SAVE PROOF (2026-09-21) ──
+// "Shows push done, but sheet has no change." A ✅ must be EARNED: after an
+// explicit Force Push lands, ask the SAME endpoint for its save receipt and
+// match it against the attempt that just finished (the identity persisted by
+// spaxSaveAttempt before its first request). Outcomes:
+//   • the receipt carries this attempt's tag          → receipt confirmed;
+//   • the receipt carries identical content (a retry
+//     or another device saved the same bytes)         → content confirmed;
+//   • a NEWER receipt for different content           → another device saved
+//     over this push in the gap — say so honestly;
+//   • an OLDER receipt for different content          → this push did NOT
+//     land on this endpoint. That is the two-deployments / wrong-sheet trap:
+//     name the spreadsheet the endpoint writes to and tell the user to
+//     compare it with the sheet they are watching.
+// A probe that cannot run (old backend without status, a network blip) never
+// downgrades a save the server already confirmed — the save's own success
+// stands, just without the extra ribbon.
+async function spaxConfirmLastSave(post) {
+  const attempt = spaxLoadAttempt();
+  if (!attempt) return { ok: true, note: '' };
+  let st = null;
+  try {
+    st = await post({ action: 'status' }, CLOUD_TIMEOUT_DEFAULT, 0);
+  } catch (_) {
+    return { ok: true, note: '' };
+  }
+  try { spaxNoteBackendVersion(st); } catch (_) {}
+  const rec = st && st.lastSave;
+  const where = cloudSpreadsheetNote();
+  if (rec && rec.tag === attempt.tag) {
+    return { ok: true, note: ' Receipt confirmed' + where + '.' };
+  }
+  if (rec && rec.txBasis === attempt.txBasis && rec.smallBasis === attempt.smallBasis) {
+    return { ok: true, note: ' Content confirmed in the cloud' + where + '.' };
+  }
+  if (rec && Number(rec.at) > Number(attempt.ts) - 2000) {
+    return { ok: true, note: ' (a newer save from another device landed right after this push' + where + ')' };
+  }
+  return {
+    ok: false,
+    note: 'The cloud answered success but its newest save receipt is OLDER than this push and holds different data — this push did NOT land on this endpoint' + where + '. ' +
+      'You are most likely looking at a different Google Sheet than this /exec URL writes to (a second deployment). ' +
+      'Run 🧪 Test, compare the 📄 sheet it names with the sheet you have open, and fix the Cloud URL or re-paste Code.gs into the right project.'
+  };
+}
+
 // The cloud save payload, built in exactly one place so the save path and
 // the resume pre-check (spaxResumeInterruptedSave) can never describe two
 // different databases. Merchant exclusion applies to the cloud too: never
@@ -2662,10 +2760,15 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
     // fingerprints of the data it carries. Every one-shot save body and
     // every commit echoes them, and the server stores them as the save's
     // receipt on success — so an attempt whose response never arrived can be
-    // verified (did it land?) instead of re-uploaded blindly.
+    // verified (did it land?) instead of re-uploaded blindly. The identity is
+    // persisted BEFORE any request goes out (spaxSaveAttempt) so a killed
+    // tab's resume can still name the exact attempt it is asking about —
+    // only that attempt's own tag may ever be adopted as "landed".
     const saveTag = 't' + Date.now().toString(36) + Math.floor(Math.random() * 0x1000000).toString(36);
     const txBasis = spaxTableBasis(allTx);
     const smallBasis = spaxSmallBasis(payload);
+    const attempt = { tag: saveTag, txBasis, smallBasis };
+    spaxSaveAttempt(attempt);
     // ── VERIFY BEFORE RE-UPLOADING ──
     // This attempt only exists because the previous one ended ambiguously
     // (its connection timed out — the server may have finished writing
@@ -2742,7 +2845,7 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
           // HTTP/app error, a network drop the server never saw) is not
           // proof the deployment lacks saveDelta either — fall back just
           // this once, exactly as before.
-          const rerouted = cloudSaveRerouteTimeout(err, { txBasis, smallBasis });
+          const rerouted = cloudSaveRerouteTimeout(err, attempt);
           if (rerouted !== err) throw rerouted;
           console.warn('Delta probe failed (' + (err && err.message) + ') — falling back to a full save.');
           // fall through
@@ -2757,14 +2860,21 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       }
     }
 
-    // Large payloads try the chunked upload first — but only if the backend is
-    // known (or not yet known) to support it. A saveAll-only backend answers
-    // "unknown action", we remember that for the session, and the save falls
-    // straight through to the one-shot request below. Small saves are always
-    // a single request, on every backend.
-    // Full-save mode (the default) skips this too: the one-shot saveAll below
-    // IS the whole save, however big the database is.
-    if (!cloudFullSave && totalBigRows > CHUNK_ROWS && (cloudChunks || !cloudChunkProbed)) {
+    // Large payloads go up through the resumable chunked transport —
+    // saveBegin → saveChunk×N → saveCommit — even in full-save mode. The
+    // SEMANTICS stay "one atomic full replace" (the commit count-verifies
+    // every promised row and only then swaps all live sheets — exactly what
+    // one-shot saveAll does); only the TRANSPORT changes. This is what makes
+    // a big save land at all: the whole-database one-shot saveAll is a ~4 MB
+    // POST that weak mobile signal routinely aborts before the server ever
+    // sees its end (the very failure that spent three weeks being papered
+    // over with false "verified" receipts). A chunked request is ≤250 KB and
+    // an interrupted upload RESUMES from its last acknowledged slice. Small
+    // saves are always a single request (the one-shot saveAll below); a
+    // saveAll-only backend answers "unknown action" to the saveBegin probe,
+    // we remember that for the session, and the save falls through to the
+    // one-shot request exactly as before.
+    if (totalBigRows > CHUNK_ROWS && (cloudChunks || !cloudChunkProbed)) {
       try {
         const chunked = await saveToCloudChunked(post, payload, bigTables, totalBigRows, 'full', { tag: saveTag, txBasis, smallBasis });
         if (chunked) {
@@ -2830,7 +2940,7 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
         try { err._spaxRetried = true; result = await post(saveAllBody, saveAllTimeout); }
         catch (err2) { err2._spaxRetried = true; throw cloudSaveRerouteTimeout(err2, { txBasis, smallBasis }); }
       } else {
-        throw cloudSaveRerouteTimeout(err, { txBasis, smallBasis });
+        throw cloudSaveRerouteTimeout(err, attempt);
       }
     }
     if (result.success) {
@@ -3173,12 +3283,14 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode, 
   if (!attempt || !attempt.tag) attempt = null;
   const markCommitStep = (err) => {
     // A commit that may have landed server-side (its ack never arrived):
-    // carry the fingerprints the busy-retry verifies before re-uploading.
-    // The receipt covers the LIVE sheet, so a delta append verifies against
+    // carry the identity the busy-retry verifies before re-uploading. The
+    // receipt covers the LIVE sheet, so a delta append verifies against
     // the full-set hash, while a full replace verifies the staged set (the
-    // live sheet it just swapped in).
+    // live sheet it just swapped in). The TAG is required as well — only
+    // this exact attempt's receipt may ever be adopted as "landed".
     if (err && err.spaxCommitStep && !err.spaxVerifyFirst) {
       err.spaxVerifyFirst = {
+        tag: attempt ? attempt.tag : '',
         txBasis: mode === 'delta' && attempt ? attempt.txBasis : spaxTableBasis(bigTables.transactions || []),
         smallBasis: attempt ? attempt.smallBasis : ''
       };
@@ -3302,7 +3414,7 @@ async function saveToCloudChunked(post, payload, bigTables, totalBigRows, mode, 
 // the rows added since the last confirmed push travel as Transactions. A
 // small delta is a single saveDelta POST; a large first delta after the
 // upgrade is sliced (mode:"delta" chunked session) and still append-only.
-async function saveDeltaToCloud(post, payload, deltaRows, saveTag) {
+async function saveDeltaToCloud(post, payload, deltaRows, attempt) {
   const rememberDelta = () => {
     cloudDelta = true;
     cloudDeltaProbed = true;
@@ -3315,9 +3427,10 @@ async function saveDeltaToCloud(post, payload, deltaRows, saveTag) {
     // as a probe failure for the caller; unknown-action is still recognised
     // separately there and cached as "deployment lacks deltas". An
     // UNANSWERED one (a client timeout) is the exception: the server may be
-    // mid-append, so the fingerprint of the in-flight attempt rides along
-    // for the busy-retry's verify-before-re-uploading step.
-    const verifyFirst = saveTag ? { txBasis: saveTag.txBasis, smallBasis: saveTag.smallBasis } : null;
+    // mid-append, so the identity of the in-flight attempt rides along
+    // for the busy-retry's verify-before-re-uploading step — fingerprints
+    // AND its unique tag, so only this exact attempt can be adopted.
+    const verifyFirst = attempt && attempt.tag ? { tag: attempt.tag, txBasis: attempt.txBasis, smallBasis: attempt.smallBasis } : null;
     try {
       const res = await post({
         action: 'saveDelta',
@@ -3325,7 +3438,7 @@ async function saveDeltaToCloud(post, payload, deltaRows, saveTag) {
         monthly: payload.monthly,
         settings: payload.settings,
         txAdd,
-        saveTag: saveTag && saveTag.tag,
+        saveTag: attempt && attempt.tag,
         txBasis: verifyFirst && verifyFirst.txBasis,
         smallBasis: verifyFirst && verifyFirst.smallBasis
       }, CLOUD_TIMEOUT_BIG_SAVE, 0); // full-body post: tiny deltas answer fast, but the server
@@ -3347,7 +3460,7 @@ async function saveDeltaToCloud(post, payload, deltaRows, saveTag) {
   // mode:"delta" chunked session — still append-only.
   if (!deltaRows || deltaRows.length <= CHUNK_ROWS) return await oneShot((deltaRows || []));
   const deltaTables = { transactions: deltaRows };
-  return await saveToCloudChunked(post, payload, deltaTables, deltaRows.length, 'delta', saveTag);
+  return await saveToCloudChunked(post, payload, deltaTables, deltaRows.length, 'delta', attempt);
 }
 
 // A save may fail without touching any sheet when another device/tab owns
@@ -3420,21 +3533,31 @@ function cloudSaveRerouteTimeout(err, verifyFirst) {
   return err;
 }
 
-// Asks a v3.6 backend for its last save receipt and compares fingerprints.
-// True = the timed-out attempt verifiably landed; anything else (an older
-// backend answering "unknown action", an unreachable cloud, a receipt for
-// different data) throws or returns false, and the save proceeds to upload.
+// Asks a v3.6 backend for its last save receipt and checks it against the
+// INTERRUPTED ATTEMPT's identity. True = that exact attempt verifiably
+// landed. The receipt must echo the attempt's unique saveTag — a receipt for
+// any other save, even one carrying identical fingerprints (the stale-
+// receipt trap above), is NOT proof and the save proceeds exactly as before
+// (an unverifiable attempt must upload, not fail). Anything older (a backend
+// answering "unknown action"), an unreachable cloud, or a receipt for
+// different data returns false or throws, and the save uploads.
 async function spaxVerifySaveLanded(post, verifyFirst) {
   const st = await post({ action: 'status' }, CLOUD_TIMEOUT_DEFAULT, 0);
   try { spaxNoteBackendVersion(st); } catch (_) {}
   const rec = st && st.lastSave;
-  return !!(rec && verifyFirst && verifyFirst.txBasis && verifyFirst.smallBasis &&
+  if (!rec || !verifyFirst || !verifyFirst.tag) return false;
+  if (rec.tag !== verifyFirst.tag) return false;
+  return !!(verifyFirst.txBasis && verifyFirst.smallBasis &&
     rec.txBasis === verifyFirst.txBasis && rec.smallBasis === verifyFirst.smallBasis);
 }
 
 // Last backend version seen on a load/status answer (null = unknown —
 // either never asked or a deployment that predates version reporting).
 let cloudBackendVersion = null;
+// The spreadsheet the endpoint writes to (backend v3.10 `spreadsheet`) —
+// shown on the Sync tab so "which sheet does this /exec URL push to?" is
+// answerable at a glance instead of by guessing after a hollow ✅.
+let cloudSpreadsheetInfo = null; // { id, name, url, at }
 // Last save-lock probe reported by a status answer (backend v3.9 `lock`).
 let cloudBackendLock = null; // { free, ms, at }
 // Last server-side timing echoed by any save answer (backend v3.9 `srv`).
@@ -3442,10 +3565,26 @@ let cloudLastServerTiming = null; // { wait, work, ok, at }
 function spaxNoteBackendVersion(data) {
   if (data && data.version) cloudBackendVersion = String(data.version);
   try {
+    if (data && data.spreadsheet && data.spreadsheet.url) {
+      cloudSpreadsheetInfo = {
+        id: String(data.spreadsheet.id || ''),
+        name: String(data.spreadsheet.name || ''),
+        url: String(data.spreadsheet.url || ''),
+        at: Date.now()
+      };
+    }
     if (data && data.lock && typeof data.lock.free === 'boolean') {
       cloudBackendLock = { free: !!data.lock.free, ms: Number(data.lock.ms), at: Date.now() };
     }
   } catch (_) {}
+}
+// ' → 📄 SpaxButchery Cloud Data' — suffix naming the sheet an endpoint
+// writes to, empty until a v3.10 status/load answer has told us.
+function cloudSpreadsheetNote() {
+  try {
+    const s = cloudSpreadsheetInfo;
+    return (s && s.name) ? ' → 📄 ' + s.name : '';
+  } catch (_) { return ''; }
 }
 // Noted centrally in cloudRequest for every answer that carries `srv`
 // (successes and refusals alike), so the number on a busy pill is always
@@ -3470,14 +3609,35 @@ function spaxServerWaitNote() {
 // never converge either — redeploying is the fix, not retrying.
 function spaxOldBackendHint() {
   try {
-    // Full-save mode never uses chunked uploads, so a backend without them is
-    // not a limitation worth reporting — the hint would ask for a redeploy
-    // that cannot change anything.
-    if (!cloudFullSave && (DB.transactions || []).length > CHUNK_ROWS && cloudChunkProbed && !cloudChunks) {
-      return ' The backend answers without chunked uploads — redeploy Code.gs (v3.6): chunked saves resume instead of restarting.';
+    if ((DB.transactions || []).length > CHUNK_ROWS && cloudChunkProbed && !cloudChunks) {
+      return ' The backend answers without chunked uploads — paste Code.gs (v3.10) and UPDATE THE DEPLOYMENT: big saves need the chunked upload to cross a weak link.';
     }
   } catch (_) {}
   return '';
+}
+
+// Deployment-drift nag (2026-09-21): the app and the backend ship together,
+// but Apps Script only runs the code its DEPLOYMENT points at — pasting a new
+// Code.gs into the editor and clicking Save does NOT change /exec. An app
+// talking to an old deployment then fails in ways no client retry can fix
+// (the reported "cloud sync has not worked since …" with a perfectly good
+// client). When the endpoint reports a backend older than this build needs,
+// say exactly what to do — in HTML (Sync tab) and plain text (save pills).
+const SPAX_MIN_BACKEND = 3.10;
+function spaxBackendStale() {
+  const v = parseFloat(cloudBackendVersion);
+  return isFinite(v) && v < SPAX_MIN_BACKEND;
+}
+function spaxBackendHintHtml() {
+  if (!spaxBackendStale()) return '';
+  return '<div style="margin-top:6px;font-size:.75rem;color:var(--amber)">⚠️ This endpoint runs <b>backend v' + escHtml(cloudBackendVersion) +
+    '</b> — this app expects v3.10. Tap <b>Copy Code.gs</b>, paste it into the project behind THIS URL, Save, then ' +
+    '<b>Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy</b> — saving the file alone does <b>not</b> update /exec.</div>';
+}
+function spaxBackendHint() {
+  return spaxBackendStale()
+    ? ' Backend v' + cloudBackendVersion + ' is stale — paste Code.gs v3.10 and Deploy → Manage deployments → New version (saving the file does not update /exec).'
+    : '';
 }
 
 function showSyncStatus(msg) {
@@ -11082,7 +11242,7 @@ if('serviceWorker' in navigator){
         it can never interrupt an upload either.
    The footer stamps the build date this page is running, so anyone can see
    at a glance which build a phone is on. */
-const SPAX_BUILD_DATE = '2026-09-19'; // ← bump this on every merge
+const SPAX_BUILD_DATE = '2026-09-21'; // ← bump this on every merge
 
 (function spaxSwUpdateGuard(){
   if (typeof navigator === 'undefined' || !navigator.serviceWorker || !navigator.serviceWorker.addEventListener) return;
@@ -11199,8 +11359,23 @@ async function forcePushToCloud(){
   try{
     const saved = await saveToCloud(true, CLOUD_SAVE_NAMES.forcePush);
     if (!saved) throw new Error(lastCloudError || 'Cloud did not confirm the save');
-    spaxSetActionResult('<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.</span>');
-    showSyncStatus('✅ Force push complete');
+    // The ✅ must be EARNED, not assumed (see spaxConfirmLastSave): match the
+    // endpoint's save receipt to the attempt that just finished, and name the
+    // spreadsheet this endpoint writes to — so "push done, sheet unchanged"
+    // becomes "push done → 📄 that sheet" or an honest ⚠️ naming the trap.
+    const post = (obj) => cloudRequest(spaxCloudUrl(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(obj)
+    }, CLOUD_TIMEOUT_DEFAULT, 0);
+    const proof = await spaxConfirmLastSave(post);
+    if (proof.ok) {
+      spaxSetActionResult('<span style="color:var(--green)">✅ Pushed ' + DB.customers.length + ' customers to cloud successfully.' + escHtml(proof.note) + '</span>');
+      showSyncStatus('✅ Force push complete' + cloudSpreadsheetNote());
+    } else {
+      spaxSetActionResult('<span style="color:var(--amber)">⚠️ ' + escHtml(proof.note) + '</span>');
+      showSyncStatus('⚠️ Force push unconfirmed — see the Sync result line');
+    }
   }catch(err){
     spaxSetActionResult('<span style="color:var(--red)">❌ Push failed: ' + err.message + '</span>');
     showSyncStatus('❌ Force push failed');
@@ -11520,12 +11695,49 @@ async function testCloudConnection(){
   const el = $('cloudTestStatus');
   if(el) el.innerHTML = '<span style="color:var(--muted)">⏳ Testing the cloud endpoint…</span>';
   try{
-    const data = await cloudLoad();
-    try { spaxNoteBackendVersion(data); } catch (_) {}
-    const nCust = (data.customers || []).length;
-    const nTx = (data.transactions || []).length;
-    cloudTestResult = { ok: true, detail: 'HTTP 200 — ' + nCust + ' customers, ' + nTx + ' transactions', at: Date.now() };
-    if(el) el.innerHTML = '<span style="color:var(--green)">✅ Reachable — ' + nCust + ' customers · ' + nTx + ' transactions · ' + new Date().toLocaleTimeString() + '</span>';
+    // Prefer the cheap status probe (v3.6+): it names the backend version,
+    // the row counts, the last save, AND — v3.10 — the spreadsheet this
+    // endpoint writes. That last field is the whole point: "push done but my
+    // sheet never changed" is almost always THIS /exec URL writing a
+    // different Google Sheet than the one the user has open (two
+    // deployments, each with its own URL and its own spreadsheet). Show the
+    // sheet, so the mismatch is visible instead of guessed.
+    let st = null;
+    try {
+      st = await cloudRequest(spaxCloudUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'status' })
+      }, CLOUD_TIMEOUT_DEFAULT, 0);
+    } catch (_) { st = null; } // pre-v3.6 deployment or a blip — fall back to a full load
+    let detail, line;
+    if (st && st.success === true) {
+      try { spaxNoteBackendVersion(st); } catch (_) {}
+      const nCust = Number(st.customersRows);
+      const nTx = Number(st.txRows);
+      const whereName = cloudSpreadsheetInfo ? ' → 📄 ' + cloudSpreadsheetInfo.name : '';
+      const whereLink = cloudSpreadsheetInfo
+        ? ' → 📄 ' + escHtml(cloudSpreadsheetInfo.name) + ' <a href="' + escHtml(cloudSpreadsheetInfo.url) + '" target="_blank" style="color:var(--blue)">open sheet</a>'
+        : '';
+      const savedAt = (st.lastSave && st.lastSave.at) ? ' · last save ' + new Date(st.lastSave.at).toLocaleString() : '';
+      detail = 'Backend v' + (st.version || '?') + ' — ' + (isFinite(nCust) ? nCust : '?') + ' customers · ' + (isFinite(nTx) ? nTx : '?') + ' transactions' + whereName + savedAt;
+      line = '<span style="color:var(--green)">✅ Reachable</span> — Backend v' + escHtml(st.version || '?') + ' — ' +
+        (isFinite(nCust) ? nCust : '?') + ' customers · ' + (isFinite(nTx) ? nTx : '?') + ' transactions' + whereLink + escHtml(savedAt) + ' · ' + new Date().toLocaleTimeString() +
+        '<div style="margin-top:6px;font-size:.75rem;color:var(--muted)">Is 📄 above <b>the sheet you are watching?</b> This endpoint can only ever write ITS sheet — if your open sheet is a different file, pushes will "succeed" and change nothing you can see.</div>' +
+        spaxBackendHintHtml();
+    } else {
+      const data = await cloudLoad();
+      try { spaxNoteBackendVersion(data); } catch (_) {}
+      const nCust = (data.customers || []).length;
+      const nTx = (data.transactions || []).length;
+      const whereName = cloudSpreadsheetInfo ? ' → 📄 ' + cloudSpreadsheetInfo.name : '';
+      const whereLink = cloudSpreadsheetInfo ? ' → 📄 ' + escHtml(cloudSpreadsheetInfo.name) : '';
+      detail = 'HTTP 200 — ' + nCust + ' customers, ' + nTx + ' transactions' + whereName;
+      line = '<span style="color:var(--green)">✅ Reachable</span> — ' + escHtml(nCust + ' customers · ' + nTx + ' transactions') + whereLink +
+        ' <span style="color:var(--muted)">(no status probe — pre-v3.6 backend)</span> · ' + new Date().toLocaleTimeString() + spaxBackendHintHtml();
+    }
+    cloudTestResult = { ok: true, detail, at: Date.now() };
+    if(el) el.innerHTML = line;
   }catch(err){
     const msg = (err && err.message) || String(err);
     cloudTestResult = { ok: false, detail: msg, at: Date.now() };
@@ -12748,5 +12960,8 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 </script>
+</body>
+</html>
+/script>
 </body>
 </html>

@@ -25,7 +25,10 @@
 // without a version field is finally flagged stale (the amber "update the
 // deployment" note used to stay silent for exactly those endpoints).
 // Installed apps must pick up the new shell for either to reach them.
-const CACHE_NAME = 'spax-v33';
+// Bumped to spax-v34 (2026-09-23): the built-in default backend URL moves
+// from the developer's v3.8 deployment (owner had no edit access) to the
+// owner's own v3.10 deployment bound to the SpaxButchery_Customers sheet.
+const CACHE_NAME = 'spax-v34';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

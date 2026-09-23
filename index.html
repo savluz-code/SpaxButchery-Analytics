@@ -952,7 +952,7 @@ function doPost(e) {
 
 </main>
 <div class="toast" id="toast"></div>
-<footer>SpaxButchery Analytics v2.5 · <span id="buildStamp">build 2026-09-21</span> · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
+<footer>SpaxButchery Analytics v2.5 · <span id="buildStamp">build 2026-09-23</span> · Local data · Kimi Vision AI + Tesseract OCR · Dedup guard · Native WhatsApp/SMS</footer>
 
 <script>
 
@@ -960,7 +960,12 @@ function doPost(e) {
 // GOOGLE SHEETS SYNC LAYER — SpaxButchery Cloud v1
 // ════════════════════════════════════════════════════════════
 
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbylY3y9P1eRH8QdH_d6_nG8uro65WOrR3-Hwc6cv5eIybwYzfUtvbXDWM6mVcfLWC-KmQ/exec';
+// Built-in default backend (2026-09-23): the owner's v3.10 deployment
+// ("SpaxButchery Fresh" project), bound to the SpaxButchery_Customers
+// spreadsheet. Verified to answer version 3.10 + spreadsheet identity.
+// Replaces the developer's v3.8 deployment that this app shipped with —
+// one the owner could not edit or redeploy.
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbwJ6B5wotS5P5CbE6NO7k8pEJakFSWndhRxmWNpmhZtS4Wb6TJE1ahj_BA9VzKEh3OvkA/exec';
 
 // The /exec URL is swappable at runtime: redeploying Code.gs can change it
 // without a new app release, and a dead deployment is the one situation a
@@ -11399,7 +11404,7 @@ if('serviceWorker' in navigator){
         it can never interrupt an upload either.
    The footer stamps the build date this page is running, so anyone can see
    at a glance which build a phone is on. */
-const SPAX_BUILD_DATE = '2026-09-21'; // ← bump this on every merge
+const SPAX_BUILD_DATE = '2026-09-23'; // ← bump this on every merge
 
 (function spaxSwUpdateGuard(){
   if (typeof navigator === 'undefined' || !navigator.serviceWorker || !navigator.serviceWorker.addEventListener) return;

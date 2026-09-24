@@ -1290,7 +1290,7 @@ async function cloudRequest(url, options = {}, stepTimeoutMs = CLOUD_TIMEOUT_DEF
         const failure = new Error(detail);
         // Backend v3.9 echoes its server-side lock wait on refusals — keep it
         // on the error (busy pills name the number) and in the session log.
-        try { if (data && data.srv) { failure.spaxSrv = data.srv; spaxNoteServerTiming(data.srv, false); } } catch (_) {}
+        try { if (data && data.srv) { failure.spaxSrv = data.srv; spaxNoteServerTiming(data.srv, false); } if (data && data.why) failure.spaxWhy = String(data.why); } catch (_) {}
         throw failure;
       }
       // Backend v3.9 echoes {wait, work} on every save answer — the session's
@@ -2998,7 +2998,8 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
     // schedule and counts, which is the zombie-lock case the budget exists
     // for.
     const progressed = cloudSaveProgressSeq > progressAtEntry;
-    if (isBackendBusyError(err) && (busyRetry < CLOUD_BUSY_RETRIES || progressed)) {
+    const instantRefusal = !progressed && spaxIsInstantBusy(err);
+    if (isBackendBusyError(err) && !(instantRefusal && busyRetry >= 4) && (busyRetry < CLOUD_BUSY_RETRIES || progressed)) {
       const nextRetry = progressed ? 0 : busyRetry + 1;
       const delayMs = progressed
         ? CLOUD_BUSY_RETRY_DELAYS[0]
@@ -3021,6 +3022,9 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
       return await performSaveToCloud(nextRetry, (err && err.spaxVerifyFirst) || null);
     }
     lastCloudError = err && err.message ? err.message : String(err);
+    // An instant refusal is a broken lock in Code.gs — make the Recent list say so
+    // (it shows lastCloudError) instead of the misleading "another save".
+    if (!progressed && spaxIsInstantBusy(err)) lastCloudError = spaxInstantBusyMessage(err);
     console.error('Cloud save failed:', err);
     // The batch drain uses this to decide whether the failure is worth an
     // automatic retry on the next launch (see cloudSavePump). Captured at
@@ -3030,7 +3034,9 @@ async function performSaveToCloud(busyRetry = 0, verifyFirst) {
     // Spell out the common case so "what's saving in the background?" has an
     // answer: name the upload this device stopped if there was one, otherwise
     // say precisely what the two possible writers are — never "another save".
-    if (isBackendBusyError(err)) {
+    if (!progressed && spaxIsInstantBusy(err)) {
+      showSyncStatus(cloudSaveFailedMessage(lastCloudError));
+    } else if (isBackendBusyError(err)) {
       // Rounds that moved rows restart the budget, so reaching here means the
       // last rounds moved NOTHING — a writer really is holding the lock.
       showSyncStatus(cloudSaveFailedMessage('the cloud is still busy after retries — ' + ((err && err.spaxBusyWhy) || cloudSaveBusyReason()) + spaxServerWaitNote() + '. Wait ~1 min then Force Push.' + spaxOldBackendHint()));
@@ -3630,6 +3636,26 @@ function spaxNoteServerTiming(srv, ok) {
   if (!srv) return;
   cloudLastServerTiming = { wait: Number(srv.wait), work: Number(srv.work), ok: !!ok, at: Date.now() };
 }
+// An INSTANT busy refusal (the server waited ~0s and refused) is NOT contention:
+// real contention makes the server wait the full ~30s for the lock first. It means
+// the lock code itself is failing (v3.2–v3.10: waitLock() returns void, so every
+// save was refused instantly while nothing else was running — three weeks of
+// "backend busy" that no amount of retrying could ever fix). Retrying it for ten
+// minutes only hides that; say so after a few tries instead.
+function spaxIsInstantBusy(err) {
+  try {
+    if (!err || err.spaxBusyWhy || !isBackendBusyError(err)) return false;
+    const s = err.spaxSrv;
+    return !!(s && isFinite(Number(s.wait)) && Number(s.wait) < 2000);
+  } catch (_) { return false; }
+}
+function spaxInstantBusyMessage(err) {
+  const w = (err && err.spaxSrv && isFinite(Number(err.spaxSrv.wait))) ? (Number(err.spaxSrv.wait) / 1000).toFixed(1) : '0.0';
+  return 'the cloud refused the save instantly (server waited ' + w + 's for the lock — nobody was holding it). ' +
+    'That is a lock failure inside the deployed Code.gs, not another tab or device' +
+    (err && err.spaxWhy ? ' (server says: ' + err.spaxWhy + ')' : '') + '. ' +
+    'Paste Code.gs v3.11 into the project behind this URL, Save, then Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy, then Force Push.';
+}
 // Suffix for busy pills: ' · server waited 30.0s for the lock'. A wait near
 // 30s met a real writer; a wait near 0s failed instantly with no holder
 // (stuck lock / LockService failure) — the distinction a busy storm needs.
@@ -3647,7 +3673,7 @@ function spaxServerWaitNote() {
 function spaxOldBackendHint() {
   try {
     if ((DB.transactions || []).length > CHUNK_ROWS && cloudChunkProbed && !cloudChunks) {
-      return ' The backend answers without chunked uploads — paste Code.gs (v3.10) and UPDATE THE DEPLOYMENT: big saves need the chunked upload to cross a weak link.';
+      return ' The backend answers without chunked uploads — paste Code.gs (v3.11) and UPDATE THE DEPLOYMENT: big saves need the chunked upload to cross a weak link.';
     }
   } catch (_) {}
   // Every failed save against a deployment this old deserves the one line
@@ -3663,7 +3689,7 @@ function spaxOldBackendHint() {
 // (the reported "cloud sync has not worked since …" with a perfectly good
 // client). When the endpoint reports a backend older than this build needs,
 // say exactly what to do — in HTML (Sync tab) and plain text (save pills).
-const SPAX_MIN_BACKEND = '3.10';
+const SPAX_MIN_BACKEND = '3.11'; // v3.2-v3.10 refuse EVERY save as "busy" (waitLock() returns void) — fixed in v3.11
 // Backend versions are major.minor STRINGS: parseFloat('3.10') is 3.1, which
 // sorted v3.10 BELOW v3.6 and below the 3.10 minimum alike — every gate built
 // on it misjudged the newest backend as ancient. Compare components.
@@ -3679,7 +3705,7 @@ function spaxBackendStale() {
   // v3.10 this build expects.
   if (cloudBackendPreVersioning) return true;
   if (!cloudBackendVersion) return false; // never asked yet — not proven stale
-  return !spaxBackendAtLeast(3, 10);
+  return !spaxBackendAtLeast(3, 11);
 }
 // Can this deployment issue save receipts (v3.6+)? A backend that CANNOT
 // leaves a reported save success unwitnessed — its saves are confirmed by
@@ -3696,12 +3722,12 @@ function spaxBackendHintHtml() {
     ? 'a backend <b>older than v3.6</b> — it answers without even reporting a version'
     : 'backend <b>v' + escHtml(cloudBackendVersion) + '</b>';
   return '<div style="margin-top:6px;font-size:.75rem;color:var(--amber)">⚠️ This endpoint runs ' + named +
-    ' — this app expects v3.10. Deployments this old can answer <b>SUCCESS to a save they never wrote</b> (the hollow-success bug fixed server-side in v3.10), so this app now reads the cloud back after every save to them and fails the push loudly when the write did not land. To end the round-trip: tap <b>Copy Code.gs</b>, paste it into the project behind THIS URL, Save, then ' +
+    ' — this app expects v3.11. <b>Backends v3.2–v3.10 refuse EVERY save as “busy”</b> (a lock bug in Code.gs, fixed in v3.11 — no other tab or device is involved), and those older than v3.10 can also answer <b>SUCCESS to a save they never wrote</b>, so this app reads the cloud back after every save to them and fails the push loudly when the write did not land. To end the round-trip: tap <b>Copy Code.gs</b>, paste it into the project behind THIS URL, Save, then ' +
     '<b>Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy</b> — saving the file alone does <b>not</b> update /exec.</div>';
 }
 function spaxBackendHint() {
   return spaxBackendStale()
-    ? ' Backend ' + (cloudBackendPreVersioning ? 'older than v3.6' : 'v' + cloudBackendVersion) + ' is stale — paste Code.gs v3.10 and Deploy → Manage deployments → New version (saving the file does not update /exec).'
+    ? ' Backend ' + (cloudBackendPreVersioning ? 'older than v3.6' : 'v' + cloudBackendVersion) + ' is stale — paste Code.gs v3.11 and Deploy → Manage deployments → New version (saving the file does not update /exec).'
     : '';
 }
 
@@ -3737,7 +3763,7 @@ function spaxCustomerKeysBasis(rows) {
 function spaxHollowSaveError(why) {
   return 'the cloud reported SUCCESS but the read-back shows the save never landed (' + why +
     ') — the deployment behind this URL is older than v3.6 and still answers hollow successes. ' +
-    'Fix: Copy Code.gs (v3.10) into the project behind this URL, then Deploy → Manage deployments → Edit → Version: New version → Deploy, then Force Push. Your data is safe on this device and retries automatically.';
+    'Fix: Copy Code.gs (v3.11) into the project behind this URL, then Deploy → Manage deployments → Edit → Version: New version → Deploy, then Force Push. Your data is safe on this device and retries automatically.';
 }
 // Returns {ok:true} when the reported save success is witnessed (a receipt-
 // capable backend, a matching read-back, or a read-back that could not be

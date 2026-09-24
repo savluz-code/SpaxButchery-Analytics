@@ -1,5 +1,24 @@
 /**
- * SpaxButchery Analytics — Google Apps Script backend  v3.10  (2026-09-21)
+ * SpaxButchery Analytics — Google Apps Script backend  v3.11  (2026-09-24)
+ * ─────────────────────────────────────────────────────────────────
+ * v3.11 FIXES THE ROOT CAUSE OF "backend busy with another save" (present
+ * since v3.2, i.e. every save for ~3 weeks):
+ *   • spaxTakeSaveLock_ did `ok = lock.waitLock(30000)`. In Apps Script
+ *     waitLock() RETURNS NOTHING (void) - it acquires the lock or throws.
+ *     `ok` was therefore always undefined, so every save was refused as
+ *     "busy" the instant it arrived (server-side wait 0ms, nobody holding
+ *     anything), while action=status - which uses tryLock(), a real boolean -
+ *     kept saying the lock was free. Now: `ok = lock.tryLock(30000) === true`.
+ *   • saveChunk / saveCommit re-check the upload session AFTER acquiring the
+ *     lock, so a slice that queued behind a newer saveBegin is refused
+ *     instead of being staged into the wrong session.
+ *   • Busy answers carry `why` ('timeout' vs 'lock service error').
+ *   • GET <exec URL>?action=ping answers {version, spreadsheet, lock} — the
+ *     quickest proof of which Code.gs the deployment is really running.
+ * No protocol change: v3.10 clients work unchanged against v3.11.
+ *
+ * ─── previous release notes ───
+ * SpaxButchery Analytics — v3.10  (2026-09-21)
  * ─────────────────────────────────────────────────────────────────
  * v3.10 makes every answer self-identifying and kills the last hollow-success
  * path — the "push shows done but the sheet never changes" class of bug:
@@ -221,10 +240,11 @@ var TABLE_HEADERS = {
      • saveCommit checks the uploadId too (it only checked saveChunk before),
        and a refused commit clears the staging sheets so the retry it asks for
        starts from an empty staging area.
-     • waitLock's answer is honoured: a save that cannot get the script lock is
+     • [v3.11: THIS WAS THE BUG - waitLock() returns void, see spaxTakeSaveLock_]
+       waitLock's answer is honoured: a save that cannot get the script lock is
        refused instead of running alongside the writer that holds it. */
 
-var BACKEND_VERSION = '3.10';
+var BACKEND_VERSION = '3.11';
 
 var STAGE_SUFFIX = '_Staging';
 var SWAP_TMP_SUFFIX = '_SwapTmp';
@@ -281,6 +301,11 @@ function doGet(e) {
   var action = (e && e.parameter && e.parameter.action) || 'load';
   try {
     if (action === 'load') return json_(loadAll_());
+    // v3.11: tiny health check — open <your /exec URL>?action=ping in any browser.
+    // Proves WHICH code the deployment is running (saving Code.gs in the editor
+    // does not change /exec; only Deploy → New version does) without downloading
+    // the whole database the way action=load does.
+    if (action === 'ping') return json_({ success: true, version: BACKEND_VERSION, spreadsheet: spreadsheetInfo_(), lock: spaxLockProbe_() });
     return json_({ success: false, error: 'unknown action: ' + action });
   } catch (err) {
     return json_({ success: false, error: String(err) });
@@ -569,7 +594,7 @@ function recordSaveReceipt_(body, txCount) {
 // the live database at its previous, complete state instead of truncating it.
 function saveAll_(body) {
   var held = spaxTakeSaveLock_();
-  if (!held.lock) return backendBusy_(held.waited);
+  if (!held.lock) return backendBusy_(held.waited, held.why);
   var tWork = new Date().getTime();
   try {
     prepareStaging_();
@@ -611,7 +636,7 @@ function saveAll_(body) {
 
 function saveDelta_(body) {
   var held = spaxTakeSaveLock_();
-  if (!held.lock) return backendBusy_(held.waited);
+  if (!held.lock) return backendBusy_(held.waited, held.why);
   var tWork = new Date().getTime();
   try {
     prepareStaging_();
@@ -651,7 +676,7 @@ function updateCustomer_(body) {
   var edits = (body && body.edits) || [];
   if (!edits.length) return { success: true, customersUpdated: 0, customersAdded: 0, transactionsRenamed: 0 };
   var held = spaxTakeSaveLock_();
-  if (!held.lock) return backendBusy_(held.waited);
+  if (!held.lock) return backendBusy_(held.waited, held.why);
   var tWork = new Date().getTime();
   try {
     ensureSheets_();
@@ -746,7 +771,7 @@ function updateCustomer_(body) {
 
 function saveBegin_(body) {
   var held = spaxTakeSaveLock_();
-  if (!held.lock) return backendBusy_(held.waited);
+  if (!held.lock) return backendBusy_(held.waited, held.why);
   var tWork = new Date().getTime();
   try {
     prepareStaging_();
@@ -800,9 +825,15 @@ function saveChunk_(body) {
     return { success: false, error: 'upload superseded by a newer save — please retry the whole save' };
   }
   var held = spaxTakeSaveLock_();
-  if (!held.lock) return backendBusy_(held.waited);
+  if (!held.lock) return backendBusy_(held.waited, held.why);
   var tWork = new Date().getTime();
   try {
+    // v3.11: re-check inside the lock. The check above ran BEFORE waiting for
+    // the lock; a newer saveBegin may have superseded this session (and reset
+    // the staging area) while this chunk was queued.
+    if (!uploadSessionCurrent_(body.uploadId)) {
+      return spaxWithSrv_({ success: false, error: 'upload superseded by a newer save — please retry the whole save' }, held, tWork);
+    }
     var sheet = stagingSheet_(SHEETS[table]);
     if (!sheet) {
       return spaxWithSrv_({ success: false, error: 'no upload in progress — saveBegin must run before saveChunk' }, held, tWork);
@@ -853,9 +884,13 @@ function saveCommit_(body) {
     return { success: true, duplicate: true };
   }
   var held = spaxTakeSaveLock_();
-  if (!held.lock) return backendBusy_(held.waited);
+  if (!held.lock) return backendBusy_(held.waited, held.why);
   var tWork = new Date().getTime();
   try {
+    // v3.11: re-check inside the lock (see saveChunk_).
+    if (!uploadSessionCurrent_(body.uploadId)) {
+      return spaxWithSrv_({ success: false, error: 'upload superseded by a newer save — please retry the whole save' }, held, tWork);
+    }
     // Delta sessions append new transactions instead of swapping tables —
     // they have their own commit (append + dedup, then swap only the small
     // and derivable-cache sheets). The client's explicit mode is honoured
@@ -954,15 +989,26 @@ function spaxTakeSaveLock_() {
   var t0 = new Date().getTime();
   var lock = null;
   var ok = false;
+  var why = '';
   try {
     lock = LockService.getUserLock();
-    ok = lock.waitLock(30000);
+    // v3.11 FIX. Lock.waitLock() returns NOTHING (void) - it either acquires
+    // the lock or throws on timeout. v3.2-v3.10 wrote `ok = lock.waitLock(...)`,
+    // so `ok` was ALWAYS undefined, `!ok` was ALWAYS true, and EVERY save was
+    // refused as "backend busy" the instant it arrived (srv.wait ~ 0ms) while
+    // action=status - whose probe uses tryLock(), which does return a boolean -
+    // truthfully reported the lock as free. That contradiction is why the
+    // "stuck lock" theories, the user-lock switch (v3.9) and every redeploy
+    // changed nothing. tryLock(ms) waits up to ms and returns true/false.
+    ok = lock.tryLock(30000) === true;
+    if (!ok) why = 'timeout: another execution held the lock for 30s';
   } catch (err) {
     ok = false;
+    why = 'lock service error: ' + String(err);
   }
   var waited = new Date().getTime() - t0;
-  if (!ok) return { lock: null, waited: waited };
-  return { lock: lock, waited: waited };
+  if (!ok) return { lock: null, waited: waited, why: why };
+  return { lock: lock, waited: waited, why: '' };
 }
 
 // Attach the server-side timing to an in-lock answer. Pre-lock refusals
@@ -974,9 +1020,10 @@ function spaxWithSrv_(answer, held, tWork) {
   return answer;
 }
 
-function backendBusy_(waitedMs) {
+function backendBusy_(waitedMs, why) {
   var ans = { success: false, error: 'backend busy with another save — please retry the save' };
   if (waitedMs !== undefined && waitedMs !== null) ans.srv = { wait: waitedMs };
+  if (why) ans.why = String(why);
   return ans;
 }
 

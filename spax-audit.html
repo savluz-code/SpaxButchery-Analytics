@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spax data audit (read-only)</title>
+<style>
+  :root { --bg:#0f141a; --card:#1a222b; --line:#2b3642; --txt:#e8edf2; --mut:#8b9aa7; --grn:#2ec4b6; --amb:#f4a261; --red:#e5484d; --blu:#4cc9f0; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; background:var(--bg); color:var(--txt); font:15px/1.45 system-ui,Roboto,Arial,sans-serif; }
+  h1 { font-size:1.25rem; margin:0 0 4px; } h2 { font-size:1.05rem; margin:0 0 8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin:12px 0; }
+  .mut { color:var(--mut); font-size:.85rem; } .grn{color:var(--grn)} .amb{color:var(--amb)} .red{color:var(--red)} .blu{color:var(--blu)}
+  button { background:var(--blu); color:#04202a; border:0; border-radius:10px; padding:11px 16px; font-weight:700; font-size:.95rem; margin:4px 6px 4px 0; }
+  button.ghost { background:#2b3642; color:var(--txt); } button:disabled { opacity:.5; }
+  input[type=text] { width:100%; background:#0b1015; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:10px; font-size:.85rem; }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; } td,th { padding:6px 4px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+  th { color:var(--mut); font-weight:600; } td.n, th.n { text-align:right; white-space:nowrap; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:.75rem; background:#2b3642; }
+  .verdict li { margin:6px 0; }
+</style>
+</head>
+<body>
+<h1>🔎 Spax data audit <span class="pill">read-only</span></h1>
+<div class="mut">Reads this browser's stored copy of the app and the cloud sheet, and compares them. It never writes to either, never uploads anything, and never changes sync settings. The only network request is a read of <i>your own</i> Apps Script address.</div>
+
+<div class="card" id="storesCard">
+  <h2>1 · What this browser has stored</h2>
+  <div id="stores" class="mut">Reading…</div>
+</div>
+
+<div class="card">
+  <h2>2 · Cloud copy to compare against</h2>
+  <div class="mut" style="margin-bottom:6px">Your Apps Script address (…/exec). Filled in automatically when the app is on the same site.</div>
+  <input type="text" id="cloudUrl" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off">
+  <div style="margin-top:8px">
+    <button id="runBtn">Compare this device with the cloud</button>
+  </div>
+  <div id="status" class="mut"></div>
+</div>
+
+<div id="results"></div>
+
+<script>
+/* ══════════ analysis core (pure functions — no DOM, no storage writes) ══════════ */
+const SpaxAudit = (function () {
+  const ISO = /(\d{4}-\d{2}-\d{2})/;
+  function day(v) { const s = String(v == null ? '' : v).trim(); const m = s.match(ISO); return m ? m[1] : s; }
+  function normName(n) { return String(n || '').toLowerCase().replace(/[^a-z0-9\s']/g, ' ').replace(/\s+/g, ' ').trim(); }
+  function normContact(contact) {                       // same rules as the app's normalizeContact()
+    let c = String(contact || '').trim();
+    if (!c || c.toLowerCase().includes('missing')) return '';
+    c = c.replace(/\s+/g, '');
+    if (c.includes('***')) { if (c.startsWith('254')) return '0' + c.slice(3); return c; }
+    c = c.replace(/[^\d+]/g, '');
+    if (c.startsWith('+254')) c = '0' + c.slice(4);
+    if (c.startsWith('254')) c = '0' + c.slice(3);
+    return c;
+  }
+  function validPhone(c) { return /^0(1|7)\d{8}$/.test(normContact(c)); }
+  function cleanReceipt(r) { return String(r || '').replace(/\s+/g, '').replace(/[^A-Z0-9]/gi, '').toUpperCase(); }
+  function custKey(c) { return String((c && c.name) || '').trim().toLowerCase() + '|' + normContact((c && c.contact) || ''); }
+  function txPhone(t) { return t.contact || t.phone || ''; }
+  function compKey(t) { return ['c', day(t.date), t.time || '', Number(t.amount || 0).toFixed(2), normName(t.name), normContact(txPhone(t))].join('|'); }
+  function month(d) { const s = day(d); return /^\d{4}-\d{2}/.test(s) ? s.slice(0, 7) : '(no date)'; }
+  function top(map, n) { return Array.from(map.entries()).sort((a, b) => b[1] - a[1]).slice(0, n); }
+  function bump(map, k, by) { map.set(k, (map.get(k) || 0) + (by === undefined ? 1 : by)); }
+  const num = v => { const n = Number(v); return isFinite(n) ? n : 0; };
+
+  function analyze(local, cloud) {
+    const lc = (local && local.customers) || [], ltx = (local && local.transactions) || [];
+    const cc = (cloud && cloud.customers) || [], ctx = (cloud && cloud.transactions) || [];
+    const out = { counts: { localCust: lc.length, cloudCust: cc.length, localTx: ltx.length, cloudTx: ctx.length } };
+
+    /* ---- customers ---- */
+    const cloudKeys = new Map(), cloudPhones = new Map(), cloudNames = new Map();
+    cc.forEach(c => {
+      cloudKeys.set(custKey(c), c);
+      const p = normContact(c.contact);
+      if (validPhone(c.contact)) { if (!cloudPhones.has(p)) cloudPhones.set(p, c); }
+      const nn = normName(c.name); if (nn && !cloudNames.has(nn)) cloudNames.set(nn, c);
+    });
+    const localKeys = new Set(lc.map(custKey));
+    const cust = { both: 0, samePhone: [], sameName: [], brandNew: [], onlyCloud: 0 };
+    lc.forEach(c => {
+      if (cloudKeys.has(custKey(c))) { cust.both++; return; }
+      const p = normContact(c.contact);
+      if (validPhone(c.contact) && cloudPhones.has(p)) cust.samePhone.push({ c, twin: cloudPhones.get(p) });
+      else if (cloudNames.has(normName(c.name))) cust.sameName.push({ c, twin: cloudNames.get(normName(c.name)) });
+      else cust.brandNew.push({ c });
+    });
+    cloudKeys.forEach((_, k) => { if (!localKeys.has(k)) cust.onlyCloud++; });
+    const localOnlyCust = cust.samePhone.length + cust.sameName.length + cust.brandNew.length;
+    const sumSpent = arr => arr.reduce((t, x) => t + num(x.c.spent), 0);
+    const lastByMonth = new Map();
+    cust.samePhone.concat(cust.sameName, cust.brandNew).forEach(x => bump(lastByMonth, month(x.c.lastVisit)));
+    const maskedExtra = cust.samePhone.concat(cust.sameName, cust.brandNew).filter(x => !validPhone(x.c.contact)).length;
+    out.cust = {
+      both: cust.both, localOnly: localOnlyCust, onlyCloud: cust.onlyCloud,
+      samePhone: cust.samePhone.length, sameName: cust.sameName.length, brandNew: cust.brandNew.length,
+      spentSamePhone: sumSpent(cust.samePhone), spentSameName: sumSpent(cust.sameName), spentBrandNew: sumSpent(cust.brandNew),
+      maskedExtra, lastVisitMonths: top(lastByMonth, 8),
+      _rows: { samePhone: cust.samePhone, sameName: cust.sameName, brandNew: cust.brandNew }
+    };
+
+    /* ---- transactions ---- */
+    const cloudReceipts = new Map(), cloudComp = new Set();
+    let cloudTotal = 0;
+    ctx.forEach(t => {
+      cloudTotal += num(t.amount);
+      const r = cleanReceipt(t.receipt);
+      if (r) { if (!cloudReceipts.has(r)) cloudReceipts.set(r, day(t.date)); } else cloudComp.add(compKey(t));
+    });
+    const tx = { both: 0, bothDateDiffers: 0, receiptInCloudDiffKey: 0, newReceipt: [], noReceiptNew: [] };
+    const localReceiptCount = new Map();
+    let localTotal = 0;
+    ltx.forEach(t => {
+      localTotal += num(t.amount);
+      const r = cleanReceipt(t.receipt);
+      if (r) {
+        bump(localReceiptCount, r);
+        if (cloudReceipts.has(r)) { tx.both++; if (cloudReceipts.get(r) !== day(t.date)) tx.bothDateDiffers++; }
+        else tx.newReceipt.push(t);
+      } else {
+        if (cloudComp.has(compKey(t))) tx.both++; else tx.noReceiptNew.push(t);
+      }
+    });
+    let dupRows = 0, dupAmount = 0;
+    const seenR = new Map();
+    ltx.forEach(t => {
+      const r = cleanReceipt(t.receipt); if (!r) return;
+      if (localReceiptCount.get(r) > 1) {
+        if (seenR.has(r)) { dupRows++; dupAmount += num(t.amount); } else seenR.set(r, 1);
+      }
+    });
+    const localOnlyTx = tx.newReceipt.concat(tx.noReceiptNew);
+    const byImported = new Map(), bySource = new Map(), byMonth = new Map();
+    let minD = '9999', maxD = '0000', onlyTotal = 0;
+    localOnlyTx.forEach(t => {
+      onlyTotal += num(t.amount);
+      bump(byImported, day(t.importedAt) || '(none)'); bump(bySource, t.source || '(none)'); bump(byMonth, month(t.date));
+      const d = day(t.date); if (/^\d{4}-/.test(d)) { if (d < minD) minD = d; if (d > maxD) maxD = d; }
+    });
+    let cloudOnlyTx = 0;
+    const localReceiptSet = new Set(localReceiptCount.keys());
+    cloudReceipts.forEach((_, r) => { if (!localReceiptSet.has(r)) cloudOnlyTx++; });
+    out.tx = {
+      both: tx.both, bothDateDiffers: tx.bothDateDiffers, newReceipt: tx.newReceipt.length, noReceiptNew: tx.noReceiptNew.length,
+      localOnly: localOnlyTx.length, onlyCloud: cloudOnlyTx,
+      internalDupRows: dupRows, internalDupAmount: dupAmount,
+      localTotal, cloudTotal, localOnlyTotal: onlyTotal,
+      dateMin: minD === '9999' ? '' : minD, dateMax: maxD === '0000' ? '' : maxD,
+      importedDays: top(byImported, 8), sources: top(bySource, 6), months: top(byMonth, 10),
+      _rows: { newReceipt: tx.newReceipt, noReceiptNew: tx.noReceiptNew }
+    };
+
+    /* ---- plain-English reading (hedged: these are signals, not proof) ---- */
+    const v = [];
+    if (localOnlyCust === 0 && localOnlyTx.length === 0) v.push({ k: 'grn', t: 'This device holds nothing the cloud lacks — the two agree.' });
+    else {
+      const dupShare = localOnlyCust ? (cust.samePhone.length + cust.sameName.length) / localOnlyCust : 0;
+      if (localOnlyCust) {
+        if (dupShare >= 0.5) v.push({ k: 'amb', t: Math.round(dupShare * 100) + '% of the customers only this device has look like copies of customers already in the cloud (same phone number or same name). That pattern is typical of an older or differently-formatted copy being merged in — not of real new customers.' });
+        else v.push({ k: 'blu', t: 'Most customers only this device has are not matches of any cloud customer by phone or name, so they look genuinely different people — check their last-visit dates below.' });
+      }
+      if (tx.newReceipt.length) v.push({ k: 'blu', t: tx.newReceipt.length.toLocaleString() + ' transactions here carry M-Pesa receipt codes the cloud has never seen. Receipt codes are unique per payment, so these are not double-counted copies — either real payments that never reached the cloud, or another dataset merged in. Their dates ' + (out.tx.dateMin ? '(' + out.tx.dateMin + ' → ' + out.tx.dateMax + ') ' : '') + 'help tell which.' });
+      if (tx.bothDateDiffers) v.push({ k: 'amb', t: tx.bothDateDiffers.toLocaleString() + ' transactions share a receipt code with the cloud but carry a different date — the same payment stored twice with shifted dates would inflate revenue.' });
+      if (dupRows) v.push({ k: 'red', t: dupRows.toLocaleString() + ' extra rows on this device repeat a receipt code that already appears on another row (KES ' + Math.round(dupAmount).toLocaleString() + ' counted more than once). These are duplicates.' });
+      if (out.tx.localTotal - out.tx.cloudTotal > 0) v.push({ k: 'mut', t: 'Transaction amounts add up to KES ' + Math.round(out.tx.localTotal).toLocaleString() + ' here vs KES ' + Math.round(out.tx.cloudTotal).toLocaleString() + ' in the cloud (difference KES ' + Math.round(out.tx.localTotal - out.tx.cloudTotal).toLocaleString() + ').' });
+    }
+    out.verdict = v;
+    return out;
+  }
+
+  function csv(rows, cols) {
+    const q = s => '"' + String(s == null ? '' : s).replace(/"/g, '""') + '"';
+    return cols.join(',') + '\n' + rows.map(r => cols.map(c => q(r[c])).join(',')).join('\n');
+  }
+  function summarizeStore(raw) {
+    if (raw === undefined || raw === null || raw === '') return { present: false };
+    let obj = raw, size = 0;
+    if (typeof raw === 'string') { size = raw.length; try { obj = JSON.parse(raw); } catch (e) { return { present: true, unreadable: true, size }; } }
+    else { try { size = JSON.stringify(raw).length; } catch (_) {} }
+    return {
+      present: true, size,
+      customers: (obj.customers || []).length, transactions: (obj.transactions || []).length,
+      importedRev: Number(obj.importedRev) || 0, resolved: Number(obj.resolved) || 0,
+      tombstones: obj.tombstones ? Object.keys(obj.tombstones).length : 0,
+      baselineCleared: !!obj.baselineCleared, importBatch: Number(obj.importBatch) || 0, _obj: obj
+    };
+  }
+  return { analyze, csv, summarizeStore, cleanReceipt, normContact, custKey, day };
+})();
+if (typeof module !== 'undefined') module.exports = SpaxAudit;
+
+/* ══════════ page (read-only storage access) ══════════ */
+if (typeof document !== 'undefined') (function () {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const DB_KEY = 'spaxDB_v23', BASE_KEY = 'spaxBaseline_v23', URL_KEY = 'spaxCloudUrl_v1';
+  const stores = {};        // name -> summary
+  let cloudData = null;
+
+  function readIdb() {      // strictly read-only; aborts instead of ever creating a database
+    return new Promise(resolve => {
+      let req, created = false;
+      try { req = indexedDB.open('spax-analytics'); } catch (e) { return resolve({ error: String(e) }); }
+      req.onupgradeneeded = () => { created = true; try { req.transaction.abort(); } catch (_) {} };
+      req.onerror = () => resolve({ error: created ? 'No app database exists in this browser storage (a different browser/profile/app container).' : String(req.error) });
+      req.onblocked = () => resolve({ error: 'blocked' });
+      req.onsuccess = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('kv')) { db.close(); return resolve({ error: 'The app database has no data store yet.' }); }
+        const out = {}; let left = 2;
+        const done = () => { if (--left === 0) { db.close(); resolve({ data: out }); } };
+        try {
+          const os = db.transaction('kv', 'readonly').objectStore('kv');
+          [DB_KEY, BASE_KEY].forEach(k => { const r = os.get(k); r.onsuccess = () => { out[k] = r.result; done(); }; r.onerror = () => { out[k] = undefined; done(); }; });
+        } catch (e) { db.close(); resolve({ error: String(e) }); }
+      };
+    });
+  }
+
+  function kb(n) { return n ? Math.round(n / 1024).toLocaleString() + ' KB' : '—'; }
+  function storeRow(label, s, note) {
+    if (!s.present) return '<tr><td>' + label + '</td><td colspan="4" class="mut">not present</td></tr>';
+    if (s.unreadable) return '<tr><td>' + label + '</td><td colspan="4" class="red">present but unreadable</td></tr>';
+    return '<tr><td>' + label + (note ? '<div class="mut">' + note + '</div>' : '') + '</td><td class="n">' + s.customers.toLocaleString() + '</td><td class="n">' + s.transactions.toLocaleString() + '</td><td class="n">' + Math.round(s.importedRev).toLocaleString() + '</td><td class="n">' + kb(s.size) + '</td></tr>';
+  }
+
+  async function loadStores() {
+    let html = '';
+    const idb = await readIdb();
+    if (idb.error) html += '<div class="amb">IndexedDB: ' + esc(idb.error) + '</div>';
+    stores.idbMain = idb.data ? SpaxAudit.summarizeStore(idb.data[DB_KEY]) : { present: false };
+    stores.idbBase = idb.data ? SpaxAudit.summarizeStore(idb.data[BASE_KEY]) : { present: false };
+    let lsMain = null, lsBase = null;
+    try { lsMain = localStorage.getItem(DB_KEY); lsBase = localStorage.getItem(BASE_KEY); } catch (_) {}
+    stores.lsMain = SpaxAudit.summarizeStore(lsMain);
+    stores.lsBase = SpaxAudit.summarizeStore(lsBase);
+    html += '<table><tr><th>Stored copy</th><th class="n">Customers</th><th class="n">Transactions</th><th class="n">Imported rev (KES)</th><th class="n">Size</th></tr>' +
+      storeRow('IndexedDB — live data', stores.idbMain, 'what the app loads at start') +
+      storeRow('localStorage — old live copy', stores.lsMain, 'only used if IndexedDB is empty') +
+      storeRow('IndexedDB — saved baseline', stores.idbBase, 'used only by Reset / when nothing else exists') +
+      storeRow('localStorage — saved baseline', stores.lsBase, '') + '</table>';
+    const warn = [];
+    if (stores.lsMain.present && stores.idbMain.present && (stores.lsMain.customers !== stores.idbMain.customers || stores.lsMain.transactions !== stores.idbMain.transactions))
+      warn.push('The old localStorage copy differs from the live IndexedDB copy. If IndexedDB ever fails to open, the app silently starts from the OLD copy.');
+    if (!stores.idbMain.present && stores.lsMain.present) warn.push('The live IndexedDB copy is missing, so the app is starting from the old localStorage copy.');
+    if (stores.idbBase.present && stores.idbMain.present && stores.idbBase.customers > stores.idbMain.customers)
+      warn.push('The saved baseline has MORE customers than the live data. A Reset (or a lost live copy) would restore that larger set.');
+    if (warn.length) html += '<div class="amb" style="margin-top:8px">⚠️ ' + warn.map(esc).join('<br>⚠️ ') + '</div>';
+    $('stores').innerHTML = html;
+  }
+
+  async function detectUrl() {
+    try { const o = localStorage.getItem(URL_KEY); if (o) { $('cloudUrl').value = o.trim(); return; } } catch (_) {}
+    try {
+      const r = await fetch('index.html', { cache: 'no-store' }); const t = await r.text();
+      const m = t.match(/const\s+GAS_URL\s*=\s*['"]([^'"]+)['"]/); if (m) $('cloudUrl').value = m[1];
+    } catch (_) {}
+  }
+
+  function table(rows, head) {
+    return '<table>' + (head ? '<tr>' + head.map((h, i) => '<th' + (i ? ' class="n"' : '') + '>' + h + '</th>').join('') + '</tr>' : '') +
+      rows.map(r => '<tr>' + r.map((c, i) => '<td' + (i ? ' class="n"' : '') + '>' + c + '</td>').join('') + '</tr>').join('') + '</table>';
+  }
+  const f = n => Number(n).toLocaleString();
+  const kes = n => 'KES ' + Math.round(n).toLocaleString();
+
+  function download(name, text) {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv' })); a.download = name; a.click();
+  }
+
+  function render(res, label) {
+    const c = res.cust, t = res.tx;
+    let h = '<div class="card"><h2>3 · Result — ' + esc(label) + ' vs cloud</h2>';
+    h += table([
+      ['Customers', f(res.counts.localCust), f(res.counts.cloudCust)],
+      ['Transactions', f(res.counts.localTx), f(res.counts.cloudTx)],
+      ['Transaction amounts', kes(t.localTotal), kes(t.cloudTotal)]
+    ], ['', 'This device', 'Cloud']);
+    h += '<h2 style="margin-top:14px">What is in the extra customers</h2>';
+    h += table([
+      ['In both', f(c.both), ''],
+      ['Only here — same phone as a cloud customer', f(c.samePhone), kes(c.spentSamePhone)],
+      ['Only here — same name as a cloud customer (different/masked number)', f(c.sameName), kes(c.spentSameName)],
+      ['Only here — no match at all', f(c.brandNew), kes(c.spentBrandNew)],
+      ['Only in the cloud', f(c.onlyCloud), '']
+    ], ['', 'Count', 'Their “spent”']);
+    if (c.localOnly) h += '<div class="mut">Extra customers with a masked/invalid number: ' + f(c.maskedExtra) + ' of ' + f(c.localOnly) + '. Their last visits, by month: ' + c.lastVisitMonths.map(m => esc(m[0]) + ' (' + f(m[1]) + ')').join(', ') + '.</div>';
+    h += '<h2 style="margin-top:14px">What is in the extra transactions</h2>';
+    h += table([
+      ['In both (same receipt)', f(t.both), ''],
+      ['Only here — receipt code the cloud never saw', f(t.newReceipt), ''],
+      ['Only here — no receipt code, no match', f(t.noReceiptNew), ''],
+      ['Only in the cloud', f(t.onlyCloud), ''],
+      ['Repeated receipts inside this device (duplicates)', f(t.internalDupRows), kes(t.internalDupAmount)],
+      ['Same receipt as cloud but different date', f(t.bothDateDiffers), '']
+    ], ['', 'Count', 'Amount']);
+    if (t.localOnly) {
+      h += '<div class="mut">The extra transactions total ' + kes(t.localOnlyTotal) + ', dated ' + esc(t.dateMin || '?') + ' → ' + esc(t.dateMax || '?') + '.<br>' +
+        'By month: ' + t.months.map(m => esc(m[0]) + ' (' + f(m[1]) + ')').join(', ') + '.<br>' +
+        'Added to the app on: ' + t.importedDays.map(m => esc(m[0]) + ' (' + f(m[1]) + ')').join(', ') + '.<br>' +
+        'Source: ' + t.sources.map(m => esc(m[0]) + ' (' + f(m[1]) + ')').join(', ') + '.</div>';
+    }
+    h += '<h2 style="margin-top:14px">Reading</h2><ul class="verdict">' + res.verdict.map(v => '<li class="' + v.k + '">' + esc(v.t) + '</li>').join('') + '</ul>';
+    h += '<div class="mut">These are signals, not proof — send me a screenshot of this page and I will interpret it against the app\'s merge rules.</div>';
+    h += '<div style="margin-top:10px"><button class="ghost" id="dlC">⬇️ Extra customers (CSV)</button><button class="ghost" id="dlT">⬇️ Extra transactions (CSV)</button></div></div>';
+    $('results').innerHTML = h;
+    $('dlC').onclick = () => {
+      const rows = [];
+      [['same phone', c._rows.samePhone], ['same name', c._rows.sameName], ['no match', c._rows.brandNew]].forEach(g => g[1].forEach(x => rows.push({ kind: g[0], name: x.c.name, contact: x.c.contact, spent: x.c.spent, visits: x.c.visits, firstVisit: x.c.firstVisit, lastVisit: x.c.lastVisit, cloudTwin: x.twin ? x.twin.name + ' / ' + x.twin.contact : '' })));
+      download('extra_customers.csv', SpaxAudit.csv(rows, ['kind', 'name', 'contact', 'spent', 'visits', 'firstVisit', 'lastVisit', 'cloudTwin']));
+    };
+    $('dlT').onclick = () => download('extra_transactions.csv', SpaxAudit.csv(t._rows.newReceipt.concat(t._rows.noReceiptNew), ['date', 'time', 'amount', 'name', 'contact', 'phone', 'product', 'till', 'receipt', 'source', 'importedAt']));
+  }
+
+  $('runBtn').onclick = async () => {
+    const url = $('cloudUrl').value.trim();
+    const st = $('status'); st.className = 'mut';
+    if (!stores.idbMain.present && !stores.lsMain.present) { st.className = 'red'; st.textContent = 'This browser has no stored copy of the app — open this page from the same address and browser you use for the app.'; return; }
+    if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec/.test(url)) { st.className = 'red'; st.textContent = 'Paste your Apps Script address (…/exec).'; return; }
+    $('runBtn').disabled = true; st.textContent = '⏳ Reading the cloud copy (read-only)…';
+    try {
+      const r = await fetch(url + '?action=load', { redirect: 'follow' });
+      cloudData = await r.json();
+      if (!cloudData || cloudData.success === false) throw new Error((cloudData && cloudData.error) || 'The cloud did not answer with data');
+      st.className = 'grn'; st.textContent = '✅ Cloud read: ' + f((cloudData.customers || []).length) + ' customers, ' + f((cloudData.transactions || []).length) + ' transactions (backend v' + (cloudData.version || '?') + ').';
+      const live = stores.idbMain.present ? stores.idbMain : stores.lsMain;
+      const label = stores.idbMain.present ? 'live data (IndexedDB)' : 'old localStorage copy';
+      const res = SpaxAudit.analyze(live._obj, cloudData);
+      render(res, label);
+    } catch (e) { st.className = 'red'; st.textContent = '❌ ' + (e && e.message ? e.message : e); }
+    $('runBtn').disabled = false;
+  };
+
+  loadStores().then(detectUrl);
+})();
+</script>
+</body>
+</html>

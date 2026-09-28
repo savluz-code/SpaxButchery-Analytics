@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spax reconcile (read-only)</title>
+<style>
+  :root { --bg:#0f141a; --card:#1a222b; --line:#2b3642; --txt:#e8edf2; --mut:#8b9aa7; --grn:#2ec4b6; --amb:#f4a261; --red:#e5484d; --blu:#4cc9f0; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; background:var(--bg); color:var(--txt); font:15px/1.45 system-ui,Roboto,Arial,sans-serif; }
+  h1 { font-size:1.25rem; margin:0 0 4px; } h2 { font-size:1.05rem; margin:0 0 8px; } h3 { font-size:.95rem; margin:14px 0 6px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin:12px 0; }
+  .mut { color:var(--mut); font-size:.85rem; } .grn{color:var(--grn)} .amb{color:var(--amb)} .red{color:var(--red)} .blu{color:var(--blu)}
+  button { background:var(--blu); color:#04202a; border:0; border-radius:10px; padding:11px 16px; font-weight:700; font-size:.95rem; margin:4px 6px 4px 0; }
+  button.ghost { background:#2b3642; color:var(--txt); } button:disabled { opacity:.5; }
+  input[type=file] { width:100%; padding:10px; background:#0b1015; color:var(--txt); border:1px solid var(--line); border-radius:8px; }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; } td,th { padding:6px 4px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+  th { color:var(--mut); font-weight:600; } td.n, th.n { text-align:right; white-space:nowrap; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:.75rem; background:#2b3642; }
+  ul.v li { margin:7px 0; }
+</style>
+</head>
+<body>
+<h1>🧮 Spax reconcile <span class="pill">read-only</span></h1>
+<div class="mut">Compares the data stored in this browser with a seed-snapshot file from your phone. It never writes to the app, the cloud or any setting, and sends nothing anywhere: the snapshot is read locally.</div>
+
+<div class="card">
+  <h2>1 · Pick your snapshot file</h2>
+  <div class="mut" style="margin-bottom:6px">The <i>spax_seed_snapshot.js</i> saved by “Export as JS Seed Code”.</div>
+  <input type="file" id="snapFile" accept=".js,.txt,text/javascript,text/plain">
+  <div id="snapStatus" class="mut" style="margin-top:6px"></div>
+</div>
+
+<div class="card">
+  <h2>2 · What this browser has stored</h2>
+  <div id="liveStatus" class="mut">Reading…</div>
+</div>
+
+<div class="card">
+  <button id="runBtn" disabled>Reconcile snapshot with live data</button>
+  <div id="runStatus" class="mut"></div>
+</div>
+<div id="results"></div>
+
+<script>
+/* ═════════ analysis core: pure functions, no DOM, no storage ═════════ */
+const SpaxReconcile = (function () {
+  const num = v => { const n = Number(v); return isFinite(n) ? n : 0; };
+  const cleanReceipt = r => String(r || '').replace(/\s+/g, '').replace(/[^A-Z0-9]/gi, '').toUpperCase();
+  const normName = n => String(n || '').toLowerCase().replace(/[^a-z0-9\s']/g, ' ').replace(/\s+/g, ' ').trim();
+  function normContact(contact) {
+    let c = String(contact || '').trim();
+    if (!c || c.toLowerCase().includes('missing')) return '';
+    c = c.replace(/\s+/g, '');
+    if (c.includes('***')) { if (c.startsWith('254')) return '0' + c.slice(3); return c; }
+    c = c.replace(/[^\d+]/g, '');
+    if (c.startsWith('+254')) c = '0' + c.slice(4);
+    if (c.startsWith('254')) c = '0' + c.slice(3);
+    return c;
+  }
+  const custKey = c => String((c && c.name) || '').trim().toLowerCase() + '|' + normContact((c && c.contact) || '');
+  const day = v => { const m = String(v == null ? '' : v).match(/(\d{4}-\d{2}-\d{2})/); return m ? m[1] : ''; };
+  const sum = (a, f) => a.reduce((t, x) => t + num(f(x)), 0);
+
+  function parseSnapshot(text) {           // same bracket-balanced, string-aware scan the app uses
+    function grab(name) {
+      const m = text.match(new RegExp('const\\s+' + name + '\\s*='));
+      if (!m) throw new Error('missing ' + name);
+      let i = text.indexOf(m[0]) + m[0].length;
+      while (i < text.length && /\s/.test(text[i])) i++;
+      const open = text[i]; if (open !== '[' && open !== '{') throw new Error(name + ': expected [ or {');
+      const close = open === '[' ? ']' : '}';
+      let depth = 0, inStr = false, esc = false;
+      for (let j = i; j < text.length; j++) {
+        const ch = text[j];
+        if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+        if (ch === '"') inStr = true;
+        else if (ch === open || ch === close) { depth += ch === open ? 1 : -1; if (depth === 0) return JSON.parse(text.slice(i, j + 1)); }
+      }
+      throw new Error(name + ': unterminated');
+    }
+    return { customers: grab('SEED_SNAPSHOT_CUSTOMERS'), transactions: grab('SEED_SNAPSHOT_TRANSACTIONS'), monthly: (function () { try { return grab('SEED_SNAPSHOT_MONTHLY'); } catch (_) { return {}; } })() };
+  }
+
+  function ledger(list) {                  // first row per receipt wins; count the repeats
+    const m = new Map(); let noReceipt = 0;
+    (list || []).forEach(t => {
+      const r = cleanReceipt(t.receipt);
+      if (!r) { noReceipt++; return; }
+      const e = m.get(r);
+      if (e) e.count++; else m.set(r, { amount: num(t.amount), date: day(t.date), name: t.name, count: 1 });
+    });
+    let repeats = 0, repeatAmount = 0;
+    (list || []).forEach(() => {});
+    m.forEach(e => { repeats += e.count - 1; });
+    return { map: m, noReceipt, repeats };
+  }
+
+  function analyze(snap, live) {
+    const sC = snap.customers || [], sT = snap.transactions || [];
+    const lC = (live && live.customers) || [], lT = (live && live.transactions) || [];
+    const out = {};
+
+    /* ---- payments: was anything lost, what is newer ---- */
+    const S = ledger(sT), L = ledger(lT);
+    let missing = [], missingAmt = 0, newer = [], newerAmt = 0, amountDiff = 0, snapDupRows = S.repeats;
+    let dMin = '9999', dMax = '0000';
+    S.map.forEach((e, r) => { const l = L.map.get(r); if (!l) { missing.push(r); missingAmt += e.amount; } else if (Math.abs(l.amount - e.amount) > 0.005) amountDiff++; });
+    L.map.forEach((e, r) => { if (!S.map.has(r)) { newer.push(r); newerAmt += e.amount; if (e.date && e.date < dMin) dMin = e.date; if (e.date && e.date > dMax) dMax = e.date; } });
+    const snapDate = sT.reduce((mx, t) => { const d = day(t.date); return d > mx ? d : mx; }, '') || sC.reduce((mx, c) => { const d = day(c.lastVisit); return d > mx ? d : mx; }, '');
+    let snapDupAmount = 0; { const seen = new Set(); sT.forEach(t => { const r = cleanReceipt(t.receipt); if (!r) return; if (seen.has(r)) snapDupAmount += num(t.amount); else seen.add(r); }); }
+    out.pay = {
+      snapRows: sT.length, snapUnique: S.map.size, snapDupRows, snapDupAmount, snapUniqueAmount: sum([...S.map.values()], e => e.amount),
+      liveRows: lT.length, liveUnique: L.map.size, liveRepeats: L.repeats, liveUniqueAmount: sum([...L.map.values()], e => e.amount),
+      missing: missing.length, missingAmount: missingAmt, missingSample: missing.slice(0, 8),
+      newer: newer.length, newerAmount: newerAmt, newerFrom: dMin === '9999' ? '' : dMin, newerTo: dMax === '0000' ? '' : dMax,
+      amountDiff, snapDate
+    };
+
+    /* ---- customers: which live records have a counterpart in the snapshot ---- */
+    const sKey = new Map(), sName = new Map();
+    sC.forEach(c => { sKey.set(custKey(c), c); const n = normName(c.name); if (n && !sName.has(n)) sName.set(n, c); });
+    const lKeys = new Set(lC.map(custKey)), lNames = new Set(lC.map(c => normName(c.name)));
+    const B = { same: [], sameName: [], noMatch: [] };
+    lC.forEach(c => {
+      if (sKey.has(custKey(c))) B.same.push({ c });
+      else if (sName.has(normName(c.name))) B.sameName.push({ c, twin: sName.get(normName(c.name)) });
+      else B.noMatch.push({ c });
+    });
+    const snapOnly = sC.filter(c => !lKeys.has(custKey(c)) && !lNames.has(normName(c.name)));
+    const isNewer = c => day(c.firstVisit) > snap_(snapDate);
+    function snap_(d) { return d || '0000-00-00'; }
+    const split = arr => ({ newer: arr.filter(x => isNewer(x.c)), older: arr.filter(x => !isNewer(x.c)) });
+    const sn = split(B.sameName), nm = split(B.noMatch);
+    const spentOf = arr => sum(arr, x => x.c.spent);
+    out.cust = {
+      snapCount: sC.length, snapSpent: sum(sC, c => c.spent), liveCount: lC.length, liveSpent: sum(lC, c => c.spent),
+      liveBaseline: sum(lC, c => c.seedSpent),
+      same: B.same.length, sameSpent: spentOf(B.same),
+      sameNameOlder: sn.older.length, sameNameOlderSpent: spentOf(sn.older),
+      noMatchOlder: nm.older.length, noMatchOlderSpent: spentOf(nm.older),
+      newerCount: sn.newer.length + nm.newer.length, newerSpent: spentOf(sn.newer) + spentOf(nm.newer),
+      snapOnly: snapOnly.length, snapOnlySpent: sum(snapOnly, c => c.spent),
+      _rows: { sameNameOlder: sn.older, noMatchOlder: nm.older, newer: sn.newer.concat(nm.newer), snapOnly }
+    };
+    const olderAll = sn.older.concat(nm.older);
+    out.cust.olderCount = olderAll.length; out.cust.olderSpent = spentOf(olderAll);
+    out.cust.liveSpentWithoutOlder = out.cust.liveSpent - out.cust.olderSpent;
+
+    /* ---- spend that neither a baseline nor the customer's own payments can explain ---- */
+    const byName = new Map();
+    L.map.forEach(e => { const n = normName(e.name); byName.set(n, (byName.get(n) || 0) + e.amount); });
+    const rows = lC.map(c => {
+      const explained = num(c.seedSpent) + (byName.get(normName(c.name)) || 0);
+      return { c, excess: num(c.spent) - explained };
+    }).filter(x => x.excess > 1);
+    rows.sort((a, b) => b.excess - a.excess);
+    const olderSet = new Set(olderAll.map(x => x.c));
+    out.excess = {
+      count: rows.length, total: sum(rows, x => x.excess),
+      onOlder: sum(rows.filter(x => olderSet.has(x.c)), x => x.excess), countOnOlder: rows.filter(x => olderSet.has(x.c)).length,
+      top: rows.slice(0, 15), _rows: rows
+    };
+
+    /* ---- plain-English reading (signals, not proof) ---- */
+    const v = [], P = out.pay, C = out.cust;
+    if (P.missing === 0) v.push({ k: 'grn', t: 'Nothing was lost: every one of the ' + P.snapUnique.toLocaleString() + ' payments in your snapshot is still in the live ledger.' });
+    else v.push({ k: 'red', t: P.missing.toLocaleString() + ' payments (KES ' + Math.round(P.missingAmount).toLocaleString() + ') that are in your snapshot are NOT in the live ledger. Do not clean anything until these are explained.' });
+    if (P.newer) v.push({ k: 'blu', t: P.newer.toLocaleString() + ' payments (KES ' + Math.round(P.newerAmount).toLocaleString() + ') are newer than the snapshot' + (P.newerFrom ? ' (' + P.newerFrom + ' → ' + P.newerTo + ')' : '') + ' — real sales since ' + P.snapDate + '.' });
+    if (P.liveRepeats) v.push({ k: 'red', t: P.liveRepeats.toLocaleString() + ' live rows still repeat a receipt code — run 🧾 Deduplicate Transactions again.' });
+    if (P.amountDiff) v.push({ k: 'amb', t: P.amountDiff.toLocaleString() + ' receipts have a different amount in the snapshot and the live ledger — worth checking.' });
+    if (C.olderCount) v.push({ k: 'amb', t: C.olderCount.toLocaleString() + ' live customer records existed BEFORE the snapshot date yet have no counterpart in it (' + C.sameNameOlder.toLocaleString() + ' share a name with a snapshot customer under a different number, ' + C.noMatchOlder.toLocaleString() + ' match nothing). They carry KES ' + Math.round(C.olderSpent).toLocaleString() + ' of the KES ' + Math.round(C.liveSpent).toLocaleString() + ' total. Without them the total would be KES ' + Math.round(C.liveSpentWithoutOlder).toLocaleString() + '.' });
+    else v.push({ k: 'grn', t: 'Every live customer that existed before the snapshot is also in the snapshot.' });
+    if (out.excess.count) v.push({ k: 'amb', t: out.excess.count.toLocaleString() + ' customers show more spend (KES ' + Math.round(out.excess.total).toLocaleString() + ' in total) than their baseline plus their own payments can explain; KES ' + Math.round(out.excess.onOlder).toLocaleString() + ' of it sits on the pre-snapshot records above.' });
+    if (C.snapOnly) v.push({ k: 'amb', t: C.snapOnly.toLocaleString() + ' snapshot customers (KES ' + Math.round(C.snapOnlySpent).toLocaleString() + ') have no live record at all.' });
+    v.push({ k: 'mut', t: 'The snapshot itself repeats ' + P.snapDupRows.toLocaleString() + ' receipt rows (KES ' + Math.round(P.snapDupAmount).toLocaleString() + '), so its own customer totals (KES ' + Math.round(C.snapSpent).toLocaleString() + ') are probably overstated by about that much.' });
+    out.verdict = v;
+    return out;
+  }
+
+  function csv(rows, cols) {
+    const q = s => '"' + String(s == null ? '' : s).replace(/"/g, '""') + '"';
+    return cols.join(',') + '\n' + rows.map(r => cols.map(c => q(r[c])).join(',')).join('\n');
+  }
+  return { analyze, parseSnapshot, csv, cleanReceipt, normName, normContact, custKey };
+})();
+if (typeof module !== 'undefined') module.exports = SpaxReconcile;
+
+/* ═════════ page: read-only storage access ═════════ */
+if (typeof document !== 'undefined') (function () {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const f = n => Number(n).toLocaleString(), kes = n => 'KES ' + Math.round(n).toLocaleString();
+  let snap = null, live = null;
+
+  function readLive() {                      // read-only; aborts rather than ever creating a database
+    return new Promise(resolve => {
+      let req, created = false;
+      try { req = indexedDB.open('spax-analytics'); } catch (e) { return resolve({ error: String(e) }); }
+      req.onupgradeneeded = () => { created = true; try { req.transaction.abort(); } catch (_) {} };
+      req.onerror = () => resolve({ error: created ? 'No app database exists in this browser storage — open this page in the same browser you use for the app.' : String(req.error) });
+      req.onsuccess = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('kv')) { db.close(); return resolve({ error: 'The app database has no data store yet.' }); }
+        try {
+          const g = db.transaction('kv', 'readonly').objectStore('kv').get('spaxDB_v23');
+          g.onsuccess = () => { db.close(); try { const raw = g.result; resolve({ data: typeof raw === 'string' ? JSON.parse(raw) : raw }); } catch (e) { resolve({ error: 'Stored data unreadable: ' + e }); } };
+          g.onerror = () => { db.close(); resolve({ error: 'Could not read stored data.' }); };
+        } catch (e) { db.close(); resolve({ error: String(e) }); }
+      };
+    });
+  }
+  function readFile(file) {
+    if (file.text) return file.text();
+    return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsText(file); });
+  }
+  const T = (rows, head) => '<table>' + (head ? '<tr>' + head.map((h, i) => '<th' + (i ? ' class="n"' : '') + '>' + h + '</th>').join('') + '</tr>' : '') +
+    rows.map(r => '<tr>' + r.map((c, i) => '<td' + (i ? ' class="n"' : '') + '>' + c + '</td>').join('') + '</tr>').join('') + '</table>';
+  function dl(name, text) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv' })); a.download = name; a.click(); }
+  function ready() { $('runBtn').disabled = !(snap && live); }
+
+  $('snapFile').addEventListener('change', async e => {
+    const file = e.target.files && e.target.files[0]; if (!file) return;
+    const st = $('snapStatus'); st.className = 'mut'; st.textContent = 'Reading…'; snap = null; ready();
+    try {
+      snap = SpaxReconcile.parseSnapshot(await readFile(file));
+      st.className = 'grn'; st.textContent = '✅ ' + f(snap.customers.length) + ' customers, ' + f(snap.transactions.length) + ' transaction rows in the snapshot.';
+    } catch (err) { st.className = 'red'; st.textContent = '❌ Not a readable snapshot: ' + (err && err.message ? err.message : err); }
+    ready();
+  });
+
+  readLive().then(r => {
+    const el = $('liveStatus');
+    if (r.error) { el.className = 'red'; el.textContent = r.error; return; }
+    live = r.data;
+    el.className = ''; el.innerHTML = '<span class="grn">✅</span> Live data: <b>' + f((live.customers || []).length) + '</b> customers, <b>' + f((live.transactions || []).length) + '</b> transactions.';
+    ready();
+  });
+
+  $('runBtn').onclick = () => {
+    const st = $('runStatus'); st.className = 'mut'; st.textContent = '⏳ Working (read-only)…';
+    setTimeout(() => {
+      try {
+        const res = SpaxReconcile.analyze(snap, live), P = res.pay, C = res.cust, X = res.excess;
+        st.className = 'grn'; st.textContent = '✅ Done.';
+        let h = '<div class="card"><h2>Result</h2>';
+        h += T([
+          ['Customers', f(C.snapCount), f(C.liveCount)],
+          ['Total spent (header)', kes(C.snapSpent), kes(C.liveSpent)],
+          ['Payments (unique receipts)', f(P.snapUnique), f(P.liveUnique)],
+          ['Payment amounts (unique)', kes(P.snapUniqueAmount), kes(P.liveUniqueAmount)],
+          ['Repeated receipt rows', f(P.snapDupRows), f(P.liveRepeats)]
+        ], ['', 'Snapshot', 'Live now']);
+        h += '<h3>Payments</h3>' + T([
+          ['In the snapshot but missing live', f(P.missing), kes(P.missingAmount)],
+          ['Newer than the snapshot (' + esc(P.snapDate) + ')', f(P.newer), kes(P.newerAmount)],
+          ['Same receipt, different amount', f(P.amountDiff), '']
+        ], ['', 'Count', 'Amount']);
+        h += '<h3>Customers</h3>' + T([
+          ['Live record matches a snapshot customer', f(C.same), kes(C.sameSpent)],
+          ['Older record, same NAME as a snapshot customer', f(C.sameNameOlder), kes(C.sameNameOlderSpent)],
+          ['Older record, matches nothing', f(C.noMatchOlder), kes(C.noMatchOlderSpent)],
+          ['New since the snapshot', f(C.newerCount), kes(C.newerSpent)],
+          ['In the snapshot, no live record', f(C.snapOnly), kes(C.snapOnlySpent)]
+        ], ['', 'Count', 'Spent']);
+        h += '<h3>Spend nothing explains</h3>' + T([
+          ['Customers with unexplained spend', f(X.count), kes(X.total)],
+          ['…of which on the older extra records', f(X.countOnOlder), kes(X.onOlder)],
+          ['Live total without the older extras', '', kes(C.liveSpentWithoutOlder)]
+        ], ['', 'Count', 'Amount']);
+        h += '<h3>Reading</h3><ul class="v">' + res.verdict.map(v => '<li class="' + v.k + '">' + esc(v.t) + '</li>').join('') + '</ul>';
+        h += '<div class="mut">Signals, not proof. Send me a screenshot of this whole result.</div>';
+        h += '<div style="margin-top:10px"><button class="ghost" id="dlOld">⬇️ Older extra customers (CSV)</button><button class="ghost" id="dlEx">⬇️ Unexplained spend (CSV)</button></div></div>';
+        $('results').innerHTML = h;
+        $('dlOld').onclick = () => {
+          const rows = [];
+          [['same name', C._rows.sameNameOlder], ['no match', C._rows.noMatchOlder]].forEach(g => g[1].forEach(x => rows.push({ kind: g[0], name: x.c.name, contact: x.c.contact, spent: x.c.spent, visits: x.c.visits, firstVisit: x.c.firstVisit, lastVisit: x.c.lastVisit, isSeed: x.c.isSeed, seedSpent: x.c.seedSpent, snapshotTwin: x.twin ? x.twin.name + ' / ' + x.twin.contact + ' / ' + x.twin.spent : '' })));
+          dl('older_extra_customers.csv', SpaxReconcile.csv(rows, ['kind', 'name', 'contact', 'spent', 'visits', 'firstVisit', 'lastVisit', 'isSeed', 'seedSpent', 'snapshotTwin']));
+        };
+        $('dlEx').onclick = () => dl('unexplained_spend.csv', SpaxReconcile.csv(X._rows.map(x => ({ name: x.c.name, contact: x.c.contact, spent: x.c.spent, seedSpent: x.c.seedSpent, unexplained: Math.round(x.excess), firstVisit: x.c.firstVisit, lastVisit: x.c.lastVisit })), ['name', 'contact', 'spent', 'seedSpent', 'unexplained', 'firstVisit', 'lastVisit']));
+      } catch (err) { st.className = 'red'; st.textContent = '❌ ' + (err && err.message ? err.message : err); }
+    }, 30);
+  };
+})();
+</script>
+</body>
+</html>

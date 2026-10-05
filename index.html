@@ -4033,7 +4033,7 @@ function getTodayEAT(){
   const now = new Date();
   // EAT is UTC+3
   const eatOffset = 3 * 60 * 60 * 1000;
-  const eatTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60 * 1000) + eatOffset);
+  const eatTime = new Date(now.getTime() + eatOffset); // UTC ms + 3h, read back via UTC fields
   return eatTime.toISOString().slice(0,10);
 }
 
@@ -7354,7 +7354,7 @@ function findCustomer(phone,name){
 
 /* ══════════ ANALYTICS 360° — forecasting · P&L · bleeds · prices · expenses ══════════ */
 function anToday(){ return getTodayEAT(); }
-function anAddDays(d, k){ const dt=new Date(d+'T12:00:00'); dt.setDate(dt.getDate()+k); return dt.toISOString().slice(0,10); }
+function anAddDays(d, k){ const dt=new Date(d+'T12:00:00Z'); dt.setUTCDate(dt.getUTCDate()+k); return dt.toISOString().slice(0,10); }
 function anNextMonthKey(mk, k){
   let y=+mk.slice(0,4), m=+mk.slice(5,7)-1+k;
   y+=Math.floor(m/12); m=((m%12)+12)%12+1;
@@ -8112,7 +8112,7 @@ function parseDate(value) {
   // A bare year ("2026") is not a calendar date — don't turn it into Jan 1st.
   if (/^\d{4}$/.test(raw)) return "";
   const d = new Date(raw);
-  if (!isNaN(d)) return d.toISOString().slice(0, 10);
+  if (!isNaN(d)) return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   return "";
 }
 
@@ -9460,7 +9460,7 @@ function importTransactions(txs, opts = {}) {
   const currentBatch = Number(DB.importBatch) || 0;
   let imported = 0, dupes = 0, added = 0, updated = 0, unmasked = 0, needsReview = 0;
   const comebacks = [];
-  const txDate = (tx) => stripTime(tx.date) || new Date().toISOString().slice(0, 10);
+  const txDate = (tx) => stripTime(tx.date) || getTodayEAT();
   // FIRST de-duplicate, THEN mutate. Previously the transaction row was pushed to
   // DB.transactions BEFORE the dedup guard, and the final `importedRev` tally summed
   // EVERY input (including duplicates), while customer spent/visits and monthly

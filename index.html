@@ -188,7 +188,7 @@ footer{text-align:center;padding:20px;color:var(--muted);font-size:.78rem;border
         <option value="nameDesc">🔤 Name Z-A</option>
         <option value="firstDesc">🆕 First Visit ↓</option>
         <option value="firstAsc">🆕 First Visit ↑</option>
-        <option value="lastDesc">🔚 Last Visit ↓</option>
+        <option value="lastDesc" selected>🔚 Last Visit ↓</option>
         <option value="lastAsc">🔚 Last Visit ↑</option>
       </select>
     </div>
@@ -7933,7 +7933,7 @@ function renderCustTable(){
     if(s==='firstAsc')return (a.firstVisit||'').localeCompare(b.firstVisit||'');
     if(s==='lastDesc')return (b.lastVisit||'').localeCompare(a.lastVisit||'');
     if(s==='lastAsc')return (a.lastVisit||'').localeCompare(b.lastVisit||'');
-    return b.spent-a.spent;
+    return (b.lastVisit||"").localeCompare(a.lastVisit||"");
   });
   $('custTable').querySelector('tbody').innerHTML=rows.map(c=>{
     const[st,cls]=statusOf(c.days);const first=stripTime(c.firstVisit)||'—';const last=stripTime(c.lastVisit)||'—';

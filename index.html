@@ -405,13 +405,13 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     <h3>🔗 Masked Contact Resolver</h3>
     <div class="hint" id="maskedCount">—</div>
     <div class="note">🔍 Masked <code>0723***321</code> matches any full number starting <code>0723</code> &amp; ending <code>321</code>. Name-match too → auto-applied. Pattern-only → review list.<br>
-      <b>📎 Attach file:</b> Drop a <b>PDF</b>, CSV, Excel, screenshot, or <b>handwritten photo</b> of a contact list. It auto-extracts names + phones and resolves masked contacts. PDFs use embedded text or OCR fallback; handwriting gets fast adaptive thresholding + a review step.<br>
+      <b>📎 Attach file:</b> Drop a <b>PDF</b>, CSV, Excel, text (.txt), Word (.doc/.docx), screenshot, or <b>handwritten photo</b> of a contact list. It auto-extracts names + phones and resolves masked contacts. PDFs use embedded text or OCR fallback; handwriting gets fast adaptive thresholding + a review step.<br>
       <b>🌙 Kimi Vision AI:</b> When Tesseract struggles with handwriting, Kimi Vision automatically kicks in (Auto mode) or you can use it manually from Settings → Kimi Vision AI.</div>
     <div class="drop" id="resolverDrop" style="padding:24px;margin-bottom:14px">
       <div class="big">📎</div>
       <div><b>Drop one or more contact lists here</b> or click to browse</div>
-      <div style="color:var(--muted);font-size:.8rem;margin-top:6px">Select multiple .pdf · .csv · .xlsx · .xls · .png · .jpg · .jpeg files</div>
-      <input type="file" id="resolverFile" accept=".pdf,.csv,.xlsx,.xls,.png,.jpg,.jpeg,.webp,.bmp,.gif" multiple style="display:none">
+      <div style="color:var(--muted);font-size:.8rem;margin-top:6px">Select multiple .pdf · .csv · .xlsx · .xls · .txt · .doc · .docx · .png · .jpg · .jpeg files</div>
+      <input type="file" id="resolverFile" accept=".pdf,.csv,.xlsx,.xls,.txt,.doc,.docx,.png,.jpg,.jpeg,.webp,.bmp,.gif" multiple style="display:none">
     </div>
     <div id="resolverProgress" style="margin-bottom:12px;font-size:.85rem;color:var(--muted)"></div>
     <div class="grid-2">
@@ -11290,10 +11290,59 @@ function reviewResolverContacts(text, confidence) {
   });
 }
 
+// Best-effort text extraction from a legacy Word .doc (binary) file.
+// Word 97-2003 stores body text as either 8-bit or UTF-16LE runs; we pull
+// readable runs from both decodings and keep whichever yields more content.
+async function extractDocText(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const runs = (str) => (str.match(/[\x20-\x7E\t\r\n]{4,}/g) || []).join('\n');
+  const latin = runs(new TextDecoder('latin1').decode(buf));
+  const utf16 = runs(new TextDecoder('utf-16le').decode(buf.byteLength % 2 ? buf.slice(0, -1) : buf));
+  return (utf16.length > latin.length ? utf16 : latin).replace(/\r/g, '\n');
+}
+
+// Text extraction from a modern Word .docx (a ZIP of XML parts). Uses the
+// ZIP reader bundled with SheetJS (XLSX.CFB), so no extra library is needed.
+async function extractDocxText(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const zip = XLSX.CFB.read(buf, { type: 'array' });
+  const idx = zip.FullPaths.findIndex(p => /\/word\/document\.xml$/i.test(p));
+  if (idx < 0) throw new Error('Not a valid .docx file (word/document.xml missing)');
+  const xml = new TextDecoder('utf-8').decode(zip.FileIndex[idx].content);
+  return xml
+    .replace(/<w:tab\/>/g, '\t')
+    .replace(/<w:br\/>|<w:cr\/>|<\/w:p>|<\/w:tr>/g, '\n')
+    .replace(/<\/w:tc>/g, '\t')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
+
 async function handleResolverFile(file) {
   if (!file) return;
   $('resolverProgress').innerHTML = '<span class="spinner"></span> Processing…';
   try {
+    // Plain text (.txt) / Word (.doc, .docx) → text → contact list
+    if (/\.(txt|docx?)$/i.test(file.name)) {
+      const ext = (file.name.match(/\.(txt|docx?)$/i)[1] || '').toLowerCase();
+      const isDoc = ext !== 'txt';
+      $('resolverProgress').innerHTML = `<span class="spinner"></span> Reading ${isDoc ? 'Word document' : 'text file'}…`;
+      const text = ext === 'docx' ? await extractDocxText(file)
+                 : ext === 'doc' ? await extractDocText(file)
+                 : await file.text();
+      if (!text.trim()) { $('resolverProgress').textContent = `❌ No readable text found in "${file.name}".`; return; }
+      const contacts = parseContactListFromText(text);
+      if (contacts.length >= 2) {
+        const n = resolveContacts(contacts, true);
+        $('resolverProgress').innerHTML = `✅ ${n} contact(s) auto-resolved from .${ext} · ${contacts.length} extracted`;
+        toast(`📇 ${n} masked contacts resolved from ${isDoc ? 'Word document' : 'text file'}`);
+        return;
+      }
+      $('resolverProgress').textContent = '⏳ Waiting for review…';
+      await reviewResolverContacts(text);
+      return;
+    }
+
     if (/\.pdf$/i.test(file.name)) {
       // PDF → text extraction → OCR fallback → contact list
       $('resolverProgress').innerHTML = '<span class="spinner"></span> Reading PDF…';
@@ -11390,8 +11439,9 @@ async function handleResolverFile(file) {
         $('resolverProgress').textContent = '⏳ Waiting for review…';
         await reviewResolverContacts(rawText, wordConf);
       } finally { await worker.terminate(); }
-    } else {
-      // CSV / Excel → parse → contact list
+
+    // 3) CSV / Excel → parse → contact list
+    } else if (/\.(csv|xlsx|xls)$/i.test(file.name)) {
       const rows = await parseCsvExcelFile(file);
       const keys = Object.keys(rows[0] || {});
       const hasName = keys.some(k => /^name$/i.test(k) || /customer.?name/i.test(k));
@@ -11408,6 +11458,10 @@ async function handleResolverFile(file) {
       const n = resolveContacts(list, true);
       $('resolverProgress').innerHTML = `✅ ${n} contact(s) resolved from file · ${list.length} total rows`;
       toast(`📇 ${n} masked contacts resolved from file`);
+
+    // 4) Anything else — not a supported resolver input
+    } else {
+      $('resolverProgress').textContent = `❌ Unsupported file type for "${file.name}". Use PDF, CSV, Excel (.xlsx/.xls), text (.txt), Word (.doc/.docx), or an image (PNG/JPG/JPEG/WEBP/BMP/GIF).`;
     }
   } catch (err) {
     console.error(err);

@@ -11390,8 +11390,9 @@ async function handleResolverFile(file) {
         $('resolverProgress').textContent = '⏳ Waiting for review…';
         await reviewResolverContacts(rawText, wordConf);
       } finally { await worker.terminate(); }
-    } else {
-      // CSV / Excel → parse → contact list
+
+    // 3) CSV / Excel → parse → contact list
+    } else if (/\.(csv|xlsx|xls)$/i.test(file.name)) {
       const rows = await parseCsvExcelFile(file);
       const keys = Object.keys(rows[0] || {});
       const hasName = keys.some(k => /^name$/i.test(k) || /customer.?name/i.test(k));
@@ -11408,6 +11409,10 @@ async function handleResolverFile(file) {
       const n = resolveContacts(list, true);
       $('resolverProgress').innerHTML = `✅ ${n} contact(s) resolved from file · ${list.length} total rows`;
       toast(`📇 ${n} masked contacts resolved from file`);
+
+    // 4) Anything else — not a supported resolver input
+    } else {
+      $('resolverProgress').textContent = `❌ Unsupported file type for "${file.name}". Use PDF, CSV, Excel (.xlsx/.xls), or an image (PNG/JPG/WEBP/BMP/GIF).`;
     }
   } catch (err) {
     console.error(err);

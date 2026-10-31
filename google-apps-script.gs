@@ -196,7 +196,15 @@ var TABLE_HEADERS = {
     // settings.importBatch) — it must survive the cloud round-trip because
     // revenue reconciliation depends on it, but it is never shown in the UI
     // (the public NEW 🌱 badge comes from firstVisit's month instead).
-    'newBatch'
+    'newBatch',
+    // newMonth = the calendar month ("YYYY-MM") this customer was tagged as
+    // a NEW customer in — the month of their first-ever purchase. It is the
+    // STORED form of the 🌱 "new customer this month" badge: the badge must
+    // stay for the whole of that month, so it cannot depend on a first-visit
+    // date that a pull, a merge or a date repair may rewrite. Sheets written
+    // before this column keep loading (the field reads as '' and the client
+    // re-derives it) and gain the column on the next save.
+    'newMonth'
   ],
   monthly: ['label', 'revenue'],
   settings: ['key', 'value'],
@@ -398,6 +406,13 @@ function loadAll_() {
     c.isNew = toBool_(c.isNew);
     c.isSeed = toBool_(c.isSeed);
     c.newBatch = Number(c.newBatch) || 0;
+    // newMonth = the month the customer was tagged as a new customer ("the
+    // new customer this month" badge). Normalised to "YYYY-MM" or '' so the
+    // client never has to guess at a shape the sheet mangled.
+    c.newMonth = (function (v) {
+      var m = String(v == null ? '' : v).trim().match(/^(\d{4}-\d{2})/);
+      return m ? m[1] : '';
+    })(c.newMonth);
     c.seedSpent = Number(c.seedSpent) || 0;
     c.seedVisits = Number(c.seedVisits) || 0;
     c.firstVisit = dateOnly_(c.firstVisit);
@@ -684,8 +699,15 @@ function updateCustomer_(body) {
     var cu = ss.getSheetByName(SHEETS.customers);
     ensureSheetHeader_(cu, TABLE_HEADERS.customers);
     var headers = TABLE_HEADERS.customers;
+    // A sheet written before a column existed (the newMonth tag column) has
+    // FEWER columns than the header list. New columns are always APPENDED,
+    // so the sheet's columns are a prefix of the list — write only the
+    // columns the sheet actually has, so a targeted edit can never fail on a
+    // range the sheet does not have. The missing columns are filled by the
+    // next full save, which rewrites the sheet with the current header list.
+    var nCols = Math.min(headers.length, cu.getLastColumn() || headers.length);
     var cuLast = cu.getLastRow();
-    var cuValues = cuLast > 1 ? cu.getRange(2, 1, cuLast - 1, headers.length).getValues() : [];
+    var cuValues = cuLast > 1 ? cu.getRange(2, 1, cuLast - 1, nCols).getValues() : [];
     var sheetHeaders = cu.getRange(1, 1, 1, Math.max(cu.getLastColumn(), headers.length)).getValues()[0]
       .map(function (h) { return String(h || '').trim(); });
     var nameCol = sheetHeaders.indexOf('name');
@@ -708,18 +730,18 @@ function updateCustomer_(body) {
         if (looseIdx < 0 && k === wantLoose) looseIdx = i;
       }
       if (rowIdx < 0 && gasNormContact_(oldContact) === '') rowIdx = looseIdx;
-      var row = headers.map(function (h) {
+      var row = headers.slice(0, nCols).map(function (h) {
         var v = e.customer[h];
         if (v === undefined || v === null) return '';
         if (typeof v === 'boolean') return v ? 'true' : 'false';
         return v;
       });
       if (rowIdx >= 0) {
-        cu.getRange(rowIdx + 2, 1, 1, headers.length).setValues([row]);
+        cu.getRange(rowIdx + 2, 1, 1, nCols).setValues([row]);
         cuValues[rowIdx] = row.slice();
         updated++;
       } else {
-        cu.getRange(cuValues.length + 2, 1, 1, headers.length).setValues([row]);
+        cu.getRange(cuValues.length + 2, 1, 1, nCols).setValues([row]);
         cuValues.push(row.slice());
         added++;
       }

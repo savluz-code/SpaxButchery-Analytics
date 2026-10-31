@@ -28,7 +28,11 @@
 // Bumped to spax-v34 (2026-09-23): the built-in default backend URL moves
 // from the developer's v3.8 deployment (owner had no edit access) to the
 // owner's own v3.10 deployment bound to the SpaxButchery_Customers sheet.
-const CACHE_NAME = 'spax-v36';
+// Bumped to spax-v37 (2026-11-01): the "new customer this month" tag is
+// restored as a labelled badge and STORED on the customer record, so it
+// stays for the whole month it was earned and survives a reload, a pull or
+// a merge. Installed apps must pick up the new shell for the tag to show.
+const CACHE_NAME = 'spax-v37';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

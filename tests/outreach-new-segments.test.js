@@ -7,6 +7,11 @@ const html = fs.readFileSync(require('node:path').join(__dirname, '..', 'index.h
 const start = html.indexOf('function validOutreachDate(');
 const end = html.indexOf('window.sendOne=', start);
 assert.ok(start !== -1 && end > start);
+// The segment table shows the "new customer this month" tag, so the sandbox
+// needs the tag helpers too (they live further up the file).
+const tagStart = html.indexOf('/* ══════════ NEW THIS MONTH (isNewThisMonth) ══════════');
+const tagEnd = html.indexOf('/* ══════════ COMEBACK (3+ months away, then returned) ══════════', tagStart);
+assert.ok(tagStart !== -1 && tagEnd > tagStart);
 
 function setup() {
   const fields = {};
@@ -28,6 +33,7 @@ function setup() {
   const state = { today:'2027-01-03' }, window = {};
   const context = { $, DB: { customers }, window, getTodayEAT:()=>state.today, stripTime: value => String(value || '').slice(0,10), TEMPLATES:{winback:'Hello'}, fill:(t,c)=>t+' '+c.name, genericMsg:t=>t, kes:n=>'KES '+n, escHtml:String, document:{querySelectorAll:()=>[]}, Date };
   function $(id){return fields[id];}
+  vm.runInNewContext(html.slice(tagStart,tagEnd), context);
   vm.runInNewContext(html.slice(start,end), context);
   return { fields, customers, context, window, state, tbody };
 }

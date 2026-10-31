@@ -28,7 +28,7 @@
 // Bumped to spax-v34 (2026-09-23): the built-in default backend URL moves
 // from the developer's v3.8 deployment (owner had no edit access) to the
 // owner's own v3.10 deployment bound to the SpaxButchery_Customers sheet.
-const CACHE_NAME = 'spax-v34';
+const CACHE_NAME = 'spax-v36';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

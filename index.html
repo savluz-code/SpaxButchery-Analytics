@@ -357,7 +357,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
   <div class="card">
     <h3>💬 WhatsApp / SMS Campaigns</h3>
     <div class="note wa-note">🟢 <b>WhatsApp:</b> guided one-tap-per-contact, each message personalized (WhatsApp blocks multi-recipient auto-send outside their paid Business API).<br>
-    ✉️ <b>SMS:</b> <b>⚡ One-Click Bulk</b> loads ALL selected numbers into your SMS app as a group — one tap sends to everyone (shared generic message). Or use the <b>👤 personalized queue</b>.</div>
+    ✉️ <b>SMS:</b> <b>⚡ One-Click Bulk</b> loads ALL selected numbers into your SMS app as a group — one tap sends to everyone (shared generic message). Use the <b>👤 personalized queue</b>, or configure the gateway below to send separate personalized SMS in bulk.</div>
     <div class="grid-2">
       <div>
         <label style="font-size:.8rem;color:var(--muted)">TARGET SEGMENT</label><br>
@@ -367,8 +367,18 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
           <option value="lapsing">🟡 Lapsing (31–60 days)</option>
           <option value="lost90">🔴 Lost 90–180 days</option>
           <option value="active">🟢 Active (≤30 days) — upsell</option>
+          <option value="newWeek">🌱 New this week</option>
+          <option value="newMonth">🌱 New this month</option>
+          <option value="newRange">🌱 New (from…to)</option>
           <option value="all">All reachable customers</option>
         </select>
+        <div id="segDateRange" style="display:none;margin-bottom:12px">
+          <div class="flex">
+            <label for="segDateFrom">From <input type="date" id="segDateFrom"></label>
+            <label for="segDateTo">To <input type="date" id="segDateTo"></label>
+          </div>
+        </div>
+        <div id="segDateHint" class="hint" aria-live="polite" style="display:none"></div>
         <label style="font-size:.8rem;color:var(--muted)">TEMPLATE — tokens: {firstname} {name} {spent} {visits} {days}</label>
         <select id="tplSel" style="width:100%;margin:6px 0 8px">
           <option value="winback">Win-back offer</option><option value="vip">VIP appreciation</option>
@@ -386,6 +396,17 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
           <button class="btn wa" id="bulkWA">🟢 WhatsApp Queue</button>
           <button class="btn ghost" id="bulkSMSq">👤 SMS Queue</button>
         </div>
+        <details style="margin-top:14px">
+          <summary>📨 Personalized bulk SMS (Africa’s Talking)</summary>
+          <div class="hint">Requires a separately deployed SMS gateway and an Africa’s Talking account. Messages are sent individually and may incur charges. Only contact customers who have consented.</div>
+          <label for="smsGatewayUrl">Gateway URL (ending in /sms)</label>
+          <input id="smsGatewayUrl" type="url" placeholder="https://your-gateway.example/sms" style="width:100%;margin:6px 0" autocomplete="off">
+          <label for="smsGatewayToken">Gateway access token</label>
+          <input id="smsGatewayToken" type="password" style="width:100%;margin:6px 0" autocomplete="off">
+          <div class="hint">The token is not saved; it is sent to the gateway. See README for setup.</div>
+          <button class="btn blue" id="bulkPersonalSMS">📨 Send personalized bulk SMS</button>
+          <div id="personalSMSStatus" role="status" aria-live="polite" style="margin-top:8px;white-space:pre-wrap"></div>
+        </details>
         <div id="bulkStatus" style="margin-top:12px;font-size:.85rem;color:var(--muted)"></div>
         <div id="bulkNext" style="margin-top:8px"></div>
       </div>
@@ -395,7 +416,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
     <h3>Recipients — <span id="segCount">0</span> reachable</h3>
     <div class="hint">Masked contacts excluded automatically. Untick to skip.</div>
     <div class="scroll-y"><table id="segTable">
-      <thead><tr><th><input type="checkbox" id="selAll" checked></th><th>Name</th><th>Phone</th><th>Spent</th><th>Days Away</th><th>Send</th></tr></thead>
+      <thead><tr><th><input type="checkbox" id="selAll" checked></th><th>Name</th><th>Phone</th><th>First Visit</th><th>Spent</th><th>Days Away</th><th>Send</th></tr></thead>
       <tbody></tbody></table></div>
   </div>
 </section>
@@ -10915,26 +10936,62 @@ function triggerComebackMessages(list){
   if(first) sendComebackNow(first, 'wa');
   showComebackPanel(queue);
 }
+// New customers are acquisitions by first-ever visit, not import date. All
+// calendar boundaries use East Africa Time, matching the analytics dashboard.
+function validOutreachDate(date){
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const d=new Date(date+'T00:00:00Z');
+  return !isNaN(d.getTime()) && d.toISOString().slice(0,10)===date;
+}
+function outreachNewRange(segment){
+  if(segment==='newRange'){
+    const from=$('segDateFrom').value, to=$('segDateTo').value;
+    if(!validOutreachDate(from)||!validOutreachDate(to)) return {error:'Select both valid dates to see new customers.'};
+    if(from>to) return {error:'From date must be on or before To date.'};
+    return {from,to};
+  }
+  if(segment!=='newWeek' && segment!=='newMonth') return null;
+  const today=getTodayEAT();
+  if(segment==='newMonth') return {from:today.slice(0,7)+'-01',to:today};
+  const day=new Date(today+'T00:00:00Z');
+  day.setUTCDate(day.getUTCDate()-((day.getUTCDay()+6)%7)); // Monday
+  return {from:day.toISOString().slice(0,10),to:today};
+}
 function segPool(){
-  const s=$('segSel').value,cs=DB.customers.filter(c=>!c.masked&&c.contact!=='—');
+  const s=$('segSel').value,cs=DB.customers.filter(c=>!c.masked && c.contact && c.contact!=='—' && !String(c.contact).includes('*'));
+  const range=outreachNewRange(s);
+  if(range){
+    if(range.error) return [];
+    return cs.filter(c=>{const first=stripTime(c.firstVisit);return validOutreachDate(first) && first>=range.from && first<=range.to;});
+  }
   if(s==='risk')return cs.filter(c=>c.days>60&&c.days<=90);
   if(s==='vip')return cs.filter(c=>c.spent>=10000);
   if(s==='lapsing')return cs.filter(c=>c.days>30&&c.days<=60);
   if(s==='lost90')return cs.filter(c=>c.days>90&&c.days<=180);
   if(s==='active')return cs.filter(c=>c.days<=30);
   return cs;}
-$('tplSel').onchange=()=>{$('tplText').value=TEMPLATES[$('tplSel').value];renderSeg();};
+$('tplSel').onchange=()=>{$('tplText').value=TEMPLATES[$('tplSel').value];updateSegPreview();};
 $('tplText').value=TEMPLATES.winback;
-$('tplText').oninput=renderSeg;$('segSel').onchange=renderSeg;
-function renderSeg(){
-  const pool=segPool().sort((a,b)=>b.spent-a.spent);
-  $('segCount').textContent=pool.length;
+$('tplText').oninput=updateSegPreview;$('segSel').onchange=renderSeg;
+$('segDateFrom').onchange=renderSeg;$('segDateTo').onchange=renderSeg;
+function updateSegPreview(){
+  const pool=window._pool||[];
   $('tplPrev').textContent=pool.length?fill($('tplText').value,pool[0]):'— none in segment —';
   $('tplGeneric').textContent=genericMsg($('tplText').value);
+}
+function renderSeg(){
+  const segment=$('segSel').value, range=outreachNewRange(segment);
+  $('segDateRange').style.display=segment==='newRange'?'block':'none';
+  $('segDateHint').style.display=range?'block':'none';
+  $('segDateHint').textContent=range?(range.error || `First visit: ${range.from} to ${range.to}, inclusive (EAT). ${segment==='newWeek'?'Week starts Monday. ':''}Customers without a first-visit date are excluded.`):'';
+  const pool=segPool().sort((a,b)=>b.spent-a.spent);
+  $('segCount').textContent=pool.length;
+  $('selAll').checked=true;
+  window._pool=pool; updateSegPreview();
   $('segTable').querySelector('tbody').innerHTML=pool.map((c,i)=>`<tr>
     <td><input type="checkbox" class="segChk" data-i="${i}" checked></td>
     <td>${c.name}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}</td>
-    <td>${c.contact}</td><td>${kes(c.spent)}</td><td>${c.days}d</td>
+    <td>${escHtml(c.contact)}</td><td>${escHtml(stripTime(c.firstVisit)||'—')}</td><td>${kes(c.spent)}</td><td>${c.days}d</td>
     <td style="white-space:nowrap">
       <button class="btn wa sm" onclick="sendOne(${i},'wa')">WhatsApp</button>
       <button class="btn blue sm" onclick="sendOne(${i},'sms')">SMS</button></td></tr>`).join('');
@@ -10957,6 +11014,64 @@ $('bulkSMS1').onclick=()=>{
   $('bulkStatus').innerHTML=`⚡ SMS app opening with <b>${nums.length} recipients</b> pre-loaded — hit send once!`;
   window.location.href=href;
   toast(`⚡ Composer opened with ${nums.length} recipients`);};
+// Native SMS URIs cannot carry a different body per recipient. The gateway
+// submits one personalized request at a time and never retries an uncertain send.
+function bulkKenyanPhone(contact){
+  const p=String(contact||'').trim();
+  if(!/^\+?[\d\s()-]+$/.test(p)) return '';
+  const digits=p.replace(/\D/g,'');
+  const local=digits.startsWith('254')?'0'+digits.slice(3):digits.length===9?'0'+digits:digits;
+  return /^0[17]\d{8}$/.test(local)?'+254'+local.slice(1):'';
+}
+async function sendPersonalBulk(){
+  const button=$('bulkPersonalSMS'), status=$('personalSMSStatus');
+  if(button.disabled)return;
+  const pool=selectedPool(), template=$('tplText').value;
+  if(!pool.length){status.textContent='Select at least one recipient.';return;}
+  if(!template.trim()){status.textContent='Enter a message first.';return;}
+  let url;
+  try { url=new URL($('smsGatewayUrl').value.trim()); }
+  catch(_){status.textContent='Enter a valid gateway URL.';return;}
+  if((url.protocol!=='https:' && !(url.protocol==='http:' && ['localhost','127.0.0.1'].includes(url.hostname))) || url.pathname!=='/sms' || url.search || url.hash || url.username || url.password){
+    status.textContent='Use an HTTPS gateway URL ending in /sms (HTTP is allowed only for local testing).';return;
+  }
+  const token=$('smsGatewayToken').value;
+  if(!token){status.textContent='Enter the gateway access token.';return;}
+  const seen=new Set(), rows=[], invalid=[], duplicate=[];
+  for(const c of pool){
+    const to=bulkKenyanPhone(c.contact);
+    if(!to){invalid.push(c.name);continue;}
+    if(seen.has(to)){duplicate.push(c.name);continue;}
+    seen.add(to); rows.push({to,message:fill(template,c),name:c.name});
+  }
+  if(!rows.length){status.textContent='No valid Kenyan mobile numbers selected.';return;}
+  if(rows.some(r=>!r.message.trim()||r.message.length>1500)){status.textContent='Each message must be non-empty and at most 1500 characters.';return;}
+  const skipped=invalid.length+duplicate.length;
+  if(!confirm(`Send ${rows.length} separate personalized SMS via Africa’s Talking? ${skipped} invalid or duplicate number(s) will be skipped. Charges may apply. Only send to consenting customers.`)) return;
+  button.disabled=true;
+  let accepted=0,rejected=0, unknown=0, attempted=0;
+  const details=[];
+  try{
+    for(const row of rows){
+      status.textContent=`Submitting ${attempted+1}/${rows.length}… Accepted: ${accepted}; rejected: ${rejected}.`;
+      attempted++;
+      try{
+        const response=await fetch(url.href,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({to:row.to,message:row.message})});
+        const result=await response.json();
+        if(response.ok && result.status==='accepted'){accepted++;details.push(`${row.name} (${row.to}): accepted${result.messageId?' — '+result.messageId:''}`);continue;}
+        if(response.ok && result.status==='rejected'){rejected++;details.push(`${row.name} (${row.to}): rejected (${result.code})`);continue;}
+        // Auth/validation failures occur before submission; all other failures may be uncertain.
+        if([400,401,403,404,413].includes(response.status) && result.error){rejected++;details.push(`${row.name} (${row.to}): ${result.error}. Campaign stopped.`);break;}
+        unknown++;details.push(`${row.name} (${row.to}): outcome unknown. Verify with the provider before retrying.`);break;
+      }catch(_){unknown++;details.push(`${row.name} (${row.to}): outcome unknown. Verify with the provider before retrying.`);break;}
+    }
+  } finally {
+    button.disabled=false;
+    const remaining=rows.slice(attempted).map(r=>`${r.name} (${r.to}): not attempted`);
+    status.textContent=`Provider accepted: ${accepted}; rejected: ${rejected}; unknown: ${unknown}; not attempted: ${remaining.length}; skipped invalid: ${invalid.length}; skipped duplicates: ${duplicate.length}.\nAcceptance is not delivery. Check provider reports before retrying.\n${details.concat(remaining,invalid.map(n=>n+': invalid number'),duplicate.map(n=>n+': duplicate number')).join('\n')}`;
+  }
+}
+$('bulkPersonalSMS').onclick=sendPersonalBulk;
 let queue=[],qCh='wa',qIdx=0;
 function startQueue(ch){queue=selectedPool();
   if(!queue.length){toast('No recipients selected');return;}

@@ -1,5 +1,28 @@
 # SpaxButchery Analytics
 
+## The "new customer this month" tag
+
+A customer who made their **first-ever purchase** in the current calendar
+month (East Africa Time) carries a **🌱 New customer** tag. It shows on the
+customer row in **Customers**, on the customer card, in the Outreach segment
+table, in the masked-contacts table and in the drill-down lists behind the
+Overview tiles.
+
+The tag is **stored on the customer record** (`newMonth` — the month they were
+tagged in), not merely worked out from a date, so it is **persistent for that
+month**:
+
+- importing another statement in the same month never clears it;
+- a reload, a cloud pull, a cloud merge or a date repair never clears it —
+  when two copies of a customer are merged, the **earliest** acquisition month
+  either side knows wins, so a first visit that was rewritten cannot take the
+  badge away;
+- a record that lost its tag gets it back on the next load (the tag is
+  restored from the customer's first visit).
+
+The tag expires by itself on the 1st of the next month: the stored month stops
+matching the current one. It is never cleared earlier than that.
+
 ## Outreach: new customer segments
 
 Choose **New this week**, **New this month**, or **New (from…to)** in the

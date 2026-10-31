@@ -47,10 +47,10 @@ tr:hover td{background:rgba(255,255,255,.03)}
 .b-risk{background:rgba(244,162,97,.15);color:var(--amber)}.b-lost{background:rgba(230,57,70,.15);color:var(--red2)}
 .b-valid{background:rgba(76,201,240,.12);color:var(--blue)}.b-masked{background:rgba(139,154,167,.15);color:var(--muted)}
 .b-new{background:rgba(46,196,182,.25);color:var(--green)}
-/* 🌱 NEW = first-ever purchase (acquisition). Derived from firstVisit's month —
-   a customer whose first purchase falls in the current calendar month is NEW;
-   the flag expires by itself on the 1st of the next month. */
-.b-month{background:rgba(255,209,102,.18);color:var(--gold);border:1px solid rgba(255,209,102,.35)}.b-month.leaf-only{padding:2px 6px}.b-dup{background:rgba(230,57,70,.25);color:var(--red2)}
+/* 🌱 NEW = first-ever purchase (acquisition). The month a customer was tagged
+   in is STORED on their record (`newMonth`), so the badge is persistent for
+   that whole month; it expires by itself on the 1st of the next month. */
+.b-month{background:rgba(255,209,102,.18);color:var(--gold);border:1px solid rgba(255,209,102,.35)}.b-dup{background:rgba(230,57,70,.25);color:var(--red2)}
 /* Returned after 3+ months away — acquisition/win-back signal */
 .b-comeback{background:rgba(255,209,102,.28);color:var(--gold);border:1px solid rgba(255,209,102,.5)}.b-comeback.leaf-only{padding:2px 6px}
 .cust-name{display:inline-block;vertical-align:top;line-height:1.35;max-width:100%}
@@ -1741,8 +1741,15 @@ async function loadFromCloud() {
             // displayed spent/visits are re-derived from baseline + the
             // unioned history by repairDates() below (CUSTOMER TALLY).
             ...mergeBaselineFields(localCust, cloudCust),
-            firstVisit: stripTime(useCloud ? (cloudCust.firstVisit || localCust.firstVisit) : (localCust.firstVisit || cloudCust.firstVisit)),
-            lastVisit: stripTime(useCloud ? (cloudCust.lastVisit || localCust.lastVisit) : (localCust.lastVisit || cloudCust.lastVisit))
+            // The FIRST visit is the earliest either side knows (a later copy
+            // must not push it back) and the LAST visit the latest — the
+            // same rule smartMergeCloud uses.
+            firstVisit: (() => { const f1 = stripTime(cloudCust.firstVisit), f2 = stripTime(localCust.firstVisit); return (f1 && f2) ? (f1 < f2 ? f1 : f2) : (f1 || f2 || ''); })(),
+            lastVisit: (() => { const l1 = stripTime(cloudCust.lastVisit), l2 = stripTime(localCust.lastVisit); return (l1 && l2) ? (l1 > l2 ? l1 : l2) : (l1 || l2 || ''); })(),
+            // The "new customer this month" tag is MERGED, never replaced: the
+            // earliest acquisition month either side knows wins, so a sync can
+            // never take the badge off a customer.
+            newMonth: spaxMergeAcqMonth(customerAcqMonth(localCust), customerAcqMonth(cloudCust))
           });
           cloudMap.delete(key);
         } else {
@@ -5816,6 +5823,9 @@ async function seedDB(){
         name:c[0],contact:c[1],spent:c[2],visits:c[3],days:c[4],
         firstVisit: firstVisit, lastVisit: lastVisit,
         masked:c[1].includes('***'),isNew:false,
+        // The month the baseline row says this customer first bought — the
+        // "new customer" tag for that month (the badge reads it).
+        newMonth: spaxMonthOnly(firstVisit),
         // Seed customers carry their report row as an explicit BASELINE
         // (seedSpent/seedVisits up to seedLastVisit). spent/visits are DERIVED
         // from baseline + transaction history — see CUSTOMER TALLY.
@@ -5938,6 +5948,11 @@ async function load(){
     // had a sticky isNew that never expired — those flags are cleared here so
     // NEW strictly means "discovered by the most recent import".
     if (reconcileNewFlags() > 0) needsSave = true;
+    // Restore the "new customer this month" tag on every record that lost
+    // it — an older save, a merge from a sheet written before the tag
+    // existed, or a date repair that rewrote the first visit. The tag is
+    // persisted so it survives the next reload and reaches the cloud.
+    if (restoreNewMonthTags() > 0) needsSave = true;
     // Persist migration fixes to localStorage
     if(needsSave){
       persistDB();
@@ -7341,6 +7356,11 @@ function repairDates(){
   // what makes an inflated database heal completely rather than only on the
   // cards, and what stops a stale cloud sheet re-inflating the chart.
   if (reconcileRevenueLedgers()) fixed++;
+  // The "new customer this month" tag follows the first visit: re-derive it
+  // after the dates were touched, so a first visit that was lost or moved
+  // back carries the tag again. Deliberately NOT counted as a fix — the tag
+  // is bookkeeping, and this counter means "dates were repaired".
+  if (typeof restoreNewMonthTags === 'function') restoreNewMonthTags();
   return fixed;
 }
 // Same split the stats bar / Overview use, so the 🥩/🍲 filter, the per-product
@@ -7727,7 +7747,7 @@ function listCustomerRow(c){
   const col = st === 'valid' ? 'var(--green)' : 'var(--amber)';
   return '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 11px;' +
     'border:1px solid var(--border);border-radius:8px;background:var(--card2);margin-bottom:6px">' +
-    '<div style="min-width:0"><div style="font-weight:600">' + escHtml(c.name) + '</div>' +
+    '<div style="min-width:0"><div style="font-weight:600">' + escHtml(c.name) + ' ' + newCustomerTag(c) + '</div>' +
     '<div style="font-size:.72rem;color:var(--muted)">' + escHtml(c.contact) + ' · ' + kes(c.spent) + ' · ' + (c.visits||0) + ' visits' + '</div></div>' +
     '<div style="font-size:.68rem;color:' + col + ';white-space:nowrap">' + contactStatus(c) + '</div>' +
     '</div>';
@@ -7772,7 +7792,7 @@ function drillVIPs(){
   showCustomersList('Tracked VIPs', 'KES 10K+ lifetime spend', rows, rows.length + ' customer(s)');
 }
 function showNewCustomersMonth(mk){
-  const rows = (DB.customers||[]).filter(c => c.firstVisit && String(c.firstVisit).slice(0,7) === mk)
+  const rows = (DB.customers||[]).filter(c => customerAcqMonth(c) === mk)
     .slice().sort((a,b) => (b.spent||0) - (a.spent||0));
   showCustomersList('New Customers · ' + monthLabelEAT(mk), 'First-ever purchase in ' + monthLabelEAT(mk),
     rows, rows.length + ' new customer(s)');
@@ -7962,7 +7982,7 @@ function renderCustTable(){
       <button class="btn blue sm" onclick="quickSMS('${normPhone(c.contact)}','${c.name.replace(/'/g,"\\'")}')">SMS</button>`;
     const ntm = isNewThisMonth(c);
     return `<tr style="cursor:pointer" onclick="showCustomerDetail('${c.name.replace(/'/g,"\'")}')">
-    <td><span class="cust-name${ntm?' ntm':''}">${wrapCustomerName(c.name)}</span>${comebackBadge(c)}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${ntm?' <span class="badge b-month leaf-only" title="First-ever purchase this month">🌱</span>':''}</td>
+    <td><span class="cust-name${ntm?' ntm':''}">${wrapCustomerName(c.name)}</span>${comebackBadge(c)}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${ntm?' '+newCustomerTag(c):''}</td>
     <td><span class="badge ${c.masked?'b-masked':'b-valid'}">${c.contact}</span></td>
     <td>${kes(c.spent)}</td><td>${c.visits}</td><td>KES ${Math.round(c.spent/Math.max(c.visits,1))}</td>
     <td>${c.days}</td><td>${first}</td><td>${last}</td><td><span class="badge ${cls}">${st}</span>${customerIPI(c).status==='overdue'?' <span class="badge b-risk" title="Personal purchase interval overdue">⚡ Overdue</span>':''}</td>
@@ -8349,6 +8369,11 @@ function mergeBaselineCustomer(c) {
         existing.firstVisit = firstVisit;
       }
     }
+    // The "new customer this month" tag follows the first visit, and only
+    // ever moves EARLIER — a baseline row carrying an older first purchase
+    // must not push the tag into a later month, and a later row must never
+    // take the tag away.
+    existing.newMonth = spaxMergeAcqMonth(existing.newMonth, spaxMonthOnly(existing.firstVisit));
     // Recalculate days from lastVisit
     const today = new Date(getTodayEAT());
     if (existing.lastVisit) {
@@ -8395,6 +8420,9 @@ window.applyBaselineReview = i => {
     days: r.lastVisit ? daysSince(r.lastVisit) : 999, firstVisit: r.firstVisit, lastVisit: r.lastVisit,
     masked: contactStatus({ contact: r.contact }) === "Masked",
     isNew: false, newBatch: 0, isSeed: false,
+    // Tag the customer with the month they first bought, so the "new
+    // customer this month" badge is there from the start.
+    newMonth: spaxMonthOnly(r.firstVisit || r.lastVisit),
     seedSpent: r.totalSpent, seedVisits: r.totalVisits || 1, seedLastVisit: r.lastVisit
   };
   DB.customers.push(created);
@@ -9386,32 +9414,84 @@ function sanitizeNegativeTotals() {
    THE single definition of "new" in the app: NEW = new acquisition =
    first-ever purchase (firstVisit) falls in the current calendar month (EAT).
    A customer already in the database before this month is never NEW, no matter
-   how recently their statement row was imported. Derived, never stored, so it
-   expires by itself on the 1st of each month and can never go stale in
-   localStorage or the cloud sheet. The same rule applies retroactively to any
-   month (see newCustomersByMonth) — every month since the baseline had its own
-   new acquisitions, except June 2025 when everyone was new (baseline start). */
+   how recently their statement row was imported. The same rule applies
+   retroactively to any month (see newCustomersByMonth) — every month since
+   the baseline had its own new acquisitions, except June 2025 when everyone
+   was new (baseline start).
+
+   THE TAG IS STORED, not merely derived. Every customer record carries the
+   calendar month it was tagged as a new customer in (`newMonth`, "YYYY-MM"),
+   and the badge reads that tag. That is what makes the tag PERSISTENT for
+   the month it was earned:
+     • a later import in the SAME month never clears it — the old teal
+       "found in the latest import" flag did expire on the next statement,
+       and this one must not; and
+     • it survives a reload, a cloud pull, a merge, or a date repair that
+       rewrites firstVisit — the tag no longer depends on firstVisit alone,
+       so a first visit that got lost cannot take the badge with it.
+   The acquisition month is MONOTONIC: it only ever moves EARLIER (a first
+   visit discovered later is still a first visit), so merging two copies of a
+   customer keeps the earliest month either side knows. The tag expires by
+   itself on the 1st of the next month, when the stored month stops matching
+   the current one — never before. */
 function currentMonthEAT(){ return getTodayEAT().slice(0, 7); }
+/* "YYYY-MM" out of anything date-shaped ("2026-10", "2026-10-05", an ISO
+   timestamp). Empty string when there is no month to read. */
+function spaxMonthOnly(v){
+  const m = String(v == null ? '' : v).trim().match(/^(\d{4}-\d{2})/);
+  return m ? m[1] : '';
+}
+/* The month a customer was tagged as a new customer: the stored tag when
+   there is one, otherwise the month of their first visit. */
+function customerAcqMonth(c){
+  if(!c) return '';
+  return spaxMonthOnly(c.newMonth) || spaxMonthOnly(c.firstVisit);
+}
+/* Merge two copies of the same customer: the EARLIEST acquisition month
+   wins, so a tag can never be lost by a sync, a pull or a merge. */
+function spaxMergeAcqMonth(a, b){
+  const am = spaxMonthOnly(a), bm = spaxMonthOnly(b);
+  if(!am) return bm;
+  if(!bm) return am;
+  return am < bm ? am : bm;
+}
 function isNewThisMonth(c, month){
   const m = month || currentMonthEAT();
-  return !!(c && c.firstVisit && String(c.firstVisit).slice(0, 7) === m);
+  return !!(c && customerAcqMonth(c) === m);
 }
 function newThisMonthCustomers(month){
   const m = month || currentMonthEAT();
   return (DB.customers || []).filter(c => isNewThisMonth(c, m));
 }
+/* Restore the "new customer this month" tag on every record.
+   A record that lost its tag — an older save, a merge from a sheet written
+   before the tag existed, a date repair that rewrote firstVisit — gets it
+   back from the month of its first visit; a record whose first visit was
+   lost keeps the tag it already carries. The tag is never cleared while it
+   still matches the customer's first visit, and it only ever moves earlier.
+   Returns how many records were changed. */
+function restoreNewMonthTags(){
+  let restored = 0;
+  (DB.customers || []).forEach(c => {
+    if(!c) return;
+    const stored = spaxMonthOnly(c.newMonth);
+    const derived = spaxMonthOnly(c.firstVisit);
+    const want = (stored && derived) ? (stored < derived ? stored : derived) : (stored || derived);
+    if(!want) return;
+    if(c.newMonth !== want){ c.newMonth = want; restored++; }
+  });
+  return restored;
+}
 /* New acquisitions per calendar month — same rule as isNewThisMonth applied
    retroactively to every month in the dataset: a customer counts as NEW in
-   the month of their firstVisit, and in no other month. Months are ordered
+   the month of their first visit, and in no other month. Months are ordered
    chronologically across all months present (baseline June 2025 through the
    current month, skipping months with no data). */
 function newCustomersByMonth(){
   const counts = new Map();
   (DB.customers || []).forEach(c => {
-    if (c && c.firstVisit && /^\d{4}-\d{2}/.test(String(c.firstVisit))) {
-      const m = String(c.firstVisit).slice(0, 7);
-      counts.set(m, (counts.get(m) || 0) + 1);
-    }
+    const m = customerAcqMonth(c);
+    if(m) counts.set(m, (counts.get(m) || 0) + 1);
   });
   const labels = Array.from(counts.keys()).sort();
   return { labels, counts: labels.map(m => counts.get(m)) };
@@ -9420,6 +9500,17 @@ function monthLabelEAT(month){
   const m = month || currentMonthEAT();
   const d = new Date(m + '-01T00:00:00');
   return isNaN(d) ? m : d.toLocaleString('en-GB', { month: 'long', year: 'numeric' });
+}
+/* The "new customer this month" TAG itself — one renderer, so every list
+   that shows a customer shows the tag the same way. It used to be a bare
+   leaf emoji, which read as decoration instead of as the marker the
+   business asks about; the badge is labelled again and its tooltip names
+   the month the customer first bought, so the tag explains itself. */
+function newCustomerTag(c){
+  if(!isNewThisMonth(c)) return '';
+  const m = customerAcqMonth(c);
+  return '<span class="badge b-month" title="New customer this month — first-ever purchase in ' +
+    escHtml(monthLabelEAT(m)) + '">🌱 New customer</span>';
 }
 
 /* ══════════ COMEBACK (3+ months away, then returned) ══════════
@@ -9615,6 +9706,12 @@ function importTransactions(txs, opts = {}) {
         masked: (tx.contact || "").includes("***") || !isValidKenyanContact(tx.contact),
         isNew: true,
         newBatch: currentBatch,
+        // The "new customer this month" tag is STORED from the moment the
+        // customer is created: the month they first bought. Storing it is
+        // what keeps the tag for the whole of that month — a later import
+        // in the same month never clears it, and the tag survives a reload
+        // or a sync that no longer carries a usable first-visit date.
+        newMonth: spaxMonthOnly(txDateNorm),
         // A customer discovered by a statement has no un-itemised baseline:
         // everything they ever spent is in their history.
         isSeed: false,
@@ -9826,6 +9923,10 @@ function dedupeCustomers(){
       Object.assign(primary, mergeBaselineFields(primary, o));
       if (o.lastVisit && (!primary.lastVisit || o.lastVisit > primary.lastVisit)) primary.lastVisit = o.lastVisit;
       if (o.firstVisit && (!primary.firstVisit || o.firstVisit < primary.firstVisit)) primary.firstVisit = o.firstVisit;
+      // The "new customer this month" tag follows the merge too: the earliest
+      // acquisition month either record knows wins, so merging duplicates can
+      // never take the badge away.
+      primary.newMonth = spaxMergeAcqMonth(customerAcqMonth(primary), customerAcqMonth(o));
       // Transaction history consolidation happens below via
       // rebuildCustomerHistory(): after the repoint it re-projects every row
       // onto the survivor by phone/masked/name match (the table is derived).
@@ -10707,7 +10808,7 @@ async function handleSeedSnapshotFile(input) {
 // + transactions + customer history).
 function buildSeedCode(){
   const stamp = new Date().toISOString();
-  const customers = DB.customers.map(c => ({ name: c.name, contact: c.contact, spent: c.spent, visits: c.visits, days: c.days, firstVisit: c.firstVisit, lastVisit: c.lastVisit, masked: !!c.masked, isNew: !!c.isNew, comeback: !!c.comeback, comebackAt: c.comebackAt || '', comebackGapDays: c.comebackGapDays || 0, comebackNotified: !!c.comebackNotified }));
+  const customers = DB.customers.map(c => ({ name: c.name, contact: c.contact, spent: c.spent, visits: c.visits, days: c.days, firstVisit: c.firstVisit, lastVisit: c.lastVisit, masked: !!c.masked, isNew: !!c.isNew, newMonth: c.newMonth || '', comeback: !!c.comeback, comebackAt: c.comebackAt || '', comebackGapDays: c.comebackGapDays || 0, comebackNotified: !!c.comebackNotified }));
   const code =
 `/* ══════════ SPAX SEED SNAPSHOT — generated ${stamp} ══════════
  * Paste this into seedDB() (or keep alongside it) to make the current data the
@@ -10990,7 +11091,7 @@ function renderSeg(){
   window._pool=pool; updateSegPreview();
   $('segTable').querySelector('tbody').innerHTML=pool.map((c,i)=>`<tr>
     <td><input type="checkbox" class="segChk" data-i="${i}" checked></td>
-    <td>${c.name}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}</td>
+    <td>${escHtml(c.name)}${c.spent>=10000?' <span class="badge b-vip">VIP</span>':''}${isNewThisMonth(c)?' '+newCustomerTag(c):''}</td>
     <td>${escHtml(c.contact)}</td><td>${escHtml(stripTime(c.firstVisit)||'—')}</td><td>${kes(c.spent)}</td><td>${c.days}d</td>
     <td style="white-space:nowrap">
       <button class="btn wa sm" onclick="sendOne(${i},'wa')">WhatsApp</button>
@@ -11096,7 +11197,7 @@ function renderMaskTable(){
   const m=DB.customers.filter(c=>c.masked).sort((a,b)=>b.spent-a.spent);
   $('maskTable').querySelector('tbody').innerHTML=m.map((c,idx)=>{
     const origIdx=DB.customers.indexOf(c);
-    return `<tr><td>${c.name}</td><td><span class="badge b-masked">${c.contact}</span></td>
+    return `<tr><td>${c.name}${isNewThisMonth(c)?' '+newCustomerTag(c):''}</td><td><span class="badge b-masked">${c.contact}</span></td>
     <td>${kes(c.spent)}</td><td>${c.visits}</td><td>${c.days}d</td>
     <td><button class="btn ghost sm" onclick="event.stopPropagation();openContactEdit(${origIdx})" title="Edit name & contact">✏️ Edit</button></td></tr>`;
   }).join('')||'<tr><td colspan="6">🎉 No masked contacts in tracked list!</td></tr>';}
@@ -11936,10 +12037,17 @@ async function forcePullFromCloud(){
       return;
     }
 
+    // A pull overwrites the local database with the sheet's copy — but the
+    // "new customer this month" tag must never be lost that way: a sheet
+    // written before the tag existed (or by a device that never had the
+    // column) would silently strip it. The local acquisition month is
+    // carried over, earliest wins, so the badge survives the pull.
+    const localAcq = new Map((DB.customers || []).map(c => [customerMergeKey(c), customerAcqMonth(c)]));
     DB.customers = spaxDropTombstonedCustomers(cloudCustomers.map(c => ({
       ...c,
       firstVisit: stripTime(c.firstVisit),
-      lastVisit: stripTime(c.lastVisit)
+      lastVisit: stripTime(c.lastVisit),
+      newMonth: spaxMergeAcqMonth(customerAcqMonth(c), localAcq.get(customerMergeKey(c)))
     })));
     if(data.monthly) DB.monthly = data.monthly;
     if(data.settings){
@@ -12028,7 +12136,11 @@ async function smartMergeCloud(){
           ...(useCloud ? cloudCust : {}),
           ...mergeBaselineFields(localCust, cloudCust),
           firstVisit: (() => { const f1 = stripTime(cloudCust.firstVisit), f2 = stripTime(localCust.firstVisit); return (f1 && f2) ? (f1 < f2 ? f1 : f2) : (f1 || f2 || ""); })(),
-          lastVisit: (() => { const l1 = stripTime(cloudCust.lastVisit), l2 = stripTime(localCust.lastVisit); return (l1 && l2) ? (l1 > l2 ? l1 : l2) : (l1 || l2 || ""); })()
+          lastVisit: (() => { const l1 = stripTime(cloudCust.lastVisit), l2 = stripTime(localCust.lastVisit); return (l1 && l2) ? (l1 > l2 ? l1 : l2) : (l1 || l2 || ""); })(),
+          // The "new customer this month" tag is merged, never replaced: the
+          // earliest acquisition month either side knows wins, so a merge can
+          // never take the badge off a customer.
+          newMonth: spaxMergeAcqMonth(customerAcqMonth(localCust), customerAcqMonth(cloudCust))
         });
         cloudMap.delete(key);
         mergedCount++;
@@ -12357,7 +12469,7 @@ function showCustomerDetail(name){
     <span class="badge ${statusOf(c.days)[1]}">${statusOf(c.days)[0]}</span>
     ${c.spent>=10000?'<span class="badge b-vip">VIP</span>':''}
     ${comebackBadge(c)}
-    ${ntm?`<span class="badge b-month leaf-only" title="First-ever purchase in ${monthLabelEAT()}">🌱</span>`:''}
+    ${ntm?`<span class="badge b-month" title="New customer this month — first-ever purchase in ${monthLabelEAT(customerAcqMonth(c))}">🌱 New customer this month</span>`:''}
   `;
   // The card is always rendered from the derived tally (baseline + history),
   // so Total Spent / Visits can never disagree with the history listed below.
@@ -12737,6 +12849,9 @@ function deleteAllKeepResolved(){
     firstVisit: '', lastVisit: '',
     masked: false,
     isNew: false, newBatch: 0,
+    // No first visit left, so no "new customer" tag either — the badge
+    // comes back only if a purchase proves one.
+    newMonth: '',
     isSeed: false,
     seedSpent: 0, seedVisits: 0, seedLastVisit: ''
   }));

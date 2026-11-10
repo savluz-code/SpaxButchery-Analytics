@@ -31,6 +31,39 @@ import date. The week runs Monday through today; the month runs from the first
 through today, using East Africa Time. Custom dates are inclusive. Customers
 without a known first-visit date or a reachable contact are excluded.
 
+## Outreach: welcome and thank-you messages
+
+The Outreach template picker includes two short messages for new customers:
+
+- **Welcome & appreciation (new customers)** — 50 characters or fewer, so it
+  reads quickly and fits one message:
+
+  > Hi {firstname}! Welcome to SpaxButchery 🥩 Asante!
+
+- **Thank you (one SMS)** — says thanks for shopping with us:
+
+  > Hi {firstname}! Thanks for shopping with us at SpaxButchery!
+
+Pick a **New this week / New this month / New (from…to)** target segment,
+choose a template, and send it through WhatsApp or SMS. Customers whose names
+are unknown get the shared version ("Hi there! …").
+
+### Staying inside one SMS
+
+Under the template box the app shows the length of the longest message in the
+selected segment, e.g. `56 characters · GSM-7 · 1 SMS ✓ (limit 160)`, and turns
+red if the text would be split into more than one SMS. The count follows the
+networks' rules:
+
+| Encoding | One SMS | Per part once split |
+| --- | --- | --- |
+| GSM-7 (plain text) | 160 characters | 153 |
+| UCS-2 (any emoji, e.g. 🥩) | 70 characters | 67 |
+
+An emoji is cheap in characters but expensive in space: it switches the whole
+message to UCS-2, where one SMS holds only 70. The thank-you template avoids
+emoji so it has the full 160, and stays at one SMS for every customer name.
+
 ## Personalized bulk SMS
 
 The Outreach tab has three SMS choices: a shared-message SMS app composer, a

@@ -381,10 +381,13 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         <div id="segDateHint" class="hint" aria-live="polite" style="display:none"></div>
         <label style="font-size:.8rem;color:var(--muted)">TEMPLATE — tokens: {firstname} {name} {spent} {visits} {days}</label>
         <select id="tplSel" style="width:100%;margin:6px 0 8px">
+          <option value="welcome">Welcome &amp; appreciation (new customers)</option>
+          <option value="thanks">Thank you (one SMS)</option>
           <option value="winback">Win-back offer</option><option value="vip">VIP appreciation</option>
           <option value="upsell">Bundle upsell</option><option value="custom">Custom…</option>
         </select>
         <textarea id="tplText" rows="6"></textarea>
+        <div id="tplSms" class="hint" aria-live="polite"></div>
       </div>
       <div>
         <label style="font-size:.8rem;color:var(--muted)">PERSONALIZED PREVIEW (first recipient)</label>
@@ -11082,11 +11085,32 @@ document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>ask(c.textContent));
 
 /* ══════════ OUTREACH ══════════ */
 const TEMPLATES={
+welcome:`Hi {firstname}! Welcome to SpaxButchery 🥩 Asante!`,
+thanks:`Hi {firstname}! Thanks for shopping with us at SpaxButchery!`,
 winback:`Hi {firstname}! 👋 We've missed you at SpaxButchery — it's been {days} days! As a valued customer (KES {spent} with us 🙏), enjoy KES 100 OFF any order above KES 500 this week. Karibu tena! 🥩`,
 vip:`Hello {firstname}! 🌟 You're one of SpaxButchery's TOP customers — {visits} visits and KES {spent}! Show this message for a FREE 1/2kg of sausages on your next visit. Asante sana! 🥩`,
 upsell:`Hi {firstname}! 🥩 New at SpaxButchery: Family Pack — 1kg beef + sausages + soup bones at a special bundle price! Pop in this week and save. See you soon!`,
 comeback:`Hi {firstname}! 👋 Welcome back to SpaxButchery! It's been {gap} days since your last visit — great to see you again. Enjoy a FREE 1/2kg of sausages on your next order! Karibu tena! 🥩`,
 custom:`Hi {firstname}! `};
+/* One-SMS guard: a GSM-7 message fits 160 characters (153 per part once it has
+   to be split); any character outside that alphabet — e.g. an emoji — switches
+   the whole message to UCS-2, where one SMS holds only 70 units. */
+function smsInfo(text){
+  const GSM7='@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !"#¤%&\'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà';
+  const GSM7_EXT='^{}\\[~]|€';
+  const t=String(text==null?'':text);
+  let units=0, gsm7=true;
+  for(const ch of t){
+    if(GSM7_EXT.includes(ch)) units+=2;
+    else if(GSM7.includes(ch)) units+=1;
+    else { gsm7=false; break; }
+  }
+  const chars=[...t].length;
+  if(gsm7) return {chars, units, encoding:'GSM-7', segments:units<=160?1:Math.ceil(units/153), limit:160};
+  let u=0;
+  for(const ch of t) u+=(ch.codePointAt(0)>0xFFFF?2:1);
+  return {chars, units:u, encoding:'UCS-2', segments:u<=70?1:Math.ceil(u/67), limit:70};
+}
 function fill(t,c){return t.replace(/{name}/g,c.name).replace(/{firstname}/g,firstName(c.name))
   .replace(/{spent}/g,Math.round(c.spent).toLocaleString()).replace(/{visits}/g,c.visits).replace(/{days}/g,c.days).replace(/{gap}/g,Math.round(c.comebackGapDays || c.gap || 90));}
 function genericMsg(t){return t
@@ -11201,6 +11225,17 @@ function updateSegPreview(){
   const pool=window._pool||[];
   $('tplPrev').textContent=pool.length?fill($('tplText').value,pool[0]):'— none in segment —';
   $('tplGeneric').textContent=genericMsg($('tplText').value);
+  const smsEl=$('tplSms');
+  if(smsEl){
+    // Measure every recipient's real message (names differ in length) so the
+    // count reflects the longest one, not just the first previewed customer.
+    const msgs=pool.length?pool.map(c=>fill($('tplText').value,c)):[$('tplText').value];
+    const info=msgs.map(smsInfo).reduce((a,b)=>b.units>a.units?b:a);
+    smsEl.textContent=info.segments===1
+      ? `${info.units} characters · ${info.encoding} · 1 SMS ✓ (limit ${info.limit})`
+      : `⚠️ ${info.units} characters · ${info.encoding} · ${info.segments} SMS — over one SMS (limit ${info.limit})`;
+    smsEl.style.color=info.segments===1?'':'var(--red)';
+  }
 }
 function renderSeg(){
   const segment=$('segSel').value, range=outreachNewRange(segment);

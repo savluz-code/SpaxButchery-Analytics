@@ -32,7 +32,13 @@
 // restored as a labelled badge and STORED on the customer record, so it
 // stays for the whole month it was earned and survives a reload, a pull or
 // a merge. Installed apps must pick up the new shell for the tag to show.
-const CACHE_NAME = 'spax-v37';
+// Bumped to spax-v38 (2026-11-10): Outreach gains a short (50-character)
+// welcome-and-appreciation template for new customers. Installed apps must
+// pick up the new shell for it to appear.
+// Bumped to spax-v39 (2026-11-10): Outreach adds a "Thanks for shopping with
+// us" template and shows a live one-SMS length check under the template box
+// (GSM-7 160/153, UCS-2 70/67). Installed apps must pick up the new shell.
+const CACHE_NAME = 'spax-v39';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

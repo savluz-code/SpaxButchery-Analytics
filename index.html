@@ -381,6 +381,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         <div id="segDateHint" class="hint" aria-live="polite" style="display:none"></div>
         <label style="font-size:.8rem;color:var(--muted)">TEMPLATE — tokens: {firstname} {name} {spent} {visits} {days}</label>
         <select id="tplSel" style="width:100%;margin:6px 0 8px">
+          <option value="welcome">Welcome &amp; appreciation (new customers)</option>
           <option value="winback">Win-back offer</option><option value="vip">VIP appreciation</option>
           <option value="upsell">Bundle upsell</option><option value="custom">Custom…</option>
         </select>
@@ -11082,6 +11083,7 @@ document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>ask(c.textContent));
 
 /* ══════════ OUTREACH ══════════ */
 const TEMPLATES={
+welcome:`Hi {firstname}! Welcome to SpaxButchery 🥩 Asante!`,
 winback:`Hi {firstname}! 👋 We've missed you at SpaxButchery — it's been {days} days! As a valued customer (KES {spent} with us 🙏), enjoy KES 100 OFF any order above KES 500 this week. Karibu tena! 🥩`,
 vip:`Hello {firstname}! 🌟 You're one of SpaxButchery's TOP customers — {visits} visits and KES {spent}! Show this message for a FREE 1/2kg of sausages on your next visit. Asante sana! 🥩`,
 upsell:`Hi {firstname}! 🥩 New at SpaxButchery: Family Pack — 1kg beef + sausages + soup bones at a special bundle price! Pop in this week and save. See you soon!`,

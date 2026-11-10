@@ -31,6 +31,19 @@ import date. The week runs Monday through today; the month runs from the first
 through today, using East Africa Time. Custom dates are inclusive. Customers
 without a known first-visit date or a reachable contact are excluded.
 
+## Outreach: welcome message for new customers
+
+The Outreach template picker includes **Welcome & appreciation (new
+customers)**, a short welcome that also thanks the customer:
+
+> Hi {firstname}! Welcome to SpaxButchery 🥩 Asante!
+
+The message is **50 characters or fewer** even after the first name is filled
+in, so it fits one SMS segment and reads quickly. Pick a **New this week / New
+this month / New (from…to)** target segment, choose this template, and send it
+through WhatsApp or SMS. Customers whose names are unknown get the shared
+version ("Hi there! …").
+
 ## Personalized bulk SMS
 
 The Outreach tab has three SMS choices: a shared-message SMS app composer, a

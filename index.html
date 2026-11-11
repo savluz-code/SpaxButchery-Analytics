@@ -4076,6 +4076,42 @@ function getTodayEAT(){
   return eatTime.toISOString().slice(0,10);
 }
 
+/* ══════════ IMPORT ORDER = TIME OF PURCHASE (this app's INTERNAL rule) ══════════
+   Statements carry a purchase stamp per row (date + completion time). That stamp
+   — not the order the file lists rows in, not the parse order and not the import
+   timestamp — is what decides the order rows are read in. Every import path
+   (drop-zone preview → confirm, Backfill, Rebuild) sorts its rows by it, and when
+   several statements are imported together their rows are merged into ONE list
+   and re-sorted, so the purchase time supersedes every other capture.
+   Rows are processed oldest → newest (a customer is created by their FIRST
+   purchase, then updated by the later ones) and history lists stay newest-first. */
+function spaxTimeOfDay(v){
+  const m = String(v == null ? '' : v).match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if(!m) return '00:00:00';
+  return String(m[1]).padStart(2,'0') + ':' + m[2] + ':' + (m[3] || '00');
+}
+// Full purchase stamp, comparable as a string: "YYYY-MM-DDTHH:MM:SS".
+// The row's own time wins; rows that carry the time inside the date field
+// (“2026-08-12 14:25:30”, an ISO stamp) keep it instead of dropping to midnight.
+function spaxPurchaseStamp(row){
+  const r = row || {};
+  const date = stripTime(r.date) || '';
+  let time = spaxTimeOfDay(r.time);
+  if (time === '00:00:00' && !String(r.time || '').trim()) {
+    const inDate = String(r.date || '').match(/(\d{1,2}:\d{2}(?::\d{2})?)/);
+    if (inDate) time = spaxTimeOfDay(inDate[1]);
+  }
+  return date + 'T' + time;
+}
+function spaxByPurchaseTime(a, b){ // oldest → newest
+  const A = spaxPurchaseStamp(a), B = spaxPurchaseStamp(b);
+  return A < B ? -1 : (A > B ? 1 : 0);
+}
+function spaxByPurchaseTimeDesc(a, b){ return spaxByPurchaseTime(b, a); }
+function spaxSortByPurchaseTime(rows){
+  return (rows || []).slice().sort(spaxByPurchaseTime);
+}
+
 // Strip time component from any date value — always return YYYY-MM-DD only.
 // Handles "2026-08-12", "2026-08-12T14:25:30.000Z", "2026-08-12 14:25:30",
 // "12/08/2026 14:25:30" and Excel serial numbers (e.g. 46200.5), so no
@@ -7811,7 +7847,8 @@ function showNewCustomersMonth(mk){
 // Floating list of the transactions recorded in a given calendar month (YYYY-MM).
 function showMonthTransactions(mk){
   const rows = (DB.transactions||[]).filter(t => (t.date||'').slice(0,7) === mk)
-    .slice().sort((a,b) => (b.date||'').localeCompare(a.date||'', undefined, {numeric:true}));
+    // Newest purchase first — same date falls back to the time of purchase.
+    .slice().sort(spaxByPurchaseTimeDesc);
   const total = rows.reduce((s,t) => s + Math.max(0, Number(t.amount)||0), 0);
   showListModal('Revenue · ' + monthLabelEAT(mk),
     '<div style="font-size:.8rem;color:var(--muted);margin-bottom:10px">Transactions recorded in ' + escHtml(monthLabelEAT(mk)) +
@@ -9275,6 +9312,7 @@ function rebuildCustomerHistory() {
   const bucketKey = t => (stripTime(t && t.date) || '') + '|' + (Number(t && t.amount) || 0).toFixed(2) + '|' + cleanRc(t && t.receipt).toLowerCase();
   const histRowOf = t => ({
     date: stripTime(t.date) || '',
+    time: t.time || '',
     amount: Number(t.amount) || 0,
     product: t.product || '',
     till: t.till || '',
@@ -9384,7 +9422,8 @@ function rebuildCustomerHistory() {
   // signature with what was there so callers persist only on change.
   Object.keys(next).forEach(name => {
     if (!next[name].length) { delete next[name]; return; }
-    next[name].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    // Newest purchase first; same date resolves on the time of purchase.
+    next[name].sort(spaxByPurchaseTimeDesc);
   });
   const sigOf = map => Object.keys(map).sort().map(n => n + ':' +
     (map[n] || []).map(bucketKey).sort().join(',')).join(';');
@@ -9632,6 +9671,11 @@ function beginImportBatch() {
 }
 
 function importTransactions(txs, opts = {}) {
+  // IMPORT ORDER = TIME OF PURCHASE (internal): the rows are read oldest
+  // purchase first, whatever order the files, the parse or the preview listed
+  // them in — and when several statements arrive together their rows are
+  // merged into this one list before sorting, so the statement time wins.
+  txs = spaxSortByPurchaseTime(txs);
   if (!opts.continueBatch) beginImportBatch();
   const currentBatch = Number(DB.importBatch) || 0;
   let imported = 0, dupes = 0, added = 0, updated = 0, unmasked = 0, needsReview = 0;
@@ -9731,7 +9775,9 @@ function importTransactions(txs, opts = {}) {
       source: tx.source || '',
       importedAt: nowISO
     });
-    const histRow = { date: normDate, amount: txAmount, product: product, till: till, receipt: tx.receipt || '', importedAt: nowISO };
+    // `time` is the purchase time from the statement — the internal import
+    // order key — so a customer's history can be ordered by it later too.
+    const histRow = { date: normDate, time: tx.time || '', amount: txAmount, product: product, till: till, receipt: tx.receipt || '', importedAt: nowISO };
 
     const date = txDate(tx);
     const match = findCustomerMatch(tx);
@@ -9743,7 +9789,7 @@ function importTransactions(txs, opts = {}) {
       noteTouched(match, normDate, txAmount);
       if (!DB.customerTx[match.name]) DB.customerTx[match.name] = [];
       DB.customerTx[match.name].push(histRow);
-      DB.customerTx[match.name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
+      DB.customerTx[match.name].sort(spaxByPurchaseTimeDesc);
       if (!match.lastVisit || date > match.lastVisit) match.lastVisit = date;
       if (!match.firstVisit || date < match.firstVisit) match.firstVisit = date;
       const today = new Date(getTodayEAT());
@@ -9787,7 +9833,7 @@ function importTransactions(txs, opts = {}) {
       noteTouched(newCust, normDate, txAmount);
       if (!DB.customerTx[newCust.name]) DB.customerTx[newCust.name] = [];
       DB.customerTx[newCust.name].push(histRow);
-      DB.customerTx[newCust.name].sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+      DB.customerTx[newCust.name].sort(spaxByPurchaseTimeDesc);
       added++;
     }
     imported++;
@@ -10756,6 +10802,10 @@ function showPreview(rows, fmt) {
   // MERCHANT EXCLUSION: Simon Musyoka (the Merchant) must not even appear in
   // the import preview — his rows are dropped before the user sees them.
   rows = rows.filter(r => !isMerchant(r.name) && !isMerchant(r.details));
+  // IMPORT ORDER = TIME OF PURCHASE (internal): one combined selection of
+  // statements is merged into a single list and ordered by each row's own
+  // purchase stamp, so nothing about the capture order survives the preview.
+  rows = spaxSortByPurchaseTime(rows);
   pendingRows = rows.map(r => ({ ...r, dup: isSeen(r) }));
   const dups = pendingRows.filter(r => r.dup).length;
   $('pvFormat').textContent = fmt;
@@ -12790,6 +12840,8 @@ $('custModal').addEventListener('click', (e) => {
 
 
 function backfillTransactions(txs){
+  // IMPORT ORDER = TIME OF PURCHASE (internal) — same rule as importTransactions.
+  txs = spaxSortByPurchaseTime(txs);
   let imported = 0, dupes = 0;
   const comebacks = [];
   const touchedCustomers = new Set();
@@ -12830,13 +12882,14 @@ function backfillTransactions(txs){
       if(!DB.customerTx[cust.name]) DB.customerTx[cust.name] = [];
       DB.customerTx[cust.name].push({
         date: ntx.date,
+        time: ntx.time || '',
         amount: ntx.amount,
         product: ntx.product,
         till: ntx.till || '',
         receipt: ntx.receipt,
         importedAt: ntx.importedAt
       });
-      DB.customerTx[cust.name].sort((a,b) => (b.date||'').localeCompare(a.date||''));
+      DB.customerTx[cust.name].sort(spaxByPurchaseTimeDesc);
 
       // Reconcile last/first visit against the ACTUAL transaction history — seed
       // data (e.g. an older analytics CSV) can have a stale Last Visit that

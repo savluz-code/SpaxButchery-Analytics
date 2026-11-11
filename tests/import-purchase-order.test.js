@@ -128,6 +128,16 @@ test('per-customer history keeps the purchase time and is listed newest purchase
   assert.match(rebuild, /next\[name\]\.sort\(spaxByPurchaseTimeDesc\)/);
 });
 
+test('the purchase time is never rendered, including in the import preview', () => {
+  const preview = slice('function showPreview(rows, fmt) {', "$('exportBtn').onclick");
+  assert.doesNotMatch(preview, /r\.time/, 'the preview table must not print the time of purchase');
+  // No view renders a row's `time` at all: it exists only as the internal
+  // ordering key, the dedup identity and a stored field.
+  assert.doesNotMatch(htmlSource, /\$\{[^}]*\.time[^}]*\}/,
+    'no template may interpolate a transaction/history row time');
+  assert.doesNotMatch(htmlSource, /<th>[^<]*Time<\/th>/i, 'no table exposes a Time column');
+});
+
 test('the time of purchase is an INTERNAL rule — nothing new is shown in the UI', () => {
   // No toasts, hints or table columns were added for it.
   assert.doesNotMatch(htmlSource, /time of purchase[^\n]*toast/i);

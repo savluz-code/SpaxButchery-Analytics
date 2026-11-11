@@ -129,4 +129,8 @@ internal rule; the app shows nothing about it.
 - Per-customer history rows keep the purchase time and are listed newest
   purchase first.
 
+The purchase time is **never displayed**: it is not printed in the import
+preview, the Transactions tab or the customer card. It is stored on the rows and
+used only as the internal ordering key (and as part of the duplicate identity).
+
 Run regression tests with `node --test tests/*.test.js`.

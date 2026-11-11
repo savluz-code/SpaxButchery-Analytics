@@ -10812,6 +10812,8 @@ function showPreview(rows, fmt) {
   $('pvCount').textContent = rows.length;
   $('pvDups').style.display = dups ? 'inline-block' : 'none';
   $('pvDups').textContent = dups + ' duplicate(s) will be skipped';
+  // The purchase time is an INTERNAL ordering key (see IMPORT ORDER = TIME OF
+  // PURCHASE) — it is never rendered here or anywhere else in the UI.
   $('pvTable').querySelector('tbody').innerHTML = pendingRows.slice(0, 300).map(r => {
     let tag;
     if (r.dup) tag = '<span class="badge b-dup">DUPLICATE — will skip</span>';
@@ -10822,7 +10824,7 @@ function showPreview(rows, fmt) {
     }
     const tillBadge = r.till ? `<span class="badge b-valid">${r.till}</span>` : '—';
     return `<tr style="${r.dup ? 'opacity:.45' : ''}"><td>${r.receipt || '—'}</td><td>${r.name}</td><td>${r.phone || '—'}</td>
-    <td>${kes(r.amount)}</td><td>${stripTime(r.date) || '—'}${r.time ? ' ' + r.time : ''}</td><td>${tillBadge}</td><td>${tag}</td></tr>`;
+    <td>${kes(r.amount)}</td><td>${stripTime(r.date) || '—'}</td><td>${tillBadge}</td><td>${tag}</td></tr>`;
   }).join('');
   $('previewCard').style.display = 'block';
   $('previewCard').scrollIntoView({ behavior: 'smooth' });

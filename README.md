@@ -113,4 +113,24 @@ avoid duplicates. Closing or refreshing the page interrupts the campaign; its
 progress is not persisted, so verify provider records before restarting. The
 existing phone-composer options do not require this gateway.
 
+## Import order follows the time of purchase
+
+The order rows are imported in is decided by each row's **purchase stamp** —
+the date plus the completion time printed on the statement — not by the order
+the file lists them in, the parse order, or when they were imported. This is an
+internal rule; the app shows nothing about it.
+
+- Every import path (drop-zone preview → confirm, **Backfill**, **Rebuild**)
+  sorts its rows oldest purchase first.
+- When two or more statements are imported together, their rows are merged into
+  one list and re-sorted, so the purchase time supersedes any other capture
+  order. Rows sharing a stamp keep their original relative order.
+- A row with no time on it sorts at the start of its own day, never after it.
+- Per-customer history rows keep the purchase time and are listed newest
+  purchase first.
+
+The purchase time is **never displayed**: it is not printed in the import
+preview, the Transactions tab or the customer card. It is stored on the rows and
+used only as the internal ordering key (and as part of the duplicate identity).
+
 Run regression tests with `node --test tests/*.test.js`.

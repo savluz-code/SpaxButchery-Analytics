@@ -93,7 +93,8 @@ test('Contact Resolver renders extracted values as readable name/contact rows', 
   const uiContext = vm.createContext({
     document,
     $: id => { if (!elements.has(id)) elements.set(id, makeElement(id)); return elements.get(id); },
-    resolveContacts: contacts => contacts.length
+    resolveContacts: contacts => contacts.length,
+    findCustomerMatch: () => null // unmatched pairs retain their extraction order
   });
   vm.runInContext(`${helpers}\n${ui}`, uiContext);
   uiContext.renderResolverExtractedContacts([

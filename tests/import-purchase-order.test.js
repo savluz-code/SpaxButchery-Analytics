@@ -124,7 +124,7 @@ test('per-customer history keeps the purchase time and is listed newest purchase
   assert.match(backfill, /\.sort\(spaxByPurchaseTimeDesc\)/);
 
   const rebuild = slice('function rebuildCustomerHistory() {', '/* ══════════ NEW-CUSTOMER FLAG');
-  assert.match(rebuild, /time: t\.time \|\| ''/, 'the projection must preserve the purchase time');
+  assert.match(rebuild, /time: t\.time \|\| spaxExtractPurchaseTime\(t\.date\)/, 'the projection must preserve the purchase time, even inside a legacy date');
   assert.match(rebuild, /next\[name\]\.sort\(spaxByPurchaseTimeDesc\)/);
 });
 

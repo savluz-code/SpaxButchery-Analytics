@@ -62,27 +62,7 @@ function makeContext(DB) {
       return c;
     }
     function isValidKenyanContact(c){ return /^0\\d{9}$/.test(String(c || '')); }
-    // Purchase-time ordering (index.html IMPORT ORDER = TIME OF PURCHASE).
-    function spaxTimeOfDay(v){
-      const m = String(v == null ? '' : v).match(/(\\d{1,2}):(\\d{2})(?::(\\d{2}))?/);
-      if(!m) return '00:00:00';
-      return String(m[1]).padStart(2,'0') + ':' + m[2] + ':' + (m[3] || '00');
-    }
-    function spaxPurchaseStamp(row){
-      const r = row || {};
-      const date = stripTime(r.date) || '';
-      let time = spaxTimeOfDay(r.time);
-      if (time === '00:00:00' && !String(r.time || '').trim()) {
-        const inDate = String(r.date || '').match(/(\\d{1,2}:\\d{2}(?::\\d{2})?)/);
-        if (inDate) time = spaxTimeOfDay(inDate[1]);
-      }
-      return date + 'T' + time;
-    }
-    function spaxByPurchaseTime(a, b){
-      const A = spaxPurchaseStamp(a), B = spaxPurchaseStamp(b);
-      return A < B ? -1 : (A > B ? 1 : 0);
-    }
-    function spaxByPurchaseTimeDesc(a, b){ return spaxByPurchaseTime(b, a); }
+    ${htmlSource.slice(htmlSource.indexOf('function spaxTimeOfDay(v){'), htmlSource.indexOf('function stripTime(dateStr){'))}
     // Exhaustive indexes cover these fixtures; the fuzzy fallback never wins.
     function findCustomerMatch(){ return null; }
     function isMerchant(name){ return /simon\\s+musyoka/i.test(String(name || '')); }

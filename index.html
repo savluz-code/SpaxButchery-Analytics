@@ -4086,9 +4086,31 @@ function getTodayEAT(){
    Rows are processed oldest → newest (a customer is created by their FIRST
    purchase, then updated by the later ones) and history lists stay newest-first. */
 function spaxTimeOfDay(v){
-  const m = String(v == null ? '' : v).match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-  if(!m) return '00:00:00';
-  return String(m[1]).padStart(2,'0') + ':' + m[2] + ':' + (m[3] || '00');
+  return spaxExtractPurchaseTime(v) || '00:00:00';
+}
+// Keep the statement's local wall-clock time (EAT), without converting it
+// through the device's timezone. Excel stores both time cells and combined
+// date/time cells as fractional days. An absent/invalid time stays unknown.
+function spaxExtractPurchaseTime(v){
+  if(v === null || v === undefined || v === '') return '';
+  const s = String(v).trim();
+  if(!s) return '';
+  if(/^\d+(?:\.\d+)?$/.test(s)){
+    const n = Number(s);
+    if((n >= 0 && n < 1) || (n >= 20000 && n <= 80000)){
+      const seconds = Math.round((n % 1) * 86400) % 86400;
+      return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60]
+        .map(part => String(part).padStart(2,'0')).join(':');
+    }
+    return '';
+  }
+  const m = s.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?/i);
+  if(!m) return '';
+  let h = Number(m[1]);
+  const min = Number(m[2]), sec = Number(m[3] || 0);
+  if(min > 59 || sec > 59 || (m[4] ? h < 1 || h > 12 : h > 23)) return '';
+  if(m[4]) h = h % 12 + (m[4].toLowerCase() === 'pm' ? 12 : 0);
+  return [h, min, sec].map(part => String(part).padStart(2,'0')).join(':');
 }
 // Full purchase stamp, comparable as a string: "YYYY-MM-DDTHH:MM:SS".
 // The row's own time wins; rows that carry the time inside the date field
@@ -4096,11 +4118,8 @@ function spaxTimeOfDay(v){
 function spaxPurchaseStamp(row){
   const r = row || {};
   const date = stripTime(r.date) || '';
-  let time = spaxTimeOfDay(r.time);
-  if (time === '00:00:00' && !String(r.time || '').trim()) {
-    const inDate = String(r.date || '').match(/(\d{1,2}:\d{2}(?::\d{2})?)/);
-    if (inDate) time = spaxTimeOfDay(inDate[1]);
-  }
+  if(!date) return '';
+  const time = spaxExtractPurchaseTime(r.time) || spaxExtractPurchaseTime(r.date) || '00:00:00';
   return date + 'T' + time;
 }
 function spaxByPurchaseTime(a, b){ // oldest → newest
@@ -4110,6 +4129,41 @@ function spaxByPurchaseTime(a, b){ // oldest → newest
 function spaxByPurchaseTimeDesc(a, b){ return spaxByPurchaseTime(b, a); }
 function spaxSortByPurchaseTime(rows){
   return (rows || []).slice().sort(spaxByPurchaseTime);
+}
+
+// Customer/contact rows follow the FIRST or LAST actual purchase, not their
+// insertion order or when a statement/contact was uploaded. Derive this from
+// the owned history so existing imports, backfills, renames and cloud reloads
+// need no separate timestamp field or migration on the customer record.
+function spaxCustomerPurchaseStamp(c, visit = 'last'){
+  if(!c) return '';
+  const first = visit === 'first';
+  const recordDate = c[first ? 'firstVisit' : 'lastVisit'] || c[first ? 'lastVisit' : 'firstVisit'];
+  let day = stripTime(recordDate) || '';
+  let stamp = day && spaxExtractPurchaseTime(recordDate) ? spaxPurchaseStamp({ date: recordDate }) : '';
+  customerHistoryFor(c).forEach(row => {
+    const candidate = spaxPurchaseStamp(row);
+    if(!candidate) return;
+    const rowDay = candidate.slice(0,10);
+    if(!day || (first ? rowDay < day : rowDay > day)){
+      day = rowDay;
+      stamp = '';
+    }
+    if(rowDay === day && (!stamp || (first ? candidate < stamp : candidate > stamp))) stamp = candidate;
+  });
+  // A date-only baseline can supply the day, but an older history row must
+  // never lend its clock time to that day. Missing dates sort last below.
+  return stamp || (day ? day + 'T00:00:00' : '');
+}
+function spaxSortCustomersByPurchaseTime(customers, visit = 'last', direction = 'desc'){
+  // Compute each stamp once, not on every comparator call. Equal stamps keep
+  // their original relative order and the DB array is never reordered.
+  return (customers || []).map(customer => ({ customer, stamp: spaxCustomerPurchaseStamp(customer, visit) }))
+    .sort((a,b) => {
+      if(!a.stamp || !b.stamp) return a.stamp ? -1 : b.stamp ? 1 : 0;
+      const cmp = a.stamp < b.stamp ? -1 : a.stamp > b.stamp ? 1 : 0;
+      return direction === 'asc' ? cmp : -cmp;
+    }).map(row => row.customer);
 }
 
 // Strip time component from any date value — always return YYYY-MM-DD only.
@@ -7311,12 +7365,15 @@ function repairDates(){
   // plus transaction rows, per-customer history, ledgers, expenses and the
   // dedup seen-map) so no timestamp can ever reach the UI.
   (DB.transactions||[]).forEach(t => {
+    // Save an embedded completion time BEFORE normalizing the visible date.
+    if(!t.time){ const time = spaxExtractPurchaseTime(t.date); if(time){ t.time = time; fixed++; } }
     const d = stripTime(t.date);
     if(d !== (t.date || '')){ t.date = d; fixed++; }
   });
   Object.keys(DB.customerTx||{}).forEach(name => {
     const rows = DB.customerTx[name]||[];
     rows.forEach(t => {
+      if(!t.time){ const time = spaxExtractPurchaseTime(t.date); if(time){ t.time = time; fixed++; } }
       const d = stripTime(t.date);
       if(d !== (t.date || '')){ t.date = d; fixed++; }
     });
@@ -7822,16 +7879,16 @@ function drillRevenue(){
     kes(rows.reduce((s,c) => s + (Number(c.spent)||0), 0)) + ' · ' + rows.length + ' customer(s)');
 }
 function drillCadenceOverdue(){
-  const rows = (DB.customers||[]).filter(c => customerIPI(c).status === 'overdue');
+  const rows = spaxSortCustomersByPurchaseTime((DB.customers||[]).filter(c => customerIPI(c).status === 'overdue'));
   showCustomersList('Cadence Overdue', 'Customers past 1.8× their personal purchase interval (IPI)', rows,
     rows.length + ' customer(s)');
 }
 function drillCustomers(){
-  const rows = (DB.customers||[]).slice().sort((a,b) => ((b.spent||0) - (a.spent||0)) || String(a.name).localeCompare(String(b.name)));
+  const rows = spaxSortCustomersByPurchaseTime(DB.customers);
   showCustomersList('Customers', 'Tracked customer database', rows, rows.length + ' customer(s)');
 }
 function drillNewThisMonth(){
-  const rows = newThisMonthCustomers();
+  const rows = spaxSortCustomersByPurchaseTime(newThisMonthCustomers());
   showCustomersList('New This Month', 'First-ever purchase in ' + monthLabelEAT(), rows, rows.length + ' customer(s)');
 }
 function drillVIPs(){
@@ -7839,8 +7896,7 @@ function drillVIPs(){
   showCustomersList('Tracked VIPs', 'KES 10K+ lifetime spend', rows, rows.length + ' customer(s)');
 }
 function showNewCustomersMonth(mk){
-  const rows = (DB.customers||[]).filter(c => customerAcqMonth(c) === mk)
-    .slice().sort((a,b) => (b.spent||0) - (a.spent||0));
+  const rows = spaxSortCustomersByPurchaseTime((DB.customers||[]).filter(c => customerAcqMonth(c) === mk));
   showCustomersList('New Customers · ' + monthLabelEAT(mk), 'First-ever purchase in ' + monthLabelEAT(mk),
     rows, rows.length + ' new customer(s)');
 }
@@ -7872,7 +7928,7 @@ function showSegmentCustomers(idx){
     if (idx === 1) return d > 60 && d <= 90;
     return d > 90;
   };
-  const rows = (DB.customers||[]).filter(filter);
+  const rows = spaxSortCustomersByPurchaseTime((DB.customers||[]).filter(filter));
   showCustomersList('Customer Lifecycle · ' + labels[idx], labels[idx] + ' customers (days since last visit)',
     rows, rows.length + ' customer(s)');
 }
@@ -8009,7 +8065,9 @@ function renderCustTable(){
       statsBar.innerHTML = `🥩 Meat: KSh <b>${ps.meatRevenue.toLocaleString()}</b> · ${ps.meatCustomers.toLocaleString()} customers · ${ps.meatVisits.toLocaleString()} visits &nbsp;|&nbsp; 🍲 Soup: KSh <b>${ps.soupRevenue.toLocaleString()}</b> · ${ps.soupCustomers.toLocaleString()} customers · ${ps.soupVisits.toLocaleString()} visits &nbsp;|&nbsp; 💰 Total: KSh <b>${ps.totalRevenue.toLocaleString()}</b>`;
     }
   }
-  rows.sort((a,b)=>{
+  if(!s || /^(first|last)(Asc|Desc)$/.test(s)){
+    rows = spaxSortCustomersByPurchaseTime(rows, s.startsWith('first') ? 'first' : 'last', s.endsWith('Asc') ? 'asc' : 'desc');
+  } else rows.sort((a,b)=>{
     if(s==='spentDesc')return b.spent-a.spent;
     if(s==='spentAsc')return a.spent-b.spent;
     if(s==='visitsDesc')return b.visits-a.visits;
@@ -8018,11 +8076,7 @@ function renderCustTable(){
     if(s==='daysAsc')return a.days-b.days;
     if(s==='nameAsc')return a.name.localeCompare(b.name);
     if(s==='nameDesc')return b.name.localeCompare(a.name);
-    if(s==='firstDesc')return (b.firstVisit||'').localeCompare(a.firstVisit||'');
-    if(s==='firstAsc')return (a.firstVisit||'').localeCompare(b.firstVisit||'');
-    if(s==='lastDesc')return (b.lastVisit||'').localeCompare(a.lastVisit||'');
-    if(s==='lastAsc')return (a.lastVisit||'').localeCompare(b.lastVisit||'');
-    return (b.lastVisit||"").localeCompare(a.lastVisit||"");
+    return 0;
   });
   $('custTable').querySelector('tbody').innerHTML=rows.map(c=>{
     const[st,cls]=statusOf(c.days);const first=stripTime(c.firstVisit)||'—';const last=stripTime(c.lastVisit)||'—';
@@ -8083,10 +8137,10 @@ function renderTransactions(){
     if(f==='image')return (t.source||'').includes('Image');
     return true;});
   rows.sort((a,b)=>{
-    if(s==='dateAsc')return (a.date||'').localeCompare(b.date||'');
+    if(s==='dateAsc')return spaxByPurchaseTime(a,b);
     if(s==='amountDesc')return (b.amount||0)-(a.amount||0);
     if(s==='amountAsc')return (a.amount||0)-(b.amount||0);
-    return (b.date||'').localeCompare(a.date||'');});
+    return spaxByPurchaseTimeDesc(a,b);});
   const totalAmt=rows.reduce((s,t)=>s+(t.amount||0),0);
   let tillNote='';
   try{
@@ -8203,6 +8257,30 @@ function parseDate(value) {
   const d = new Date(raw);
   if (!isNaN(d)) return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   return "";
+}
+
+// Safaricom exports use "Completion Time"; other exports call the same
+// purchase stamp "Completed on/at". Prefer it over a report/capture Date.
+// Normalize headers so wrapped labels and underscores work in CSV and Excel.
+function spaxCompletionFields(row){
+  const fields = new Map(Object.entries(row || {}).map(([key, value]) =>
+    [String(key).toLowerCase().replace(/[^a-z0-9]/g,''), value]));
+  const read = names => {
+    for(const name of names){
+      const value = fields.get(name);
+      if(value !== null && value !== undefined && String(value).trim() !== '') return value;
+    }
+    return '';
+  };
+  const completed = read(['completiontime','completedon','completedat','completiondatetime','completiondate','completeddate']);
+  const date = read(['date','transactiondate','lastvisit','firstvisit']);
+  const time = read(['completedtime','time','transactiontime']);
+  const completedDate = stripTime(completed);
+  return {
+    date: completedDate || stripTime(date) || '',
+    time: spaxExtractPurchaseTime(completed) || spaxExtractPurchaseTime(time) ||
+      (completedDate ? '' : spaxExtractPurchaseTime(date))
+  };
 }
 
 function toTitleCase(str) {
@@ -9246,7 +9324,7 @@ function healOrphanedSeenKeys() {
 // already pushed. Used by both loadFromCloud and Smart Merge — the
 // per-customer history is now a projection of exactly this union.
 function mergeCloudTransactionsIntoDB(dataTx) {
-  const txNorm = t => ({ ...t, date: stripTime(t.date) || '', amount: Number(t.amount) || 0 });
+  const txNorm = t => ({ ...t, time: t.time || spaxExtractPurchaseTime(t.date), date: stripTime(t.date) || '', amount: Number(t.amount) || 0 });
   const cloudTx = Array.isArray(dataTx) ? dataTx.map(txNorm) : [];
   const localTx = (Array.isArray(DB.transactions) ? DB.transactions : []).map(txNorm);
   const cloudTxKeys = new Set();
@@ -9258,13 +9336,22 @@ function mergeCloudTransactionsIntoDB(dataTx) {
   };
   cloudTx.forEach(t => addKeys(cloudTxKeys, t));
   const kept = cloudTx.slice();
+  const byReceipt = new Map();
+  kept.forEach(t => { const key = txKeyNoTime(t); if(key && !byReceipt.has(key)) byReceipt.set(key, t); });
   localTx.forEach(t => {
     const k = transactionKey(t);
     const k2 = txKeyNoTime(t);
     let leg = [];
     try { leg = legacyReceiptKeys(t); } catch (_) {}
-    if (cloudTxKeys.has(k) || (k2 && cloudTxKeys.has(k2)) || leg.some(x => cloudTxKeys.has(x))) return;
+    if (cloudTxKeys.has(k) || (k2 && cloudTxKeys.has(k2)) || leg.some(x => cloudTxKeys.has(x))) {
+      // A legacy cloud copy may omit the completion time. Keep a locally
+      // known clock for that SAME receipt instead of losing same-day order.
+      const existing = k2 && byReceipt.get(k2);
+      if(existing && !existing.time && t.time) existing.time = t.time;
+      return;
+    }
     kept.push(t);
+    if(k2) byReceipt.set(k2, t);
     addKeys(cloudTxKeys, t);
   });
   DB.transactions = kept;
@@ -9312,7 +9399,7 @@ function rebuildCustomerHistory() {
   const bucketKey = t => (stripTime(t && t.date) || '') + '|' + (Number(t && t.amount) || 0).toFixed(2) + '|' + cleanRc(t && t.receipt).toLowerCase();
   const histRowOf = t => ({
     date: stripTime(t.date) || '',
-    time: t.time || '',
+    time: t.time || spaxExtractPurchaseTime(t.date),
     amount: Number(t.amount) || 0,
     product: t.product || '',
     till: t.till || '',
@@ -9675,7 +9762,7 @@ function importTransactions(txs, opts = {}) {
   // purchase first, whatever order the files, the parse or the preview listed
   // them in — and when several statements arrive together their rows are
   // merged into this one list before sorting, so the statement time wins.
-  txs = spaxSortByPurchaseTime(txs);
+  txs = spaxSortByPurchaseTime(txs).map(tx => ({ ...tx, time: tx.time || spaxExtractPurchaseTime(tx.date) }));
   if (!opts.continueBatch) beginImportBatch();
   const currentBatch = Number(DB.importBatch) || 0;
   let imported = 0, dupes = 0, added = 0, updated = 0, unmasked = 0, needsReview = 0;
@@ -9794,8 +9881,8 @@ function importTransactions(txs, opts = {}) {
       if (!match.firstVisit || date < match.firstVisit) match.firstVisit = date;
       const today = new Date(getTodayEAT());
       match.days = Math.max(0, Math.round((today - new Date(match.lastVisit)) / 86400000));
-      if (isValidKenyanContact(tx.contact) && !isValidKenyanContact(match.contact)) {
-        match.contact = normalizeContact(tx.contact);
+      if (isValidKenyanContact(tx.contact || tx.phone) && !isValidKenyanContact(match.contact)) {
+        match.contact = normalizeContact(tx.contact || tx.phone);
         match.masked = false;
         DB.resolved++;
         unmasked++;
@@ -9806,14 +9893,14 @@ function importTransactions(txs, opts = {}) {
       const txDateNorm = stripTime(date) || getTodayEAT();
       const daysSinceTx = Math.max(0, Math.round((today - new Date(txDateNorm)) / 86400000));
       const newCust = {
-        name: spaxUniqueCustomerName(tx.name || "M-Pesa Customer", tx.contact),
-        contact: normalizeContact(tx.contact),
+        name: spaxUniqueCustomerName(tx.name || "M-Pesa Customer", tx.contact || tx.phone),
+        contact: normalizeContact(tx.contact || tx.phone),
         spent: 0,
         visits: 0,
         days: daysSinceTx,
         lastVisit: txDateNorm,
         firstVisit: txDateNorm,
-        masked: (tx.contact || "").includes("***") || !isValidKenyanContact(tx.contact),
+        masked: (tx.contact || tx.phone || "").includes("***") || !isValidKenyanContact(tx.contact || tx.phone),
         isNew: true,
         newBatch: currentBatch,
         // The "new customer this month" tag is STORED from the moment the
@@ -10617,7 +10704,7 @@ async function parseAnyFile(file){
   const hasAmount=keys.some(k=>/amount|spent|total|paid.?in|value/i.test(k));
 
   // Contact list: resolve as side-effect, return nothing
-  if(hasName&&hasPhone){
+  if(hasName&&hasPhone && !(hasDetails&&hasPaidIn)){
     const list=rows.map(row=>({
       name:String(pick(row,['Name','Customer','Customer Name'])||'').trim(),
       phone:normalizeContact(pick(row,['Contact','Phone','Phone Number','Mobile']))
@@ -10651,8 +10738,7 @@ async function parseAnyFile(file){
         phone:pm?normalizeContact(pm[0]):'',
         amount:amt,
         visits:1,
-        date:parseDate(pick(row,['Date','Completion Time','Transaction Date'])),
-        time:String(pick(row,['Time','Completion Time'])||'').match(/(\d{2}:\d{2}:\d{2})/)?.[1]||'',
+        ...spaxCompletionFields(row),
         details:det,
         otherParty:otherParty,
         till:csvTill,
@@ -10736,8 +10822,8 @@ function parseSheetRows(raw) {
   const iDet = col(/details|other party|narration/), iPaid = col(/paid.?in|credit/), iRcpt = col(/receipt|ref/),
     iName = col(/^name$|customer.?name|client/), iPhone = col(/contact|phone|msisdn|mobile|number/),
     iAmt = col(/total_spent|amount|spent|value|paid/), iVis = col(/visits|txns|transactions/),
-    iDate = col(/last_visit|date|visit|time/),
     iParty = col(/other.?party|counterparty/);
+  const completionOf = r => spaxCompletionFields(Object.fromEntries(hdr.map((h,i) => [h, r[i]])));
   let fmt = 'Transactions', rows = [];
   if (iDet >= 0 && iPaid >= 0) {
     fmt = 'M-Pesa CSV';
@@ -10760,7 +10846,7 @@ function parseSheetRows(raw) {
         name: toTitleCase(name) || 'Unknown',
         phone: pm ? normalizeContact(pm[0]) : '',
         amount: amt, visits: 1,
-        date: iDate >= 0 ? parseDate(r[iDate]) : '', time: '',
+        ...completionOf(r),
         details: det,
         otherParty: party,
         till: sheetTill
@@ -10782,7 +10868,7 @@ function parseSheetRows(raw) {
         receipt: '', name: nm,
         phone: iPhone >= 0 ? normalizeContact(r[iPhone] || '') : '',
         amount: amt, visits: iVis >= 0 ? (parseInt(r[iVis]) || 1) : 1,
-        date: iDate >= 0 ? parseDate(r[iDate]) : '', time: '',
+        ...completionOf(r),
         isAggregate
       });
     });
@@ -11294,7 +11380,7 @@ function renderSeg(){
   $('segDateRange').style.display=segment==='newRange'?'block':'none';
   $('segDateHint').style.display=range?'block':'none';
   $('segDateHint').textContent=range?(range.error || `First visit: ${range.from} to ${range.to}, inclusive (EAT). ${segment==='newWeek'?'Week starts Monday. ':''}Customers without a first-visit date are excluded.`):'';
-  const pool=segPool().sort((a,b)=>b.spent-a.spent);
+  const pool=spaxSortCustomersByPurchaseTime(segPool());
   $('segCount').textContent=pool.length;
   $('selAll').checked=true;
   window._pool=pool; updateSegPreview();
@@ -11403,7 +11489,7 @@ $('bulkSMSq').onclick=()=>startQueue('sms');
 
 /* ══════════ CONTACT RESOLVER ══════════ */
 function renderMaskTable(){
-  const m=DB.customers.filter(c=>c.masked).sort((a,b)=>b.spent-a.spent);
+  const m=spaxSortCustomersByPurchaseTime(DB.customers.filter(c=>c.masked));
   $('maskTable').querySelector('tbody').innerHTML=m.map((c,idx)=>{
     const origIdx=DB.customers.indexOf(c);
     return `<tr><td>${c.name}${' '+newCustomerTag(c)}</td><td><span class="badge b-masked">${c.contact}</span></td>
@@ -11440,7 +11526,14 @@ function renderResolverExtractedContacts(contacts, reset) {
     count.textContent = '';
     return;
   }
-  resolverExtractedContacts.forEach(item => {
+  // Keep each extracted pair intact, but order known customers by the same
+  // last purchase as the other contact lists. Unmatched pairs have no known
+  // purchase yet and keep their extraction order after the dated customers.
+  const ordered = resolverExtractedContacts.map(item => {
+    const customer = findCustomerMatch(item);
+    return { item, stamp: customer ? spaxCustomerPurchaseStamp(customer) : '' };
+  }).sort((a,b) => a.stamp < b.stamp ? 1 : a.stamp > b.stamp ? -1 : 0);
+  ordered.forEach(({ item }) => {
     const row = document.createElement('tr');
     const nameCell = document.createElement('td');
     const phoneCell = document.createElement('td');
@@ -12753,7 +12846,7 @@ function showCustomerDetail(name){
   $('modalAvg').innerHTML = 'KES ' + Math.round(c.spent/Math.max(c.visits,1)).toLocaleString() + '<br><small style="color:var(--muted);font-size:.72rem;">Cycle: ~' + ipiInfo.ipi + 'd (' + (ipiInfo.status==='overdue'?'⚠️ Overdue ' + ipiInfo.multiplier + 'x': 'On track') + ')</small>';
 
   // Build transaction history
-  const txs = customerHistoryFor(c);
+  const txs = customerHistoryFor(c).slice().sort(spaxByPurchaseTimeDesc);
   // Footer that reconciles the card with the list: listed rows + any part of
   // the baseline (report / export total) that is not itemised = Total Spent.
   const listedSpent = txs.reduce((s,t) => s + Math.max(0, Number(t.amount)||0), 0);
@@ -12843,7 +12936,7 @@ $('custModal').addEventListener('click', (e) => {
 
 function backfillTransactions(txs){
   // IMPORT ORDER = TIME OF PURCHASE (internal) — same rule as importTransactions.
-  txs = spaxSortByPurchaseTime(txs);
+  txs = spaxSortByPurchaseTime(txs).map(tx => ({ ...tx, time: tx.time || spaxExtractPurchaseTime(tx.date) }));
   let imported = 0, dupes = 0;
   const comebacks = [];
   const touchedCustomers = new Set();

@@ -85,6 +85,7 @@ function makeContext(today = '2026-09-05', seedRows = SEED_ROWS) {
     function normPhone(p){ return String(p||''); }
     DB = { customers: [], transactions: [], customerTx: {}, seen: {}, monthly: { labels: [], revenue: [] }, importedRev: 0, importedTx: 0 };
   `, ctx);
+  vm.runInContext(slice('function spaxTimeOfDay(v){', 'function stripTime(dateStr){'), ctx);
   // Product classification + stats + the CUSTOMER TALLY block + repairDates.
   vm.runInContext(slice('const SOUP_START_DATE', 'function maskedMatches'), ctx);
   return ctx;

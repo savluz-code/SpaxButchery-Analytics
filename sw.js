@@ -38,7 +38,10 @@
 // Bumped to spax-v39 (2026-11-10): Outreach adds a "Thanks for shopping with
 // us" template and shows a live one-SMS length check under the template box
 // (GSM-7 160/153, UCS-2 70/67). Installed apps must pick up the new shell.
-const CACHE_NAME = 'spax-v39';
+// Bumped to spax-v40 (2026-11-12): names and contacts now sort by the full
+// purchase completion stamp, including same-day times, across customer and
+// transaction lists. CSV/Excel completion times are retained as well.
+const CACHE_NAME = 'spax-v40';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

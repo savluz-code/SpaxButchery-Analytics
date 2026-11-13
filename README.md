@@ -113,21 +113,35 @@ avoid duplicates. Closing or refreshing the page interrupts the campaign; its
 progress is not persisted, so verify provider records before restarting. The
 existing phone-composer options do not require this gateway.
 
-## Import order follows the time of purchase
+## Names and contacts follow the time of purchase
 
-The order rows are imported in is decided by each row's **purchase stamp** —
-the date plus the completion time printed on the statement — not by the order
-the file lists them in, the parse order, or when they were imported. This is an
-internal rule; the app shows nothing about it.
+Customer names and their contacts are kept together and ordered by the
+**purchase stamp** — the date **and completion time** printed under
+**Completion Time / Completed on** on the statement — not by upload time,
+file order or contact-capture order.
 
-- Every import path (drop-zone preview → confirm, **Backfill**, **Rebuild**)
-  sorts its rows oldest purchase first.
-- When two or more statements are imported together, their rows are merged into
-  one list and re-sorted, so the purchase time supersedes any other capture
-  order. Rows sharing a stamp keep their original relative order.
-- A row with no time on it sorts at the start of its own day, never after it.
-- Per-customer history rows keep the purchase time and are listed newest
-  purchase first.
+- **Customers** defaults to the most recent purchase first, including the time
+  within the same day. **Last Visit ↑** reverses that order; **First Visit ↑/↓**
+  uses the first purchase's date and time. Other explicitly selected sorts
+  (name, spend, visits, days) still work as before.
+- **Transactions**, customer history, **Outreach**, masked contacts and the
+  customer/lifecycle drill-downs also use newest purchase first. Extracted
+  name/contact pairs in Contact Resolver follow their matched customer's
+  latest purchase; unmatched pairs retain extraction order at the end.
+  Revenue/VIP drill-downs that explicitly rank spend retain that ranking.
+- Existing records use their owned transaction history, so stored completion
+  times take effect without re-importing or adding fields to the customer
+  record. Reloads, backfills and cloud merges preserve this ordering.
+- CSV/Excel imports recognize **Completion Time**, **Completed on/at** and
+  separate date/time columns, including Excel date/time cells. Completion
+  stamps take precedence over report/capture dates. Times are compared as
+  printed on the statement (East Africa Time), not in the device's timezone.
+- A purchase with no time sorts at the start of its own day. Customer records
+  with no known purchase date appear last. Equal stamps keep their original
+  relative order. Missing times cannot be reconstructed from upload times.
+- Internally, every import path (preview → confirm, **Backfill**, **Rebuild**)
+  still processes rows oldest purchase first. Multiple files are merged and
+  re-sorted together before processing.
 
 The purchase time is **never displayed**: it is not printed in the import
 preview, the Transactions tab or the customer card. It is stored on the rows and

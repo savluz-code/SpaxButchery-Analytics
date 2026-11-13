@@ -33,6 +33,8 @@ function setup() {
   const state = { today:'2027-01-03' }, window = {};
   const context = { $, DB: { customers }, window, getTodayEAT:()=>state.today, stripTime: value => String(value || '').slice(0,10), TEMPLATES:{winback:'Hello'}, fill:(t,c)=>t+' '+c.name, genericMsg:t=>t, kes:n=>'KES '+n, escHtml:String, document:{querySelectorAll:()=>[]}, Date };
   function $(id){return fields[id];}
+  context.customerHistoryFor = () => [];
+  vm.runInNewContext(html.slice(html.indexOf('function spaxTimeOfDay(v){'), html.indexOf('function stripTime(dateStr){')), context);
   vm.runInNewContext(html.slice(tagStart,tagEnd), context);
   vm.runInNewContext(html.slice(start,end), context);
   return { fields, customers, context, window, state, tbody };
@@ -70,7 +72,7 @@ test('custom date range is inclusive, requires valid ordered dates, and updates 
   assert.equal(window._pool.length, 0);
   fields.segDateFrom.value='2026-12-27'; fields.segDateTo.value='2026-12-28';
   fields.segDateTo.onchange();
-  assert.deepEqual(names(window._pool), ['Previous','Monday']);
+  assert.deepEqual(names(window._pool), ['Monday','Previous']);
   fields.segDateFrom.value='2027-01-04';
   fields.segDateFrom.onchange();
   assert.equal(window._pool.length, 0);

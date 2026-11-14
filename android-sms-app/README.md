@@ -1,6 +1,6 @@
-# SpaxButchery SMS Companion (Android App)
+# Spax Sms (Android Companion App)
 
-A lightweight (~150 KB, zero-third-party-dependency) native Android companion app for **SpaxButchery Analytics**. It sends **separate personalized SMS messages in bulk** (`{firstname}`, `{name}`, `{spent}`, `{visits}`, `{days}`) directly through your phone's SIM card and regular Safaricom / Airtel SMS bundles — while keeping Google Messages as your default SMS app so customers can reply right in the same thread.
+A lightweight (~150 KB, zero-third-party-dependency) native Android companion app (**Spax Sms** — Red background written in Black & White to distinguish it from **SpaxButchery Analytics**). It sends **separate personalized SMS messages in bulk** (`{firstname}`, `{name}`, `{spent}`, `{visits}`, `{days}`) directly through your phone's SIM card and regular Safaricom / Airtel SMS bundles — while keeping Google Messages as your default SMS app so customers can reply right in the same thread.
 
 ---
 

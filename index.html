@@ -395,14 +395,14 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         <label style="font-size:.8rem;color:var(--muted);display:block;margin-top:10px">BULK-SMS SHARED VERSION</label>
         <div class="tpl-preview" id="tplGeneric" style="border-left-color:var(--blue)">—</div>
         <div class="flex" style="margin-top:14px">
-          <button class="btn green" id="bulkSpaxApp" style="font-size:.95rem">📲 Personalized Bulk SMS (Spax App)</button>
+          <button class="btn green" id="bulkSpaxApp" style="font-size:.95rem">📲 Personalized Bulk SMS (Spax Sms)</button>
           <button class="btn blue" id="bulkSMS1" style="font-size:.95rem">⚡ One-Click Bulk SMS</button>
           <button class="btn wa" id="bulkWA">🟢 WhatsApp Queue</button>
           <button class="btn ghost" id="bulkSMSq">👤 SMS Queue</button>
         </div>
         <details id="spaxSmsAppDetails" style="margin-top:14px">
-          <summary>📲 Personalized bulk SMS via SIM (Spax Android App)</summary>
-          <div class="hint" style="margin-top:6px">Tap <b>📤 Share to App</b> (or the green button above) to open Android’s share menu and pick <b>Spax SMS</b> — sends each customer their own personalized SMS (<code>{firstname}</code>, <code>{days}</code>, <code>{spent}</code>, <code>{visits}</code>) from your SIM bundle even if Spax SMS was closed.</div>
+          <summary>📲 Personalized bulk SMS via SIM (Spax Sms App)</summary>
+          <div class="hint" style="margin-top:6px">Tap <b>📤 Share to App</b> (or the green button above) to open Android’s share menu and pick <b>Spax Sms</b> — sends each customer their own personalized SMS (<code>{firstname}</code>, <code>{days}</code>, <code>{spent}</code>, <code>{visits}</code>) from your SIM bundle even if Spax Sms was closed.</div>
           <div class="flex" style="margin-top:8px">
             <button class="btn green sm" id="spaxShareBtn" type="button">📤 Share to App</button>
             <button class="btn ghost sm" id="spaxCopyBtn" type="button">📋 Copy Batch</button>
@@ -11878,20 +11878,20 @@ async function sendViaSpaxSmsApp(mode){
       spaxShareInFlight=true;
       try{
         await navigator.share(sharePayload);
-        const msg=`📤 Shared ${batch.messages.length} personalized SMS${skipNote} — pick "Spax SMS" in your share sheet and tap Start Sending!`;
-        setSpaxAppStatus(msg,`📲 Shared <b>${batch.messages.length} personalized SMS</b> — select Spax SMS!`);
-        toast(`📤 Shared ${batch.messages.length} SMS to Spax App`);
+        const msg=`📤 Shared ${batch.messages.length} personalized SMS${skipNote} — pick "Spax Sms" in your share sheet and tap Start Sending!`;
+        setSpaxAppStatus(msg,`📲 Shared <b>${batch.messages.length} personalized SMS</b> — select Spax Sms!`);
+        toast(`📤 Shared ${batch.messages.length} SMS to Spax Sms`);
         return {ok:true,method:shareMethod,queued:batch.messages.length,batch};
       }catch(err){
         if(err && err.name==='AbortError'){
-          const msg='Share menu closed. Tap "📤 Share to App" again and choose Spax SMS.';
+          const msg='Share menu closed. Tap "📤 Share to App" again and choose Spax Sms.';
           setSpaxAppStatus(msg);
-          toast('Share closed — tap again & pick Spax SMS');
+          toast('Share closed — tap again & pick Spax Sms');
           return {ok:false,cancelled:true};
         }
         const reason=err && err.message ? err.message : 'Share unavailable';
         if(detailsEl) detailsEl.open=true;
-        setSpaxAppStatus(`⚠️ Share could not open (${reason}). Tap "📋 Copy Batch" then "Paste Clipboard" in Spax SMS, or "📥 Download .json".`);
+        setSpaxAppStatus(`⚠️ Share could not open (${reason}). Tap "📋 Copy Batch" then "Paste Clipboard" in Spax Sms, or "📥 Download .json".`);
         toast('Share blocked by browser — tap Copy Batch instead');
         return {ok:false,error:reason};
       }finally{

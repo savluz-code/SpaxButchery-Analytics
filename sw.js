@@ -47,7 +47,9 @@
 // Bumped to spax-v42 (2026-11-14): Share to App uses Chromium-allowlisted
 // text/plain (.txt) batch streaming with synchronous user-gesture activation so
 // Android's Share Sheet opens reliably on 300+ recipient campaigns.
-const CACHE_NAME = 'spax-v42';
+// Bumped to spax-v43 (2026-11-14): Updates Outreach app references to match
+// the rebranded "Spax Sms" (Red + Black & White) Android app.
+const CACHE_NAME = 'spax-v43';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="SpaxDarkTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
-        <item name="android:windowBackground">#0F1419</item>
-        <item name="android:statusBarColor">#450A0A</item>
-        <item name="android:navigationBarColor">#0F1419</item>
-        <item name="android:colorPrimary">#E63946</item>
-        <item name="android:colorAccent">#2EC4B6</item>
+        <item name="android:windowBackground">#C81922</item>
+        <item name="android:statusBarColor">#9E1118</item>
+        <item name="android:navigationBarColor">#9E1118</item>
+        <item name="android:colorPrimary">#D91E2A</item>
+        <item name="android:colorAccent">#FFFFFF</item>
     </style>
 </resources>

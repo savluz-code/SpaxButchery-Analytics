@@ -8,6 +8,7 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -18,7 +19,10 @@ import android.os.PowerManager;
 import android.provider.Settings;
 import android.telephony.SubscriptionInfo;
 import android.telephony.SubscriptionManager;
+import android.text.SpannableString;
+import android.text.Spanned;
 import android.text.TextUtils;
+import android.text.style.ForegroundColorSpan;
 import android.util.Base64;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -52,17 +56,16 @@ public final class MainActivity extends Activity implements CampaignStore.Listen
     private static final String EXTRA_CONSUMED = "_spax_intent_consumed";
     private static final String ANALYTICS_URL = "https://savluz-code.github.io/SpaxButchery-Analytics/";
 
-    // SpaxButchery dark palette
-    private static final int COL_BG = Color.parseColor("#0F1419");
-    private static final int COL_CARD = Color.parseColor("#1A2129");
-    private static final int COL_CARD2 = Color.parseColor("#212B35");
-    private static final int COL_BORDER = Color.parseColor("#2C3945");
-    private static final int COL_RED = Color.parseColor("#E63946");
-    private static final int COL_GREEN = Color.parseColor("#2EC4B6");
-    private static final int COL_BLUE = Color.parseColor("#4CC9F0");
-    private static final int COL_AMBER = Color.parseColor("#F4A261");
-    private static final int COL_TEXT = Color.parseColor("#E8EDF2");
-    private static final int COL_MUTED = Color.parseColor("#8B9AA7");
+    // Spax Sms Red + Black & White palette (distinct from SpaxButchery Analytics)
+    private static final int COL_BG = Color.parseColor("#C81922");
+    private static final int COL_CARD = Color.parseColor("#111111");
+    private static final int COL_CARD2 = Color.parseColor("#1D1D1D");
+    private static final int COL_BORDER = Color.parseColor("#4A4A4A");
+    private static final int COL_WHITE = Color.parseColor("#FFFFFF");
+    private static final int COL_BLACK = Color.parseColor("#000000");
+    private static final int COL_RED = Color.parseColor("#FF6B74");
+    private static final int COL_TEXT = Color.parseColor("#FFFFFF");
+    private static final int COL_MUTED = Color.parseColor("#D0D0D0");
 
     private static final int[] DELAY_VALUES = new int[]{12, 32, 7, 4};
     private static final String[] DELAY_LABELS = new String[]{
@@ -158,25 +161,27 @@ public final class MainActivity extends Activity implements CampaignStore.Listen
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(COL_BG);
 
-        // 1. Header Banner matching SpaxButchery Analytics
+        // 1. Header Banner: Red background written in Black ("Spax") and White ("Sms")
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.VERTICAL);
         GradientDrawable hdrBg = new GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
-                new int[]{Color.parseColor("#7F1D1D"), Color.parseColor("#450A0A")});
+                new int[]{Color.parseColor("#E0202C"), Color.parseColor("#B5121B")});
         header.setBackground(hdrBg);
         header.setPadding(dp(20), dp(18), dp(20), dp(16));
 
         TextView hdrTitle = new TextView(this);
-        hdrTitle.setText("SpaxButchery SMS Companion");
-        hdrTitle.setTextColor(COL_TEXT);
-        hdrTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19);
+        SpannableString brandTitle = new SpannableString("Spax Sms");
+        brandTitle.setSpan(new ForegroundColorSpan(COL_BLACK), 0, 4, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        brandTitle.setSpan(new ForegroundColorSpan(COL_WHITE), 5, 8, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        hdrTitle.setText(brandTitle);
+        hdrTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 23);
         hdrTitle.setTypeface(Typeface.DEFAULT_BOLD);
         header.addView(hdrTitle);
 
         TextView hdrSub = new TextView(this);
         hdrSub.setText("Personalized Bulk SIM Sender · Sends from your phone's SIM bundle");
-        hdrSub.setTextColor(Color.parseColor("#FCA5A5"));
+        hdrSub.setTextColor(COL_WHITE);
         hdrSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
         hdrSub.setPadding(0, dp(3), 0, dp(8));
         header.addView(hdrSub);
@@ -184,17 +189,17 @@ public final class MainActivity extends Activity implements CampaignStore.Listen
         tvBridgeBadge = new TextView(this);
         tvBridgeBadge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         tvBridgeBadge.setPadding(dp(10), dp(5), dp(10), dp(5));
-        tvBridgeBadge.setBackground(roundedBox(Color.parseColor("#4D000000"), dp(8), 0, 0));
-        tvBridgeBadge.setTextColor(Color.parseColor("#FECACA"));
+        tvBridgeBadge.setBackground(roundedBox(COL_BLACK, dp(8), dp(1), COL_WHITE));
+        tvBridgeBadge.setTextColor(COL_WHITE);
         LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         header.addView(tvBridgeBadge, badgeLp);
 
         root.addView(header);
 
-        View redLine = new View(this);
-        redLine.setBackgroundColor(COL_RED);
-        root.addView(redLine, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3)));
+        View blackDivider = new View(this);
+        blackDivider.setBackgroundColor(COL_BLACK);
+        root.addView(blackDivider, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3)));
 
         // Content container
         LinearLayout body = new LinearLayout(this);
@@ -209,26 +214,26 @@ public final class MainActivity extends Activity implements CampaignStore.Listen
 
         tvRestrictedHint = createBodyText(
                 "Android 13+ tip: If SMS permission is greyed out after installing this APK, tap 'App Settings' below -> tap the 3 dots (top-right) -> 'Allow restricted settings', then come back and tap 'Grant Permissions'.",
-                COL_AMBER, 12);
+                COL_MUTED, 12);
         tvRestrictedHint.setPadding(0, dp(6), 0, dp(6));
         permCard.addView(tvRestrictedHint);
 
         LinearLayout permBtns1 = createButtonRow();
-        btnGrantPerms = createButton("Grant Permissions", COL_BLUE, Color.parseColor("#081C24"));
+        btnGrantPerms = createButton("Grant Permissions", COL_WHITE, COL_BLACK);
         btnGrantPerms.setOnClickListener(v -> requestNeededPermissions());
         permBtns1.addView(btnGrantPerms, weightedBtnParams(true));
 
-        btnAppSettings = createButton("App Settings", COL_CARD2, COL_TEXT);
+        btnAppSettings = createButton("App Settings", COL_CARD2, COL_WHITE);
         btnAppSettings.setOnClickListener(v -> openAppSettings());
         permBtns1.addView(btnAppSettings, weightedBtnParams(false));
         permCard.addView(permBtns1);
 
         LinearLayout permBtns2 = createButtonRow();
-        btnBatteryOpt = createButton("Unrestricted Battery", COL_CARD2, COL_TEXT);
+        btnBatteryOpt = createButton("Unrestricted Battery", COL_CARD2, COL_WHITE);
         btnBatteryOpt.setOnClickListener(v -> requestUnrestrictedBattery());
         permBtns2.addView(btnBatteryOpt, weightedBtnParams(true));
 
-        btnToggleBridge = createButton("Restart Bridge", COL_CARD2, COL_TEXT);
+        btnToggleBridge = createButton("Restart Bridge", COL_CARD2, COL_WHITE);
         btnToggleBridge.setOnClickListener(v -> toggleBridgeService());
         permBtns2.addView(btnToggleBridge, weightedBtnParams(false));
         permCard.addView(permBtns2);
@@ -288,6 +293,8 @@ public final class MainActivity extends Activity implements CampaignStore.Listen
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progressBar.setMax(100);
         progressBar.setProgress(0);
+        progressBar.setProgressTintList(ColorStateList.valueOf(COL_WHITE));
+        progressBar.setProgressBackgroundTintList(ColorStateList.valueOf(Color.parseColor("#383838")));
         LinearLayout.LayoutParams pbLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(10));
         pbLp.bottomMargin = dp(12);
@@ -296,30 +303,30 @@ public final class MainActivity extends Activity implements CampaignStore.Listen
         // KPI Counters Row
         LinearLayout kpiRow = new LinearLayout(this);
         kpiRow.setOrientation(LinearLayout.HORIZONTAL);
-        tvKpiPending = createKpiPill(kpiRow, "PENDING", COL_BLUE, true);
-        tvKpiSent = createKpiPill(kpiRow, "SENT", COL_GREEN, true);
-        tvKpiDelivered = createKpiPill(kpiRow, "DELIV.", COL_GREEN, true);
+        tvKpiPending = createKpiPill(kpiRow, "PENDING", COL_WHITE, true);
+        tvKpiSent = createKpiPill(kpiRow, "SENT", COL_WHITE, true);
+        tvKpiDelivered = createKpiPill(kpiRow, "DELIV.", COL_WHITE, true);
         tvKpiFailed = createKpiPill(kpiRow, "FAILED", COL_RED, false);
         campCard.addView(kpiRow);
 
-        tvUnicodeNotice = createBodyText("", COL_AMBER, 12);
+        tvUnicodeNotice = createBodyText("", COL_MUTED, 12);
         tvUnicodeNotice.setPadding(0, dp(8), 0, 0);
         tvUnicodeNotice.setVisibility(View.GONE);
         campCard.addView(tvUnicodeNotice);
 
         // Control buttons
         LinearLayout ctrlRow1 = createButtonRow();
-        btnStartResume = createButton("Start Sending", COL_GREEN, Color.parseColor("#06231F"));
+        btnStartResume = createButton("Start Sending", COL_WHITE, COL_BLACK);
         btnStartResume.setOnClickListener(v -> onStartOrResumeClicked());
         ctrlRow1.addView(btnStartResume, weightedBtnParams(true));
 
-        btnPause = createButton("Pause", COL_AMBER, Color.parseColor("#231404"));
+        btnPause = createButton("Pause", COL_CARD2, COL_WHITE);
         btnPause.setOnClickListener(v -> sendServiceCommand(SmsCampaignService.ACTION_PAUSE_SENDING));
         ctrlRow1.addView(btnPause, weightedBtnParams(false));
         campCard.addView(ctrlRow1);
 
         LinearLayout ctrlRow2 = createButtonRow();
-        btnRetryFailed = createButton("Retry Failed", COL_CARD2, COL_TEXT);
+        btnRetryFailed = createButton("Retry Failed", COL_CARD2, COL_WHITE);
         btnRetryFailed.setOnClickListener(v -> onRetryFailedClicked());
         ctrlRow2.addView(btnRetryFailed, weightedBtnParams(true));
 
@@ -352,22 +359,22 @@ public final class MainActivity extends Activity implements CampaignStore.Listen
         // 5. Import / Open Spax Analytics Card
         LinearLayout impCard = createCard("4. Load Batch / Open Dashboard");
         TextView impHint = createBodyText(
-                "In SpaxButchery Analytics -> Outreach, tap 'Personalized Bulk SMS (Spax App)' for 1-tap handoff, or import a saved .json batch below:",
+                "In SpaxButchery Analytics -> Outreach, tap 'Personalized Bulk SMS (Spax Sms)' and select Spax Sms in your share menu, or import a file below:",
                 COL_MUTED, 12.5f);
         impCard.addView(impHint);
 
         LinearLayout impRow1 = createButtonRow();
-        Button btnPickFile = createButton("Import .json File", COL_CARD2, COL_TEXT);
+        Button btnPickFile = createButton("Import .json File", COL_CARD2, COL_WHITE);
         btnPickFile.setOnClickListener(v -> pickJsonFile());
         impRow1.addView(btnPickFile, weightedBtnParams(true));
 
-        Button btnPaste = createButton("Paste Clipboard", COL_CARD2, COL_TEXT);
+        Button btnPaste = createButton("Paste Clipboard", COL_CARD2, COL_WHITE);
         btnPaste.setOnClickListener(v -> importFromClipboard());
         impRow1.addView(btnPaste, weightedBtnParams(false));
         impCard.addView(impRow1);
 
         LinearLayout impRow2 = createButtonRow();
-        Button btnOpenDash = createButton("Open SpaxButchery Analytics", COL_BLUE, Color.parseColor("#081C24"));
+        Button btnOpenDash = createButton("Open SpaxButchery Analytics", COL_WHITE, COL_BLACK);
         btnOpenDash.setOnClickListener(v -> {
             try {
                 startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(ANALYTICS_URL)));
@@ -398,7 +405,7 @@ public final class MainActivity extends Activity implements CampaignStore.Listen
                 + "\n" + (notifOk ? "[OK] Progress Notifications" : "[Optional] Notifications")
                 + "  ·  " + (batteryOk ? "[OK] Unrestricted Battery" : "[Recommended] Unrestricted Battery");
         tvPermSummary.setText(summary);
-        tvPermSummary.setTextColor(smsOk ? COL_GREEN : COL_AMBER);
+        tvPermSummary.setTextColor(smsOk ? COL_WHITE : COL_RED);
         tvRestrictedHint.setVisibility(smsOk ? View.GONE : View.VISIBLE);
         btnGrantPerms.setText(smsOk && phoneOk && notifOk ? "Permissions OK" : "Grant Permissions");
         btnBatteryOpt.setText(batteryOk ? "Battery: Unrestricted" : "Allow Background Battery");
@@ -418,7 +425,7 @@ public final class MainActivity extends Activity implements CampaignStore.Listen
 
         if (c.total == 0) {
             tvCampaignTitle.setText("No campaign loaded yet");
-            tvCampaignStatus.setText("Select a segment in SpaxButchery Outreach and tap 'Personalized Bulk SMS (Spax App)'.");
+            tvCampaignStatus.setText("Select a segment in SpaxButchery Outreach and tap 'Personalized Bulk SMS (Spax Sms)'.");
             progressBar.setMax(100);
             progressBar.setProgress(0);
             tvKpiPending.setText("0\nPENDING");

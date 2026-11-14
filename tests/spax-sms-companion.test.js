@@ -376,5 +376,19 @@ test('Android companion app project, manifest, icons, and CI workflow are comple
   }
 
   assert.ok(fs.existsSync(path.join(ROOT, 'android-sms-app/app/src/main/res/mipmap-xxhdpi/ic_launcher.png')));
+  assert.ok(fs.existsSync(path.join(ROOT, 'android-sms-app/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png')));
+  assert.ok(fs.existsSync(path.join(ROOT, 'android-sms-app/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml')));
+  assert.ok(fs.existsSync(path.join(ROOT, 'android-sms-app/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml')));
+
+  const stringsXml = fs.readFileSync(path.join(ROOT, 'android-sms-app/app/src/main/res/values/strings.xml'), 'utf8');
+  assert.match(stringsXml, /<string name="app_name">Spax Sms<\/string>/);
+
+  const colorsXml = fs.readFileSync(path.join(ROOT, 'android-sms-app/app/src/main/res/values/colors.xml'), 'utf8');
+  assert.match(colorsXml, /#D91E2A/i);
+
+  const mainJava = fs.readFileSync(path.join(javaDir, 'MainActivity.java'), 'utf8');
+  assert.match(mainJava, /new SpannableString\("Spax Sms"\)/);
+  assert.match(mainJava, /#C81922/i);
+
   assert.ok(fs.existsSync(path.join(ROOT, 'android-sms-app/github-workflow-android-sms-app.yml')));
 });

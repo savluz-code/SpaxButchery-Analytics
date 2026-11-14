@@ -66,12 +66,14 @@ emoji so it has the full 160, and stays at one SMS for every customer name.
 
 ## Personalized bulk SMS
 
-The Outreach tab has three SMS choices: a shared-message SMS app composer, a
-one-at-a-time personalized queue, and **Send personalized bulk SMS**. The last
-option submits a separately personalized message for each selected customer via
-Africa's Talking. It requires a separately deployed gateway and an Africa's
-Talking account; it does not work until the gateway is configured. Only send to
-customers who have consented. SMS charges and sender-ID approval may apply.
+The Outreach tab has four SMS choices:
+
+1. **📲 Personalized Bulk SMS (Spax App)** — sends a **separate personalized SMS** (`{firstname}`, `{name}`, `{spent}`, `{visits}`, `{days}`) for every selected customer directly through your Android phone's SIM card & regular SMS bundle using the companion app in [`android-sms-app/`](android-sms-app/README.md). Customers see your real shop number and can reply right in the thread.
+   - A ready-made GitHub Actions workflow (`android-sms-app/github-workflow-android-sms-app.yml`, copy once to `.github/workflows/android-sms-app.yml` on GitHub) compiles the installable **`spax-sms-companion.apk`** automatically as a downloadable workflow artifact — no laptop or Android Studio required.
+   - Outreach hands off the personalized batch in one tap over the phone's loopback bridge (`127.0.0.1:8765`), Android's native Share menu, or a downloadable `.json` batch file, then paces sends safely in a foreground background service with Dual-SIM selection, crash-safe resume, and auto-pause protection.
+2. **⚡ One-Click Bulk SMS** — opens your default SMS app composer with all numbers and one shared generic message.
+3. **👤 SMS Queue** — steps one personalized SMS draft at a time in your default SMS app.
+4. **📨 Send personalized bulk SMS (Africa's Talking)** — submits a separately personalized message for each selected customer over HTTPS via Africa's Talking. It requires a separately deployed gateway and an Africa's Talking account; it does not work until the gateway is configured. Only send to customers who have consented. SMS charges and sender-ID approval may apply.
 
 ### Set up the gateway
 

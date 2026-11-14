@@ -1,0 +1,55 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.spaxbutchery.sms'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.spaxbutchery.sms"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0.0"
+    }
+
+    signingConfigs {
+        releaseSigning {
+            def ksPath = System.getenv("SPAX_KEYSTORE_PATH")
+            if (ksPath && file(ksPath).exists()) {
+                storeFile file(ksPath)
+                storePassword System.getenv("SPAX_KEYSTORE_PASSWORD") ?: ""
+                keyAlias System.getenv("SPAX_KEY_ALIAS") ?: "spaxsms"
+                keyPassword System.getenv("SPAX_KEY_PASSWORD") ?: ""
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            def ksPath = System.getenv("SPAX_KEYSTORE_PATH")
+            signingConfig((ksPath && file(ksPath).exists()) ? signingConfigs.releaseSigning : signingConfigs.debug)
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    // Zero third-party dependencies: uses pure Android SDK for tiny APK size (~150 KB)
+    // and deterministic, offline-friendly builds.
+}

@@ -41,7 +41,10 @@
 // Bumped to spax-v40 (2026-11-12): names and contacts now sort by the full
 // purchase completion stamp, including same-day times, across customer and
 // transaction lists. CSV/Excel completion times are retained as well.
-const CACHE_NAME = 'spax-v40';
+// Bumped to spax-v41 (2026-11-14): Outreach adds 1-tap personalized SIM bulk
+// SMS handoff to the custom Spax SMS Companion Android app (loopback bridge +
+// Share Sheet + .json batch fallback) and improves generic shared-SMS phrasing.
+const CACHE_NAME = 'spax-v41';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

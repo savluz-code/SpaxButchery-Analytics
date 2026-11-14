@@ -357,7 +357,7 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
   <div class="card">
     <h3>💬 WhatsApp / SMS Campaigns</h3>
     <div class="note wa-note">🟢 <b>WhatsApp:</b> guided one-tap-per-contact, each message personalized (WhatsApp blocks multi-recipient auto-send outside their paid Business API).<br>
-    ✉️ <b>SMS:</b> <b>⚡ One-Click Bulk</b> loads ALL selected numbers into your SMS app as a group — one tap sends to everyone (shared generic message). Use the <b>👤 personalized queue</b>, or configure the gateway below to send separate personalized SMS in bulk.</div>
+    ✉️ <b>SMS:</b> <b>📲 Spax App</b> sends <b>separate personalized SMS in bulk</b> straight through your phone’s SIM card &amp; SMS bundle (customers can reply!). <b>⚡ One-Click Bulk</b> opens your stock SMS app with one shared message, <b>👤 SMS Queue</b> steps one-by-one, or use the cloud Africa’s Talking gateway below.</div>
     <div class="grid-2">
       <div>
         <label style="font-size:.8rem;color:var(--muted)">TARGET SEGMENT</label><br>
@@ -395,10 +395,24 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         <label style="font-size:.8rem;color:var(--muted);display:block;margin-top:10px">BULK-SMS SHARED VERSION</label>
         <div class="tpl-preview" id="tplGeneric" style="border-left-color:var(--blue)">—</div>
         <div class="flex" style="margin-top:14px">
+          <button class="btn green" id="bulkSpaxApp" style="font-size:.95rem">📲 Personalized Bulk SMS (Spax App)</button>
           <button class="btn blue" id="bulkSMS1" style="font-size:.95rem">⚡ One-Click Bulk SMS</button>
           <button class="btn wa" id="bulkWA">🟢 WhatsApp Queue</button>
           <button class="btn ghost" id="bulkSMSq">👤 SMS Queue</button>
         </div>
+        <details id="spaxSmsAppDetails" style="margin-top:14px">
+          <summary>📲 Personalized bulk SMS via SIM (Spax Android App)</summary>
+          <div class="hint" style="margin-top:6px">Sends each selected customer their own personalized SMS (<code>{firstname}</code>, <code>{days}</code>, <code>{spent}</code>, <code>{visits}</code>) directly through your phone’s SIM card &amp; SMS bundle using the <b>Spax SMS Companion</b> Android app. Customers see your real shop number and can reply.</div>
+          <div id="spaxBridgeBadge" class="hint" style="margin:6px 0">Bridge status: tap <b>Check Bridge</b> or <b>Send to Spax SMS App</b> when Spax SMS is installed on this phone.</div>
+          <div class="flex" style="margin-top:8px">
+            <button class="btn green sm" id="spaxPushBtn" type="button">📲 Send to Spax SMS App</button>
+            <button class="btn ghost sm" id="spaxShareBtn" type="button">📤 Share to App</button>
+            <button class="btn ghost sm" id="spaxDownloadBtn" type="button">📥 Download .json</button>
+            <button class="btn ghost sm" id="spaxCopyBtn" type="button">📋 Copy Batch</button>
+            <button class="btn ghost sm" id="spaxPingBtn" type="button">🔌 Check Bridge</button>
+          </div>
+          <div id="spaxAppStatus" role="status" aria-live="polite" style="margin-top:8px;font-size:.82rem;color:var(--muted);white-space:pre-wrap"></div>
+        </details>
         <details style="margin-top:14px">
           <summary>📨 Personalized bulk SMS (Africa’s Talking)</summary>
           <div class="hint">Requires a separately deployed SMS gateway and an Africa’s Talking account. Messages are sent individually and may incur charges. Only contact customers who have consented.</div>
@@ -11392,7 +11406,12 @@ function genericMsg(t){return t
   .replace(/{firstname}|{name}/g,'there')
   .replace(/\(KES {spent} with us[^)]*\)/g,'(as one of our valued customers 🙏)')
   .replace(/— {visits} visits and KES {spent}!/g,'— thank you for your loyalty!')
-  .replace(/it's been {days} days/g,"it's been a while")
+  .replace(/it's been {days} days/gi,"it's been a while")
+  .replace(/it's been {gap} days/gi,"it's been a while")
+  .replace(/\bfor {days} days\b/gi,'for a while')
+  .replace(/\bin {days} days\b/gi,'in a while')
+  .replace(/\bafter {days} days\b/gi,'after a while')
+  .replace(/{days} days|{gap} days/gi,'a while')
   .replace(/{spent}|{visits}|{days}|{gap}/g,'').replace(/\s{2,}/g,' ').trim();}
 
 /* ══════════ COMEBACK SEND — immediate win-back message ══════════ */
@@ -11623,6 +11642,244 @@ window.fireNext=()=>{const c=queue[qIdx],msg=encodeURIComponent(fill($('tplText'
 window.skipNext=()=>{qIdx++;stepQueue();};
 $('bulkWA').onclick=()=>startQueue('wa');
 $('bulkSMSq').onclick=()=>startQueue('sms');
+
+/* ══════════ SPAX ANDROID SMS COMPANION (SIM PERSONALIZED BULK) ══════════ */
+const SPAX_SMS_BRIDGE_URL='http://127.0.0.1:8765';
+let spaxBridgePollTimer=null;
+function spaxAbortSignal(ms){
+  if(typeof AbortSignal!=='undefined' && typeof AbortSignal.timeout==='function') return AbortSignal.timeout(ms);
+  const ctrl=new AbortController();
+  setTimeout(()=>ctrl.abort(),ms);
+  return ctrl.signal;
+}
+function buildSpaxSmsBatch(poolOverride, templateOverride){
+  const pool=Array.isArray(poolOverride)?poolOverride:selectedPool();
+  const template=typeof templateOverride==='string'?templateOverride:($('tplText')?$('tplText').value:'');
+  if(!pool.length) return {error:'Select at least one recipient.'};
+  if(!template.trim()) return {error:'Enter a message template first.'};
+  const seen=new Set(), messages=[], invalid=[], duplicate=[];
+  let totalSegments=0, maxSegments=1, hasUnicode=false;
+  for(const c of pool){
+    const to=bulkKenyanPhone(c && c.contact);
+    const label=String((c && c.name)||'Customer');
+    if(!to){invalid.push(label);continue;}
+    if(seen.has(to)){duplicate.push(label);continue;}
+    const message=fill(template,c).trim();
+    if(!message || message.length>1500){
+      return {error:`Each personalized message must be 1–1500 characters (${label}).`};
+    }
+    seen.add(to);
+    const info=smsInfo(message);
+    totalSegments+=info.segments;
+    if(info.segments>maxSegments) maxSegments=info.segments;
+    if(info.encoding!=='GSM-7') hasUnicode=true;
+    messages.push({
+      id:'m-'+String(messages.length+1).padStart(4,'0'),
+      name:label,
+      to,
+      message,
+      segments:info.segments,
+      encoding:info.encoding
+    });
+  }
+  if(!messages.length) return {error:'No valid Kenyan mobile numbers (+2547… / +2541…) selected.'};
+  const segEl=$('segSel');
+  const segValue=segEl && segEl.value ? segEl.value : 'custom';
+  const segOpt=segEl && segEl.options && segEl.selectedIndex>=0 ? segEl.options[segEl.selectedIndex] : null;
+  const segmentLabel=segOpt && segOpt.text ? segOpt.text.trim() : segValue;
+  return {
+    invalid,
+    duplicate,
+    batch:{
+      app:'spax-sms-batch',
+      version:1,
+      campaignId:'spax-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,7),
+      createdAt:new Date().toISOString(),
+      segment:segValue,
+      segmentLabel,
+      stats:{
+        selected:pool.length,
+        queued:messages.length,
+        skippedInvalid:invalid.length,
+        skippedDuplicate:duplicate.length,
+        totalSegments,
+        maxSegments,
+        hasUnicode
+      },
+      messages
+    }
+  };
+}
+function setSpaxAppStatus(msg, htmlSummary){
+  const el=$('spaxAppStatus');
+  if(el) el.textContent=msg||'';
+  if(htmlSummary && $('bulkStatus')) $('bulkStatus').innerHTML=htmlSummary;
+}
+async function checkSpaxSmsBridge(timeoutMs){
+  const badge=$('spaxBridgeBadge');
+  try{
+    const res=await fetch(SPAX_SMS_BRIDGE_URL+'/ping',{method:'GET',signal:spaxAbortSignal(timeoutMs||1200)});
+    const data=await res.json();
+    if(res.ok && data && data.app==='spax-sms-companion'){
+      if(badge){badge.textContent='🟢 Spax SMS App connected on this phone (127.0.0.1:8765 ready)';badge.style.color='var(--green)';}
+      return true;
+    }
+  }catch(_){}
+  if(badge){badge.textContent='ℹ️ Local bridge not running right now — Share to App or open Spax SMS on your phone first.';badge.style.color='';}
+  return false;
+}
+async function pollSpaxSmsStatusOnce(){
+  try{
+    const res=await fetch(SPAX_SMS_BRIDGE_URL+'/status',{method:'GET',signal:spaxAbortSignal(1500)});
+    if(!res.ok) return null;
+    const s=await res.json();
+    if(!s || s.app!=='spax-sms-companion') return null;
+    if(s.total>0){
+      setSpaxAppStatus(
+        `[${s.status}] ${s.segmentLabel||'Campaign'} — Sent: ${s.sent}/${s.total} (Delivered: ${s.delivered||0}, Pending: ${s.pending||0}, Failed: ${s.failed||0}${s.unknown?`, Unknown: ${s.unknown}`:''})\n${s.statusMessage||''}`
+      );
+    }
+    return s;
+  }catch(_){return null;}
+}
+function startSpaxBridgePolling(){
+  if(spaxBridgePollTimer) clearInterval(spaxBridgePollTimer);
+  spaxBridgePollTimer=setInterval(async()=>{
+    if(typeof document!=='undefined' && document.hidden) return;
+    const s=await pollSpaxSmsStatusOnce();
+    if(!s || s.status==='COMPLETED' || s.status==='IDLE'){
+      clearInterval(spaxBridgePollTimer);
+      spaxBridgePollTimer=null;
+    }
+  },3000);
+}
+function downloadSpaxBatchFile(batch){
+  const filename=`spax-sms-${batch.segment||'batch'}-${batch.messages.length}.json`;
+  const json=JSON.stringify(batch,null,2);
+  const blob=new Blob([json],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download=filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),2000);
+  return filename;
+}
+async function sendViaSpaxSmsApp(mode){
+  const built=buildSpaxSmsBatch();
+  if(built.error){
+    setSpaxAppStatus(built.error);
+    toast(built.error);
+    return {ok:false,error:built.error};
+  }
+  const {batch,invalid,duplicate}=built;
+  const skipNote=(invalid.length||duplicate.length)?` (skipped ${invalid.length} invalid, ${duplicate.length} duplicate)`:'';
+  const detailsEl=$('spaxSmsAppDetails');
+
+  if(mode==='download'){
+    const file=downloadSpaxBatchFile(batch);
+    const msg=`📥 Saved ${file} with ${batch.messages.length} personalized SMS (${batch.stats.totalSegments} SMS parts)${skipNote}. Open it with the Spax SMS Android app.`;
+    setSpaxAppStatus(msg,`📲 Saved <b>${escHtml(file)}</b> — open in Spax SMS App!`);
+    toast(`📥 Downloaded ${batch.messages.length} personalized SMS`);
+    return {ok:true,method:'download',queued:batch.messages.length,batch};
+  }
+
+  if(mode==='copy'){
+    if(!navigator.clipboard || typeof navigator.clipboard.writeText!=='function'){
+      const err='Clipboard access unavailable here — use Download .json instead.';
+      setSpaxAppStatus(err); toast(err);
+      return {ok:false,error:err};
+    }
+    await navigator.clipboard.writeText(JSON.stringify(batch));
+    const msg=`📋 Copied ${batch.messages.length} personalized SMS${skipNote} to clipboard. Open Spax SMS App → tap "Paste Clipboard".`;
+    setSpaxAppStatus(msg,`📲 Batch copied — open <b>Spax SMS</b> &amp; tap Paste Clipboard!`);
+    toast(`📋 Copied ${batch.messages.length} personalized SMS`);
+    return {ok:true,method:'copy',queued:batch.messages.length,batch};
+  }
+
+  // 1. Try instant local loopback bridge (127.0.0.1:8765) unless user explicitly picked Share
+  if(mode!=='share'){
+    try{
+      const res=await fetch(SPAX_SMS_BRIDGE_URL+'/queue',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(batch),
+        signal:spaxAbortSignal(2200)
+      });
+      const data=await res.json().catch(()=>({}));
+      if(res.ok && data && data.ok){
+        const badge=$('spaxBridgeBadge');
+        if(badge){badge.textContent='🟢 Spax SMS App connected on this phone (127.0.0.1:8765 ready)';badge.style.color='var(--green)';}
+        const msg=`📲 Sent ${batch.messages.length} personalized SMS (${batch.stats.totalSegments} SMS parts)${skipNote} to Spax SMS App! Review SIM & pacing in the app and tap Start Sending.`;
+        setSpaxAppStatus(msg,`📲 <b>${batch.messages.length} personalized SMS</b> loaded in Spax SMS App — tap Start Sending!`);
+        toast(`📲 Loaded ${batch.messages.length} SMS in Spax App`);
+        startSpaxBridgePolling();
+        if(typeof window!=='undefined' && window.location){
+          window.location.href='spaxsms://campaign';
+        }
+        return {ok:true,method:'bridge',queued:batch.messages.length,batch};
+      }
+      if(res.status===409 && data && data.error){
+        if(detailsEl) detailsEl.open=true;
+        setSpaxAppStatus('⚠️ '+data.error);
+        toast(data.error);
+        if(typeof window!=='undefined' && window.location){
+          window.location.href='spaxsms://campaign';
+        }
+        return {ok:false,method:'busy',error:data.error};
+      }
+    }catch(_){
+      // Bridge isn't awake yet — fall through smoothly to Android Share / File fallback.
+    }
+  }
+
+  // 2. Android Native Share Sheet (opens Spax SMS directly even when the app was closed!)
+  if(typeof navigator!=='undefined' && typeof navigator.share==='function'){
+    try{
+      const json=JSON.stringify(batch);
+      const filename=`spax-sms-${batch.segment||'batch'}-${batch.messages.length}.json`;
+      if(typeof File==='function'){
+        const file=new File([json],filename,{type:'application/json'});
+        if(!navigator.canShare || navigator.canShare({files:[file]})){
+          await navigator.share({title:`Spax SMS (${batch.messages.length} recipients)`,files:[file]});
+          const msg=`📤 Shared ${batch.messages.length} personalized SMS${skipNote} — pick "Spax SMS" in your share sheet and tap Start Sending!`;
+          setSpaxAppStatus(msg,`📲 Shared <b>${batch.messages.length} personalized SMS</b> — select Spax SMS!`);
+          return {ok:true,method:'share-file',queued:batch.messages.length,batch};
+        }
+      }
+      if(mode==='share'){
+        await navigator.share({title:`Spax SMS (${batch.messages.length} recipients)`,text:json});
+        const msg=`📤 Shared ${batch.messages.length} personalized SMS${skipNote} as text — pick "Spax SMS"!`;
+        setSpaxAppStatus(msg);
+        return {ok:true,method:'share-text',queued:batch.messages.length,batch};
+      }
+    }catch(err){
+      if(err && err.name==='AbortError'){
+        return {ok:false,cancelled:true};
+      }
+    }
+  }
+
+  // 3. Universal fallback: download .json batch & open details guide
+  if(detailsEl) detailsEl.open=true;
+  const file=downloadSpaxBatchFile(batch);
+  const msg=`📥 Spax SMS bridge wasn't detected on this device, so ${file} (${batch.messages.length} personalized SMS${skipNote}) was downloaded.\nOn your Android phone, open it with the Spax SMS Companion app (install spax-sms-companion.apk from GitHub Actions — see android-sms-app/README.md).`;
+  setSpaxAppStatus(msg,`📥 Saved <b>${escHtml(file)}</b> (${batch.messages.length} personalized SMS) — open in Spax SMS App!`);
+  toast(`📥 Saved ${file} for Spax SMS App`);
+  return {ok:true,method:'download',queued:batch.messages.length,batch};
+}
+if($('bulkSpaxApp')) $('bulkSpaxApp').onclick=()=>sendViaSpaxSmsApp('auto');
+if($('spaxPushBtn')) $('spaxPushBtn').onclick=()=>sendViaSpaxSmsApp('auto');
+if($('spaxShareBtn')) $('spaxShareBtn').onclick=()=>sendViaSpaxSmsApp('share');
+if($('spaxDownloadBtn')) $('spaxDownloadBtn').onclick=()=>sendViaSpaxSmsApp('download');
+if($('spaxCopyBtn')) $('spaxCopyBtn').onclick=()=>sendViaSpaxSmsApp('copy');
+if($('spaxPingBtn')) $('spaxPingBtn').onclick=async()=>{
+  const ok=await checkSpaxSmsBridge(1500);
+  if(ok){await pollSpaxSmsStatusOnce();toast('🟢 Spax SMS App connected!');}
+  else toast('Spax SMS bridge not awake — open Spax SMS App first');
+};
+if($('spaxSmsAppDetails')) $('spaxSmsAppDetails').addEventListener('toggle',e=>{
+  if(e.target.open) checkSpaxSmsBridge(1200).then(ok=>{if(ok)pollSpaxSmsStatusOnce();});
+});
 
 /* ══════════ CONTACT RESOLVER ══════════ */
 function renderMaskTable(){

@@ -136,7 +136,7 @@ public final class SmsCampaignService extends Service {
     private void startSendingWorkerIfNeeded() {
         if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
             store.setCampaignStatus(CampaignModels.CAMPAIGN_PAUSED,
-                    "SMS permission is not granted yet. Grant SMS permission in Spax SMS first.");
+                    "SMS permission is not granted yet. Grant SMS permission in Spax Sms first.");
             refreshForegroundNotification();
             return;
         }
@@ -196,7 +196,7 @@ public final class SmsCampaignService extends Service {
                             "Done! Sent: " + c.sent + "/" + c.total
                                     + (c.failed > 0 ? " · Failed: " + c.failed : "")
                                     + (c.unknown > 0 ? " · Unknown: " + c.unknown : ""));
-                    postAlertNotification("Spax SMS Complete",
+                    postAlertNotification("Spax Sms Complete",
                             "Sent " + c.sent + " of " + c.total + " personalized messages.");
                     break;
                 }
@@ -233,7 +233,7 @@ public final class SmsCampaignService extends Service {
                             "Done! Sent: " + afterCounts.sent + "/" + afterCounts.total
                                     + (afterCounts.failed > 0 ? " · Failed: " + afterCounts.failed : "")
                                     + (afterCounts.unknown > 0 ? " · Unknown: " + afterCounts.unknown : ""));
-                    postAlertNotification("Spax SMS Complete",
+                    postAlertNotification("Spax Sms Complete",
                             "Sent " + afterCounts.sent + " of " + afterCounts.total
                                     + (afterCounts.failed > 0 ? " (" + afterCounts.failed + " failed)" : ""));
                     break;
@@ -244,7 +244,7 @@ public final class SmsCampaignService extends Service {
                     String msg = "Auto-paused after " + consecutiveFailures
                             + " consecutive errors. Check your SMS bundle, SIM selection, or Android SMS limit prompt, then tap Retry Failed or Resume.";
                     store.setCampaignStatus(CampaignModels.CAMPAIGN_PAUSED, msg);
-                    postAlertNotification("Spax SMS Auto-Paused", msg);
+                    postAlertNotification("Spax Sms Auto-Paused", msg);
                     break;
                 }
 
@@ -402,22 +402,22 @@ public final class SmsCampaignService extends Service {
         String title;
         String text;
         if (CampaignModels.CAMPAIGN_RUNNING.equals(snap.status)) {
-            title = "Spax SMS: Sending " + c.sent + "/" + c.total;
+            title = "Spax Sms: Sending " + c.sent + "/" + c.total;
             text = snap.statusMessage;
         } else if (CampaignModels.CAMPAIGN_READY.equals(snap.status)) {
-            title = "Spax SMS: " + c.total + " personalized messages ready";
+            title = "Spax Sms: " + c.total + " personalized messages ready";
             text = "Tap to review SIM & start sending (" + snap.segmentLabel + ")";
         } else if (CampaignModels.CAMPAIGN_PAUSED.equals(snap.status)) {
-            title = "Spax SMS Paused (" + c.sent + "/" + c.total + " sent)";
+            title = "Spax Sms Paused (" + c.sent + "/" + c.total + " sent)";
             text = snap.statusMessage;
         } else if (CampaignModels.CAMPAIGN_COMPLETED.equals(snap.status) && c.total > 0) {
-            title = "Spax SMS Complete (" + c.sent + "/" + c.total + " sent)";
+            title = "Spax Sms Complete (" + c.sent + "/" + c.total + " sent)";
             text = snap.statusMessage;
         } else {
-            title = "Spax SMS Bridge Ready";
+            title = "Spax Sms Bridge Ready";
             text = store.isBridgeRunning()
                     ? "Listening on 127.0.0.1:" + LocalBridgeServer.PORT + " for SpaxButchery Outreach"
-                    : "Open Spax SMS to configure";
+                    : "Open Spax Sms to configure";
         }
 
         Notification.Builder b = new Notification.Builder(this, CHANNEL_PROGRESS)
@@ -461,7 +461,7 @@ public final class SmsCampaignService extends Service {
     private void postNewBatchNotification(CampaignState staged) {
         postAlertNotification(
                 "Campaign Ready: " + staged.items.size() + " personalized SMS",
-                "Tap to open Spax SMS and start sending (" + staged.segmentLabel + ").");
+                "Tap to open Spax Sms and start sending (" + staged.segmentLabel + ").");
     }
 
     private void postAlertNotification(String title, String body) {

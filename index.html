@@ -402,15 +402,15 @@ Exp 160" style="font-size:.85rem;font-family:monospace;width:100%;background:var
         </div>
         <details id="spaxSmsAppDetails" style="margin-top:14px">
           <summary>📲 Personalized bulk SMS via SIM (Spax Android App)</summary>
-          <div class="hint" style="margin-top:6px">Sends each selected customer their own personalized SMS (<code>{firstname}</code>, <code>{days}</code>, <code>{spent}</code>, <code>{visits}</code>) directly through your phone’s SIM card &amp; SMS bundle using the <b>Spax SMS Companion</b> Android app. Customers see your real shop number and can reply.</div>
-          <div id="spaxBridgeBadge" class="hint" style="margin:6px 0">Bridge status: tap <b>Check Bridge</b> or <b>Send to Spax SMS App</b> when Spax SMS is installed on this phone.</div>
+          <div class="hint" style="margin-top:6px">Tap <b>📤 Share to App</b> (or the green button above) to open Android’s share menu and pick <b>Spax SMS</b> — sends each customer their own personalized SMS (<code>{firstname}</code>, <code>{days}</code>, <code>{spent}</code>, <code>{visits}</code>) from your SIM bundle even if Spax SMS was closed.</div>
           <div class="flex" style="margin-top:8px">
-            <button class="btn green sm" id="spaxPushBtn" type="button">📲 Send to Spax SMS App</button>
-            <button class="btn ghost sm" id="spaxShareBtn" type="button">📤 Share to App</button>
-            <button class="btn ghost sm" id="spaxDownloadBtn" type="button">📥 Download .json</button>
+            <button class="btn green sm" id="spaxShareBtn" type="button">📤 Share to App</button>
             <button class="btn ghost sm" id="spaxCopyBtn" type="button">📋 Copy Batch</button>
+            <button class="btn ghost sm" id="spaxDownloadBtn" type="button">📥 Download .json</button>
+            <button class="btn ghost sm" id="spaxPushBtn" type="button">🔌 Bridge Push</button>
             <button class="btn ghost sm" id="spaxPingBtn" type="button">🔌 Check Bridge</button>
           </div>
+          <div id="spaxBridgeBadge" class="hint" style="margin:6px 0">Tip: Share to App works anytime without needing the local bridge running.</div>
           <div id="spaxAppStatus" role="status" aria-live="polite" style="margin-top:8px;font-size:.82rem;color:var(--muted);white-space:pre-wrap"></div>
         </details>
         <details style="margin-top:14px">
@@ -11764,7 +11764,9 @@ function downloadSpaxBatchFile(batch){
   setTimeout(()=>URL.revokeObjectURL(url),2000);
   return filename;
 }
+let spaxShareInFlight=false;
 async function sendViaSpaxSmsApp(mode){
+  const effectiveMode=mode||'share';
   const built=buildSpaxSmsBatch();
   if(built.error){
     setSpaxAppStatus(built.error);
@@ -11775,7 +11777,7 @@ async function sendViaSpaxSmsApp(mode){
   const skipNote=(invalid.length||duplicate.length)?` (skipped ${invalid.length} invalid, ${duplicate.length} duplicate)`:'';
   const detailsEl=$('spaxSmsAppDetails');
 
-  if(mode==='download'){
+  if(effectiveMode==='download'){
     const file=downloadSpaxBatchFile(batch);
     const msg=`📥 Saved ${file} with ${batch.messages.length} personalized SMS (${batch.stats.totalSegments} SMS parts)${skipNote}. Open it with the Spax SMS Android app.`;
     setSpaxAppStatus(msg,`📲 Saved <b>${escHtml(file)}</b> — open in Spax SMS App!`);
@@ -11783,7 +11785,7 @@ async function sendViaSpaxSmsApp(mode){
     return {ok:true,method:'download',queued:batch.messages.length,batch};
   }
 
-  if(mode==='copy'){
+  if(effectiveMode==='copy'){
     if(!navigator.clipboard || typeof navigator.clipboard.writeText!=='function'){
       const err='Clipboard access unavailable here — use Download .json instead.';
       setSpaxAppStatus(err); toast(err);
@@ -11796,12 +11798,12 @@ async function sendViaSpaxSmsApp(mode){
     return {ok:true,method:'copy',queued:batch.messages.length,batch};
   }
 
-  // 1. Try instant local loopback bridge (127.0.0.1:8765) unless user explicitly picked Share
-  if(mode!=='share'){
+  // Direct Local Loopback Bridge push (127.0.0.1:8765) when explicitly requested or mode==='auto'
+  if(effectiveMode==='bridge' || effectiveMode==='auto'){
     try{
       const res=await fetch(SPAX_SMS_BRIDGE_URL+'/queue',{
         method:'POST',
-        headers:{'Content-Type':'application/json'},
+        headers:{'Content-Type':'text/plain;charset=UTF-8'},
         body:JSON.stringify(batch),
         signal:spaxAbortSignal(2200)
       });
@@ -11828,48 +11830,87 @@ async function sendViaSpaxSmsApp(mode){
         return {ok:false,method:'busy',error:data.error};
       }
     }catch(_){
-      // Bridge isn't awake yet — fall through smoothly to Android Share / File fallback.
+      if(effectiveMode==='bridge'){
+        const err='Local bridge not reachable — tap "📤 Share to App" instead (works even when Spax SMS is closed).';
+        if(detailsEl) detailsEl.open=true;
+        setSpaxAppStatus('ℹ️ '+err);
+        toast('Use "📤 Share to App" — works without bridge!');
+        return {ok:false,method:'bridge-offline',error:err};
+      }
     }
   }
 
-  // 2. Android Native Share Sheet (opens Spax SMS directly even when the app was closed!)
+  // Primary Mobile Path: Android Native Share Sheet!
+  // IMPORTANT: Chromium's Web Share file allowlist blocks `application/json` (.json)
+  // and rejects large `text` payloads (>32 KB), but explicitly permits `text/plain`
+  // (.txt) files up to 50 MB — and Spax SMS Companion natively accepts ACTION_SEND
+  // `text/plain` streams and parses the UTF-8 JSON batch directly.
+  // Also called synchronously with zero prior `await` in 'share' mode so Chrome
+  // preserves transient user activation!
   if(typeof navigator!=='undefined' && typeof navigator.share==='function'){
-    try{
-      const json=JSON.stringify(batch);
-      const filename=`spax-sms-${batch.segment||'batch'}-${batch.messages.length}.json`;
-      if(typeof File==='function'){
-        const file=new File([json],filename,{type:'application/json'});
-        if(!navigator.canShare || navigator.canShare({files:[file]})){
-          await navigator.share({title:`Spax SMS (${batch.messages.length} recipients)`,files:[file]});
-          const msg=`📤 Shared ${batch.messages.length} personalized SMS${skipNote} — pick "Spax SMS" in your share sheet and tap Start Sending!`;
-          setSpaxAppStatus(msg,`📲 Shared <b>${batch.messages.length} personalized SMS</b> — select Spax SMS!`);
-          return {ok:true,method:'share-file',queued:batch.messages.length,batch};
+    if(spaxShareInFlight){
+      toast('Share menu is already open — select Spax SMS');
+      return {ok:false,busy:true};
+    }
+    const json=JSON.stringify(batch);
+    const title=`Spax SMS (${batch.messages.length} recipients)`;
+    let sharePayload=null;
+    let shareMethod='share-file';
+    if(typeof File==='function'){
+      const txtFilename=`spax-sms-${batch.segment||'batch'}-${batch.messages.length}.txt`;
+      const txtFile=new File([json],txtFilename,{type:'text/plain'});
+      const withTitle={title,files:[txtFile]};
+      const filesOnly={files:[txtFile]};
+      if(typeof navigator.canShare!=='function' || navigator.canShare(withTitle)){
+        sharePayload=withTitle;
+      }else if(navigator.canShare(filesOnly)){
+        sharePayload=filesOnly;
+      }
+    }
+    if(!sharePayload && json.length<=16000){
+      const textOnly={title,text:json};
+      if(typeof navigator.canShare!=='function' || navigator.canShare(textOnly)){
+        sharePayload=textOnly;
+        shareMethod='share-text';
+      }
+    }
+    if(sharePayload){
+      spaxShareInFlight=true;
+      try{
+        await navigator.share(sharePayload);
+        const msg=`📤 Shared ${batch.messages.length} personalized SMS${skipNote} — pick "Spax SMS" in your share sheet and tap Start Sending!`;
+        setSpaxAppStatus(msg,`📲 Shared <b>${batch.messages.length} personalized SMS</b> — select Spax SMS!`);
+        toast(`📤 Shared ${batch.messages.length} SMS to Spax App`);
+        return {ok:true,method:shareMethod,queued:batch.messages.length,batch};
+      }catch(err){
+        if(err && err.name==='AbortError'){
+          const msg='Share menu closed. Tap "📤 Share to App" again and choose Spax SMS.';
+          setSpaxAppStatus(msg);
+          toast('Share closed — tap again & pick Spax SMS');
+          return {ok:false,cancelled:true};
         }
-      }
-      if(mode==='share'){
-        await navigator.share({title:`Spax SMS (${batch.messages.length} recipients)`,text:json});
-        const msg=`📤 Shared ${batch.messages.length} personalized SMS${skipNote} as text — pick "Spax SMS"!`;
-        setSpaxAppStatus(msg);
-        return {ok:true,method:'share-text',queued:batch.messages.length,batch};
-      }
-    }catch(err){
-      if(err && err.name==='AbortError'){
-        return {ok:false,cancelled:true};
+        const reason=err && err.message ? err.message : 'Share unavailable';
+        if(detailsEl) detailsEl.open=true;
+        setSpaxAppStatus(`⚠️ Share could not open (${reason}). Tap "📋 Copy Batch" then "Paste Clipboard" in Spax SMS, or "📥 Download .json".`);
+        toast('Share blocked by browser — tap Copy Batch instead');
+        return {ok:false,error:reason};
+      }finally{
+        spaxShareInFlight=false;
       }
     }
   }
 
-  // 3. Universal fallback: download .json batch & open details guide
+  // Desktop / non-Web-Share browser fallback: download .json batch
   if(detailsEl) detailsEl.open=true;
   const file=downloadSpaxBatchFile(batch);
-  const msg=`📥 Spax SMS bridge wasn't detected on this device, so ${file} (${batch.messages.length} personalized SMS${skipNote}) was downloaded.\nOn your Android phone, open it with the Spax SMS Companion app (install spax-sms-companion.apk from GitHub Actions — see android-sms-app/README.md).`;
+  const msg=`📥 Web Share isn't supported in this browser, so ${file} (${batch.messages.length} personalized SMS${skipNote}) was downloaded.\nOn your Android phone, open it with the Spax SMS Companion app.`;
   setSpaxAppStatus(msg,`📥 Saved <b>${escHtml(file)}</b> (${batch.messages.length} personalized SMS) — open in Spax SMS App!`);
   toast(`📥 Saved ${file} for Spax SMS App`);
   return {ok:true,method:'download',queued:batch.messages.length,batch};
 }
-if($('bulkSpaxApp')) $('bulkSpaxApp').onclick=()=>sendViaSpaxSmsApp('auto');
-if($('spaxPushBtn')) $('spaxPushBtn').onclick=()=>sendViaSpaxSmsApp('auto');
+if($('bulkSpaxApp')) $('bulkSpaxApp').onclick=()=>sendViaSpaxSmsApp('share');
 if($('spaxShareBtn')) $('spaxShareBtn').onclick=()=>sendViaSpaxSmsApp('share');
+if($('spaxPushBtn')) $('spaxPushBtn').onclick=()=>sendViaSpaxSmsApp('bridge');
 if($('spaxDownloadBtn')) $('spaxDownloadBtn').onclick=()=>sendViaSpaxSmsApp('download');
 if($('spaxCopyBtn')) $('spaxCopyBtn').onclick=()=>sendViaSpaxSmsApp('copy');
 if($('spaxPingBtn')) $('spaxPingBtn').onclick=async()=>{

@@ -44,7 +44,10 @@
 // Bumped to spax-v41 (2026-11-14): Outreach adds 1-tap personalized SIM bulk
 // SMS handoff to the custom Spax SMS Companion Android app (loopback bridge +
 // Share Sheet + .json batch fallback) and improves generic shared-SMS phrasing.
-const CACHE_NAME = 'spax-v41';
+// Bumped to spax-v42 (2026-11-14): Share to App uses Chromium-allowlisted
+// text/plain (.txt) batch streaming with synchronous user-gesture activation so
+// Android's Share Sheet opens reliably on 300+ recipient campaigns.
+const CACHE_NAME = 'spax-v42';
 const urlsToCache = [
   '/SpaxButchery-Analytics/',
   '/SpaxButchery-Analytics/index.html'

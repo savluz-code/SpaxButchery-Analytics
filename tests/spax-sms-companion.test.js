@@ -271,6 +271,78 @@ test('sendViaSpaxSmsApp falls back to Android Share Sheet file when bridge is as
   assert.equal(desktop.downloads[0].filename, 'spax-sms-lapsing-1.json');
 });
 
+test('Share to App and main button share a Chromium-allowlisted text/plain (.txt) batch synchronously for 321+ recipients', async () => {
+  // Build 321 distinct valid Kenyan mobile recipients (>40 KB JSON)
+  const pool = Array.from({ length: 321 }, (_, idx) => ({
+    name: `Customer ${idx + 1}`,
+    contact: '07' + String(10000000 + idx).slice(0, 8),
+    spent: 1500,
+    visits: 3,
+    days: 31 + (idx % 30)
+  }));
+
+  let fetchCalled = false;
+  let shareCalledSynchronously = false;
+  let syncTick = true;
+  const sharedPayloads = [];
+
+  // Emulate real Chromium Android Web Share allowlist:
+  // - Rejects `application/json` (.json) files
+  // - Permits `text/plain` (.txt) files
+  const chromiumCanShare = data => {
+    if (data && data.files) {
+      return data.files.every(f => f.type === 'text/plain' && f.name.endsWith('.txt'));
+    }
+    return Boolean(data && data.text && data.text.length <= 16000);
+  };
+
+  const h = createHarness({
+    pool,
+    fetchImpl: async () => { fetchCalled = true; throw new Error('Should not fetch before share'); },
+    navigator: {
+      canShare: chromiumCanShare,
+      share: async payload => {
+        if (syncTick) shareCalledSynchronously = true;
+        sharedPayloads.push(payload);
+      }
+    }
+  });
+
+  const promise = h.elements.bulkSpaxApp.onclick();
+  syncTick = false;
+  assert.equal(shareCalledSynchronously, true, 'navigator.share must fire synchronously inside user tap');
+  assert.equal(fetchCalled, false, 'Main button must not await network fetch before opening Share Sheet');
+
+  const res = await promise;
+  assert.equal(res.ok, true);
+  assert.equal(res.method, 'share-file');
+  assert.equal(res.queued, 321);
+  assert.equal(sharedPayloads.length, 1);
+  assert.equal(sharedPayloads[0].files[0].type, 'text/plain');
+  assert.equal(sharedPayloads[0].files[0].name, 'spax-sms-lapsing-321.txt');
+
+  const parsed = JSON.parse(sharedPayloads[0].files[0].text);
+  assert.equal(parsed.messages.length, 321);
+
+  // Also verify closing the share sheet (AbortError) gives visible UI feedback instead of silent no-op
+  const abortHarness = createHarness({
+    pool: pool.slice(0, 2),
+    navigator: {
+      canShare: chromiumCanShare,
+      share: async () => {
+        const err = new Error('Share canceled');
+        err.name = 'AbortError';
+        throw err;
+      }
+    }
+  });
+  const abortRes = await abortHarness.elements.spaxShareBtn.onclick();
+  assert.equal(abortRes.ok, false);
+  assert.equal(abortRes.cancelled, true);
+  assert.match(abortHarness.elements.spaxAppStatus.textContent, /Share menu closed/);
+  assert.ok(abortHarness.toasts.length > 0, 'Cancelling share must show feedback toast');
+});
+
 test('Android companion app project, manifest, icons, and CI workflow are complete and consistent', () => {
   const manifestPath = path.join(ROOT, 'android-sms-app/app/src/main/AndroidManifest.xml');
   const manifest = fs.readFileSync(manifestPath, 'utf8');
